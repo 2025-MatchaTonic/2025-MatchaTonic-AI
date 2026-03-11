@@ -1,50 +1,86 @@
 # app/api/endpoints/chat.py
+from typing import Any, Dict, List, Optional
+
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
-from typing import Optional, Dict, Any
+from pydantic import BaseModel, Field
+
 from app.ai.graph.workflow import ai_app
 
 router = APIRouter()
 
 
-class ChatRequest(BaseModel):
-    project_id: str
-    message: str
-    action_type: str  # "CHAT", "BTN_YES", "BTN_NO", "BTN_GO_DEF", "BTN_MORE", "BTN_PLAN", "BTN_DEV"
-    current_phase: str  # "INIT", "EXPLORE", "GATHER", "READY", "DONE"
-    collected_data: Dict[str, str] = (
-        {}
-    )  # 기존에 모인 데이터 (Spring에서 관리하여 넘겨줌)
+# ---------------------------------------------------------
+# 1. Spring -> FastAPI 로 보내는 요청 (Internal Request)
+# ---------------------------------------------------------
+class AIChatRequest(BaseModel):
+    roomId: int  # Spring 명세의 roomId 반영
+    content: str  # 사용자 채팅 내용 (명세서의 content 반영)
+    actionType: str  # "CHAT", "BTN_YES", "BTN_NO", "BTN_PLAN", "BTN_DEV" 등
+    currentStatus: str  # 명세서의 현재 상태값
+    collectedData: Dict[str, str] = Field(
+        default_factory=dict
+    )  # Spring DB에 저장된 이전 데이터
+    recentMessages: List[str] = Field(
+        default_factory=list
+    )  # @mates 호출 시 최근 팀 대화 목록
+    selectedMessage: Optional[str] = None  # 사용자가 핵심 채팅으로 선택한 메시지
 
 
-class ChatResponse(BaseModel):
-    ai_message: str
-    next_phase: str
-    is_sufficient: bool
-    collected_data: Dict[str, str]
+class NotionTemplateItem(BaseModel):
+    key: str
+    parentKey: Optional[str]
+    title: str
+    content: Any
 
 
-@router.post("/", response_model=ChatResponse)
-async def process_chat(request: ChatRequest):
+class NotionTemplatePayload(BaseModel):
+    projectId: int
+    templates: List[NotionTemplateItem]
+
+
+# ---------------------------------------------------------
+# 2. FastAPI -> Spring 으로 돌려주는 응답 (Internal Response)
+# ---------------------------------------------------------
+class AIChatResponse(BaseModel):
+    content: str  # AI 응답 텍스트 (Spring 명세의 aiResponse.content 에 맵핑)
+    suggestedQuestions: List[
+        str
+    ]  # 프론트엔드 버튼/추천질문용 (Spring 명세의 suggestedQuestions 에 맵핑)
+    currentStatus: str  # 변경된 진행 단계 (Spring 명세의 currentStatus 에 맵핑)
+    isSufficient: bool  # 템플릿 생성 가능 여부
+    collectedData: Dict[str, str]  # 업데이트된 기획 데이터 (Spring이 DB에 저장해야 함)
+    notionTemplatePayload: Optional[NotionTemplatePayload] = None
+
+
+@router.post("/", response_model=AIChatResponse)
+async def process_chat(request: AIChatRequest):
     try:
+        # LangGraph 상태 초기화 (snake_case로 변환하여 내부 로직에 주입)
         initial_state = {
-            "project_id": request.project_id,
-            "user_message": request.message,
-            "action_type": request.action_type,
-            "current_phase": request.current_phase,
-            "collected_data": request.collected_data,
+            "project_id": str(request.roomId),
+            "user_message": request.content,
+            "action_type": request.actionType,
+            "current_phase": request.currentStatus,
+            "collected_data": request.collectedData,
+            "recent_messages": request.recentMessages,
+            "selected_message": request.selectedMessage,
             "is_sufficient": False,
             "ai_message": "",
-            "next_phase": request.current_phase,
+            "next_phase": request.currentStatus,
+            "template_payload": None,
         }
 
+        # LangGraph 실행
         result = ai_app.invoke(initial_state)
 
-        return ChatResponse(
-            ai_message=result["ai_message"],
-            next_phase=result["next_phase"],
-            is_sufficient=result.get("is_sufficient", False),
-            collected_data=result.get("collected_data", {}),
+        # 결과를 Spring 명세에 맞게 camelCase로 포장하여 반환
+        return AIChatResponse(
+            content=result.get("ai_message", ""),
+            suggestedQuestions=[],  # 필요시 LangGraph 노드에서 추천 질문을 배열로 뽑아서 여기에 넣으면 됩니다.
+            currentStatus=result.get("next_phase", request.currentStatus),
+            isSufficient=result.get("is_sufficient", False),
+            collectedData=result.get("collected_data", {}),
+            notionTemplatePayload=result.get("template_payload"),
         )
 
     except Exception as e:

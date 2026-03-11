@@ -51,11 +51,11 @@ async def get_steps():
         StepInfo(
             step=4,
             key=STEP_NAMES[4],
-            title="Execution Planning",
+            title="Execution Readiness",
             done_criteria=[
-                "first sprint tasks listed",
+                "next action items listed",
                 "priority and dependencies clear",
-                "review checkpoint scheduled",
+                "review owner and handoff point defined",
             ],
         ),
     ]
@@ -90,6 +90,6 @@ async def get_templates():
         },
         "role_card": {
             "template": "[Role] owns [deliverable] and reviews [handoff artifact].",
-            "example": "PM owns sprint planning and reviews weekly status report.",
+            "example": "PM owns scope notes and reviews the implementation handoff document.",
         },
     }
