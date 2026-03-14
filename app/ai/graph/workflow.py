@@ -3,12 +3,11 @@ from langgraph.graph import StateGraph, END
 from app.ai.graph.state import AgentState
 from app.ai.graph.nodes import (
     explore_problem_node,
-    generate_dev_template_node,
-    generate_plan_template_node,
     gather_information_node,
     mates_helper_node,
     topic_exists_node,
 )
+from app.ai.services.template_generation import generate_dev_template, generate_plan_template
 
 
 def route_logic(state: AgentState):
@@ -46,8 +45,8 @@ workflow = StateGraph(AgentState)
 
 workflow.add_node("explore_node", explore_problem_node)
 workflow.add_node("gather_node", gather_information_node)
-workflow.add_node("generate_plan_node", generate_plan_template_node)
-workflow.add_node("generate_dev_node", generate_dev_template_node)
+workflow.add_node("generate_plan_node", generate_plan_template)
+workflow.add_node("generate_dev_node", generate_dev_template)
 workflow.add_node("mates_node", mates_helper_node)
 workflow.add_node("topic_exists_node", topic_exists_node)
 
