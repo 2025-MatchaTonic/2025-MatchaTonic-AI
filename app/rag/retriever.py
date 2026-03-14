@@ -10,15 +10,38 @@ class EmptyRetriever:
 
 
 class PineconeFallbackRetriever:
-    def __init__(self, vectorstore: Any, current_phase: str, k: int):
+    def __init__(
+        self,
+        vectorstore: Any,
+        current_phase: str,
+        k: int,
+        *,
+        topics: list[str] | None = None,
+        doc_types: list[str] | None = None,
+    ):
         self.vectorstore = vectorstore
         self.current_phase = (current_phase or "").strip()
         self.k = max(1, int(k))
+        self.topics = [topic.strip() for topic in (topics or []) if topic.strip()]
+        self.doc_types = [
+            doc_type.strip() for doc_type in (doc_types or []) if doc_type.strip()
+        ]
+
+    def _build_filter(self, with_phase_filter: bool) -> dict[str, Any]:
+        search_filter: dict[str, Any] = {}
+        if with_phase_filter and settings.RAG_PHASE_FILTER_ENABLED and self.current_phase:
+            search_filter["phase"] = self.current_phase
+        if self.topics:
+            search_filter["topic"] = {"$in": self.topics}
+        if self.doc_types:
+            search_filter["doc_type"] = {"$in": self.doc_types}
+        return search_filter
 
     def _search(self, query: str, with_phase_filter: bool) -> List[Any]:
         search_kwargs: dict[str, Any] = {"k": self.k}
-        if with_phase_filter and settings.RAG_PHASE_FILTER_ENABLED and self.current_phase:
-            search_kwargs["filter"] = {"phase": self.current_phase}
+        search_filter = self._build_filter(with_phase_filter)
+        if search_filter:
+            search_kwargs["filter"] = search_filter
 
         try:
             return self.vectorstore.similarity_search(query, **search_kwargs)
@@ -88,7 +111,13 @@ def format_docs_for_prompt(docs: Iterable[Any]) -> str:
     return "\n".join(blocks) if blocks else "(관련 레퍼런스를 찾지 못했습니다.)"
 
 
-def get_retriever(current_phase: str, k: int | None = None):
+def get_retriever(
+    current_phase: str,
+    k: int | None = None,
+    *,
+    topics: list[str] | None = None,
+    doc_types: list[str] | None = None,
+):
     vectorstore = get_vectorstore()
     if vectorstore is None:
         return EmptyRetriever()
@@ -98,13 +127,27 @@ def get_retriever(current_phase: str, k: int | None = None):
             vectorstore=vectorstore,
             current_phase=current_phase,
             k=k or settings.RAG_TOP_K,
+            topics=topics,
+            doc_types=doc_types,
         )
     except Exception:
         return EmptyRetriever()
 
 
-def get_rag_context(*, query: str, current_phase: str, k: int | None = None) -> str:
-    retriever = get_retriever(current_phase=current_phase, k=k)
+def get_rag_context(
+    *,
+    query: str,
+    current_phase: str,
+    k: int | None = None,
+    topics: list[str] | None = None,
+    doc_types: list[str] | None = None,
+) -> str:
+    retriever = get_retriever(
+        current_phase=current_phase,
+        k=k,
+        topics=topics,
+        doc_types=doc_types,
+    )
     try:
         docs = retriever.invoke(query)
     except Exception:

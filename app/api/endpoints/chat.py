@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from app.ai.graph.workflow import ai_app
+from app.api.schemas.template import NotionTemplatePayload
 
 router = APIRouter()
 
@@ -24,18 +25,6 @@ class AIChatRequest(BaseModel):
         default_factory=list
     )  # @mates 호출 시 최근 팀 대화 목록
     selectedMessage: Optional[str] = None  # 사용자가 핵심 채팅으로 선택한 메시지
-
-
-class NotionTemplateItem(BaseModel):
-    key: str
-    parentKey: Optional[str]
-    title: str
-    content: Any
-
-
-class NotionTemplatePayload(BaseModel):
-    projectId: int
-    templates: List[NotionTemplateItem]
 
 
 # ---------------------------------------------------------
