@@ -34,6 +34,8 @@ def _csv_env(name: str, default: list[str]) -> list[str]:
 class Settings:
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
     OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini-2025-08-07")
+    OPENAI_TIMEOUT_SECONDS = _int_env("OPENAI_TIMEOUT_SECONDS", 30)
+    OPENAI_MAX_RETRIES = _int_env("OPENAI_MAX_RETRIES", 1)
     PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
     PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "ai-pm-knowledge")
     PINECONE_NAMESPACE = os.getenv("PINECONE_NAMESPACE")
