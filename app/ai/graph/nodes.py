@@ -1,5 +1,8 @@
 ﻿# app/ai/graph/nodes.py
 import json
+import logging
+import re
+from time import perf_counter
 from json import JSONDecodeError
 
 from langchain_openai import ChatOpenAI
@@ -23,21 +26,46 @@ from app.rag.retriever import get_rag_context
 # some extra safety checks below so that nodes remain robust as the
 # schema evolves.
 
+logger = logging.getLogger(__name__)
+
 LLM_MODEL = settings.OPENAI_MODEL
 
 conversation_llm = ChatOpenAI(
     model=LLM_MODEL,
     temperature=0.7,
     openai_api_key=settings.OPENAI_API_KEY,
+    timeout=settings.OPENAI_TIMEOUT_SECONDS,
+    max_retries=settings.OPENAI_MAX_RETRIES,
 )
 
 structured_llm = ChatOpenAI(
     model=LLM_MODEL,
     temperature=0.2,
     openai_api_key=settings.OPENAI_API_KEY,
+    timeout=settings.OPENAI_TIMEOUT_SECONDS,
+    max_retries=settings.OPENAI_MAX_RETRIES,
 )
 
 RAG_EMPTY_CONTEXT = "(관련 레퍼런스를 찾지 못했습니다.)"
+FAST_MATES_REPLY = (
+    "부르셨네요. 지금 막힌 점이나 정리할 내용을 한 줄로 보내주시면 바로 핵심만 답할게요."
+)
+FAST_EXPLORE_REPLY = "좋아요. 최근 일주일 동안 '이거 좀 불편하다' 싶었던 순간이 있었나요?"
+SHORT_MESSAGE_PATTERN = re.compile(r"[^a-z0-9가-힣]+")
+TRIVIAL_MESSAGES = {
+    "",
+    "hi",
+    "hello",
+    "hey",
+    "yo",
+    "안녕",
+    "안녕하세요",
+    "하이",
+    "헬로",
+    "ㅎㅇ",
+    "ㅁㅌ",
+    "mates",
+}
 
 
 PLAIN_LANGUAGE_RULES = """
@@ -89,6 +117,31 @@ def _wants_detailed_answer(user_message: str) -> bool:
     return any(keyword in user_message for keyword in detail_keywords)
 
 
+def _normalize_message(value: str) -> str:
+    lowered = str(value or "").strip().lower().replace("@mates", " ")
+    compact = SHORT_MESSAGE_PATTERN.sub("", lowered)
+    return compact.strip()
+
+
+def _is_trivial_message(user_message: str) -> bool:
+    normalized = _normalize_message(user_message)
+    return normalized in TRIVIAL_MESSAGES
+
+
+def _should_skip_rag(state: AgentState) -> bool:
+    user_message = str(state.get("user_message", ""))
+    selected_message = str(state.get("selected_message") or "")
+    recent_messages = [msg for msg in state.get("recent_messages", []) if str(msg).strip()]
+    return _is_trivial_message(user_message) and not selected_message.strip() and not recent_messages
+
+
+def _invoke_llm(llm: ChatOpenAI, prompt: str, *, label: str, **kwargs):
+    started_at = perf_counter()
+    response = llm.invoke(prompt, **kwargs)
+    logger.info("%s completed in %.2fs", label, perf_counter() - started_at)
+    return response
+
+
 def _build_rag_query(state: AgentState) -> str:
     user_message = (state.get("user_message") or "").strip()
     selected = (state.get("selected_message") or "").strip()
@@ -109,15 +162,27 @@ def _fetch_rag_context(
     topics: list[str] | None = None,
     doc_types: list[str] | None = None,
 ) -> str:
+    if _should_skip_rag(state):
+        logger.info("rag skipped for trivial message phase=%s", phase)
+        return RAG_EMPTY_CONTEXT
+
     query = _build_rag_query(state)
     if not query:
         return RAG_EMPTY_CONTEXT
 
+    started_at = perf_counter()
     context = get_rag_context(
         query=query,
         current_phase=phase,
         topics=topics,
         doc_types=doc_types,
+    )
+    logger.info(
+        "rag fetched in %.2fs phase=%s query_chars=%d context_chars=%d",
+        perf_counter() - started_at,
+        phase,
+        len(query),
+        len(context or ""),
     )
     return context or RAG_EMPTY_CONTEXT
 
@@ -528,6 +593,12 @@ def _build_topic_exists_fallback_message() -> str:
 # ----------------------------------------------------
 # 1. 아이디어가 없을 때 (NO 선택) : 탐색 노드
 def explore_problem_node(state: AgentState):
+    if _is_trivial_message(str(state.get("user_message", ""))) and not state.get("recent_messages"):
+        return {
+            "ai_message": FAST_EXPLORE_REPLY,
+            "next_phase": "EXPLORE",
+        }
+
     rag_context = _fetch_rag_context(
         state,
         phase="EXPLORE",
@@ -556,7 +627,7 @@ def explore_problem_node(state: AgentState):
     {state['user_message']}
     """
 
-    response = conversation_llm.invoke(prompt)
+    response = _invoke_llm(conversation_llm, prompt, label="explore_problem_node llm")
 
     return {
         "ai_message": response.content,
@@ -595,7 +666,7 @@ def topic_exists_node(state: AgentState):
         [사용자 입력]
         {user_message}
         """
-        response = conversation_llm.invoke(prompt)
+        response = _invoke_llm(conversation_llm, prompt, label="topic_exists_node llm")
         ai_message = str(response.content).strip() or _build_topic_exists_fallback_message()
 
     return {
@@ -655,8 +726,10 @@ def gather_information_node(state: AgentState):
     """
 
     # JSON 형태로만 응답하도록 강제
-    response = structured_llm.invoke(
+    response = _invoke_llm(
+        structured_llm,
         eval_prompt,
+        label="gather_information_node llm",
         response_format={"type": "json_object"},
     )
     try:
@@ -700,6 +773,9 @@ def gather_information_node(state: AgentState):
 # ----------------------------------------------------
 def mates_helper_node(state: AgentState):
     user_message = str(state.get("user_message", ""))
+    if _is_trivial_message(user_message) and not state.get("recent_messages"):
+        return {"ai_message": FAST_MATES_REPLY, "next_phase": state["current_phase"]}
+
     detailed_mode = _wants_detailed_answer(user_message)
     response_style = (
         "- 상세 모드(사용자가 상세 요청 시): 최대 6개 bullet, 각 bullet 1~2문장, 완결된 문장으로만 답하세요.\n"
@@ -744,7 +820,7 @@ def mates_helper_node(state: AgentState):
     사용자 메시지:
     {user_message}
     """
-    response = conversation_llm.invoke(helper_prompt)
+    response = _invoke_llm(conversation_llm, helper_prompt, label="mates_helper_node llm")
     ai_message = str(response.content).strip()
     return {"ai_message": ai_message, "next_phase": state["current_phase"]}
 
