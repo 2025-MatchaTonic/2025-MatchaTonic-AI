@@ -6,11 +6,6 @@ on:
     types:
       - completed
   workflow_dispatch:
-    inputs:
-      deploy_ref:
-        description: "Git ref to deploy"
-        required: false
-        default: "main"
 
 concurrency:
   group: production-deploy
@@ -25,25 +20,146 @@ jobs:
        github.event.workflow_run.head_branch == 'main')
     runs-on: ubuntu-latest
     environment: production
+    permissions:
+      contents: read
 
     steps:
-      - name: Deploy to EC2
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image metadata
+        id: image
+        shell: bash
+        env:
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+        run: |
+          if [ -z "$ECR_REPOSITORY" ]; then
+            echo "ECR_REPOSITORY is missing"
+            exit 1
+          fi
+
+          echo "image_uri=${ECR_REPOSITORY}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "latest_image_uri=${ECR_REPOSITORY}:latest" >> "$GITHUB_OUTPUT"
+          echo "ecr_registry=${ECR_REPOSITORY%%/*}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.image.outputs.image_uri }}
+            ${{ steps.image.outputs.latest_image_uri }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Deploy image to EC2
         uses: appleboy/ssh-action@v1.0.3
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          APP_DIR: ${{ secrets.EC2_APP_DIR }}
+          ECR_REGISTRY: ${{ steps.image.outputs.ecr_registry }}
+          IMAGE_URI: ${{ steps.image.outputs.image_uri }}
+          CONTAINER_NAME: matchatonic-ai
+          HOST_PORT: "8000"
+          APP_PORT: "8000"
+          HEALTHCHECK_URL: http://127.0.0.1:8000/
+          BIND_ADDRESS: 0.0.0.0
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USERNAME }}
           key: ${{ secrets.EC2_SSH_KEY }}
-          port: ${{ secrets.EC2_PORT || '22' }}
+          port: ${{ secrets.EC2_PORT }}
           script_stop: true
+          envs: AWS_REGION,APP_DIR,ECR_REGISTRY,IMAGE_URI,CONTAINER_NAME,HOST_PORT,APP_PORT,HEALTHCHECK_URL,BIND_ADDRESS
           script: |
-            export DEPLOY_REF="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.deploy_ref || 'main' }}"
-            export APP_DIR="${{ secrets.EC2_APP_DIR }}"
-            export IMAGE_NAME="matchatonic-ai"
-            export CONTAINER_NAME="matchatonic-ai"
-            export HOST_PORT="8000"
-            export APP_PORT="8000"
-            export HEALTHCHECK_URL="http://127.0.0.1:8000/"
-            export BIND_ADDRESS="0.0.0.0"
+            bash -s <<'EOF'
+            set -Eeuo pipefail
 
-            cd "$APP_DIR"
-            bash scripts/deploy_ec2.sh
+            APP_DIR="${APP_DIR:?missing APP_DIR}"
+            AWS_REGION="${AWS_REGION:?missing AWS_REGION}"
+            ECR_REGISTRY="${ECR_REGISTRY:?missing ECR_REGISTRY}"
+            IMAGE_URI="${IMAGE_URI:?missing IMAGE_URI}"
+            CONTAINER_NAME="${CONTAINER_NAME:-matchatonic-ai}"
+            HOST_PORT="${HOST_PORT:-8000}"
+            APP_PORT="${APP_PORT:-8000}"
+            HEALTHCHECK_URL="${HEALTHCHECK_URL:-http://127.0.0.1:${HOST_PORT}/}"
+            BIND_ADDRESS="${BIND_ADDRESS:-0.0.0.0}"
+            ENV_FILE="${ENV_FILE:-${APP_DIR}/.env}"
+
+            if ! command -v docker >/dev/null 2>&1; then
+              echo "docker is not installed"
+              exit 1
+            fi
+
+            if ! command -v aws >/dev/null 2>&1; then
+              echo "aws cli is not installed on EC2"
+              exit 1
+            fi
+
+            if [ ! -f "$ENV_FILE" ]; then
+              echo "missing env file: $ENV_FILE"
+              exit 1
+            fi
+
+            PREVIOUS_IMAGE_ID="$(docker inspect --format '{{.Image}}' "$CONTAINER_NAME" 2>/dev/null || true)"
+
+            echo "[deploy] logging in to ECR"
+            aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+            echo "[deploy] pulling image: $IMAGE_URI"
+            docker pull "$IMAGE_URI"
+
+            if docker ps -a --format '{{.Names}}' | grep -Fxq "$CONTAINER_NAME"; then
+              echo "[deploy] removing existing container"
+              docker rm -f "$CONTAINER_NAME"
+            fi
+
+            echo "[deploy] starting new container"
+            docker run -d \
+              --name "$CONTAINER_NAME" \
+              --restart unless-stopped \
+              --env-file "$ENV_FILE" \
+              -p "${BIND_ADDRESS}:${HOST_PORT}:${APP_PORT}" \
+              "$IMAGE_URI"
+
+            echo "[deploy] waiting for health check: $HEALTHCHECK_URL"
+            for _ in $(seq 1 30); do
+              if curl -fsS "$HEALTHCHECK_URL" >/dev/null 2>&1; then
+                echo "[deploy] health check passed"
+                docker ps --filter "name=${CONTAINER_NAME}"
+                exit 0
+              fi
+              sleep 2
+            done
+
+            echo "[deploy] health check failed"
+            docker logs "$CONTAINER_NAME" || true
+            docker rm -f "$CONTAINER_NAME" || true
+
+            if [ -n "$PREVIOUS_IMAGE_ID" ]; then
+              echo "[deploy] rolling back to previous image"
+              docker run -d \
+                --name "$CONTAINER_NAME" \
+                --restart unless-stopped \
+                --env-file "$ENV_FILE" \
+                -p "${BIND_ADDRESS}:${HOST_PORT}:${APP_PORT}" \
+                "$PREVIOUS_IMAGE_ID"
+            fi
+
+            exit 1
+            EOF
