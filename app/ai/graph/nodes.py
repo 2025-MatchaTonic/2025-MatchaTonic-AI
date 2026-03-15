@@ -23,7 +23,7 @@ from app.rag.retriever import get_rag_context
 # some extra safety checks below so that nodes remain robust as the
 # schema evolves.
 
-LLM_MODEL = "gpt-5-mini-2025-08-07"
+LLM_MODEL = settings.OPENAI_MODEL
 
 conversation_llm = ChatOpenAI(
     model=LLM_MODEL,

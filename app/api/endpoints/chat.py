@@ -1,50 +1,81 @@
 # app/api/endpoints/chat.py
+import logging
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, root_validator
 
 from app.ai.graph.workflow import ai_app
 from app.api.schemas.template import NotionTemplatePayload
+from app.core.request_normalization import (
+    normalize_action_type,
+    normalize_collected_data,
+    normalize_optional_string,
+    normalize_phase,
+    normalize_string_list,
+)
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------
-# 1. Spring -> FastAPI 로 보내는 요청 (Internal Request)
-# ---------------------------------------------------------
 class AIChatRequest(BaseModel):
-    roomId: int  # Spring 명세의 roomId 반영
-    content: str  # 사용자 채팅 내용 (명세서의 content 반영)
-    actionType: str  # "CHAT", "BTN_YES", "BTN_NO", "BTN_PLAN", "BTN_DEV" 등
-    currentStatus: str  # 명세서의 현재 상태값
-    collectedData: Dict[str, str] = Field(
-        default_factory=dict
-    )  # Spring DB에 저장된 이전 데이터
-    recentMessages: List[str] = Field(
-        default_factory=list
-    )  # @mates 호출 시 최근 팀 대화 목록
-    selectedMessage: Optional[str] = None  # 사용자가 핵심 채팅으로 선택한 메시지
+    roomId: int
+    content: str = ""
+    actionType: str = "CHAT"
+    currentStatus: str = "EXPLORE"
+    collectedData: Dict[str, str] = Field(default_factory=dict)
+    recentMessages: List[str] = Field(default_factory=list)
+    selectedMessage: Optional[str] = None
+    selectedAnswers: List[str] = Field(default_factory=list)
+
+    @root_validator(pre=True)
+    def normalize_spring_compatible_payload(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+        payload = dict(values or {})
+
+        if payload.get("roomId") is None and payload.get("projectId") is not None:
+            payload["roomId"] = payload["projectId"]
+
+        payload["actionType"] = normalize_action_type(payload.get("actionType"), default="CHAT")
+        payload["currentStatus"] = normalize_phase(payload.get("currentStatus"), default="EXPLORE")
+        payload["collectedData"] = normalize_collected_data(payload.get("collectedData"))
+
+        selected_answers = normalize_string_list(payload.get("selectedAnswers"))
+        payload["selectedAnswers"] = selected_answers
+
+        recent_messages = normalize_string_list(payload.get("recentMessages"))
+        if not recent_messages and selected_answers:
+            recent_messages = list(selected_answers)
+        payload["recentMessages"] = recent_messages
+
+        selected_message = normalize_optional_string(payload.get("selectedMessage"))
+        if selected_message is None and selected_answers:
+            selected_message = selected_answers[-1]
+        payload["selectedMessage"] = selected_message
+
+        content = normalize_optional_string(payload.get("content")) or ""
+        if not content:
+            if selected_message:
+                content = selected_message
+            elif selected_answers:
+                content = "\n".join(selected_answers)
+        payload["content"] = content
+
+        return payload
 
 
-# ---------------------------------------------------------
-# 2. FastAPI -> Spring 으로 돌려주는 응답 (Internal Response)
-# ---------------------------------------------------------
 class AIChatResponse(BaseModel):
-    content: str  # AI 응답 텍스트 (Spring 명세의 aiResponse.content 에 맵핑)
-    suggestedQuestions: List[
-        str
-    ]  # 프론트엔드 버튼/추천질문용 (Spring 명세의 suggestedQuestions 에 맵핑)
-    currentStatus: str  # 변경된 진행 단계 (Spring 명세의 currentStatus 에 맵핑)
-    isSufficient: bool  # 템플릿 생성 가능 여부
-    collectedData: Dict[str, str]  # 업데이트된 기획 데이터 (Spring이 DB에 저장해야 함)
+    content: str
+    suggestedQuestions: List[str]
+    currentStatus: str
+    isSufficient: bool
+    collectedData: Dict[str, str]
     notionTemplatePayload: Optional[NotionTemplatePayload] = None
 
 
 @router.post("/", response_model=AIChatResponse)
 async def process_chat(request: AIChatRequest):
     try:
-        # LangGraph 상태 초기화 (snake_case로 변환하여 내부 로직에 주입)
         initial_state = {
             "project_id": str(request.roomId),
             "user_message": request.content,
@@ -59,19 +90,17 @@ async def process_chat(request: AIChatRequest):
             "template_payload": None,
         }
 
-        # LangGraph 실행
         result = ai_app.invoke(initial_state)
 
-        # 결과를 Spring 명세에 맞게 camelCase로 포장하여 반환
         return AIChatResponse(
             content=result.get("ai_message", ""),
-            suggestedQuestions=[],  # 필요시 LangGraph 노드에서 추천 질문을 배열로 뽑아서 여기에 넣으면 됩니다.
+            suggestedQuestions=[],
             currentStatus=result.get("next_phase", request.currentStatus),
             isSufficient=result.get("is_sufficient", False),
             collectedData=result.get("collected_data", {}),
             notionTemplatePayload=result.get("template_payload"),
         )
 
-    except Exception as e:
-        print(f"Error: {e}")
+    except Exception as exc:
+        logger.exception("AI chat processing failed: %s", exc)
         raise HTTPException(status_code=500, detail="AI 처리 중 오류 발생")

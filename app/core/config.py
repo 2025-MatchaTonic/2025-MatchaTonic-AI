@@ -23,11 +23,23 @@ def _bool_env(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "t", "yes", "y", "on"}
 
 
+def _csv_env(name: str, default: list[str]) -> list[str]:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    items = [item.strip() for item in raw.split(",") if item.strip()]
+    return items or default
+
+
 class Settings:
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+    OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini-2025-08-07")
     PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
     PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "ai-pm-knowledge")
     PINECONE_NAMESPACE = os.getenv("PINECONE_NAMESPACE")
+    AI_CORS_ALLOW_ORIGINS = _csv_env("AI_CORS_ALLOW_ORIGINS", ["*"])
+    REQUIRE_OPENAI_API_KEY = _bool_env("REQUIRE_OPENAI_API_KEY", True)
+    REQUIRE_PINECONE_FOR_RAG = _bool_env("REQUIRE_PINECONE_FOR_RAG", False)
 
     RAG_TOP_K = _int_env("RAG_TOP_K", 4)
     RAG_MAX_CONTEXT_CHARS = _int_env("RAG_MAX_CONTEXT_CHARS", 2400)
