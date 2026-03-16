@@ -90,6 +90,7 @@ def _build_template_state(request: TemplateGenerateRequest) -> dict:
         "user_message": user_message,
         "action_type": "BTN_DEV" if request.templateType == "dev" else "BTN_PLAN",
         "current_phase": request.currentStatus,
+        "turn_policy": "ANSWER_ONLY",
         "collected_data": request.collectedData,
         "recent_messages": request.recentMessages,
         "selected_message": request.selectedMessage,

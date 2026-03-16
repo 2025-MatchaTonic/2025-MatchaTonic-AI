@@ -1,5 +1,13 @@
 # app/ai/graph/state.py
-from typing import Any, Dict, List, Optional, TypedDict
+from typing import Any, Dict, List, Literal, Optional, TypedDict
+
+
+TurnPolicy = Literal[
+    "ASK_ONLY",
+    "CAPTURE_TITLE",
+    "ANSWER_ONLY",
+    "ANSWER_THEN_ASK",
+]
 
 
 class AgentState(TypedDict):
@@ -7,6 +15,7 @@ class AgentState(TypedDict):
     user_message: str
     action_type: str  # Spring에서 넘겨주는 이벤트: "CHAT", "BTN_YES", "BTN_NO", "BTN_PLAN", "BTN_DEV"
     current_phase: str  # Spring에서 관리하는 현재 단계 (예: INIT, EXPLORE, TOPIC_SET)
+    turn_policy: TurnPolicy
     recent_messages: List[str]
     selected_message: Optional[str]
 

@@ -10,11 +10,10 @@ from pydantic import ValidationError
 
 from app.ai.schemas.llm_outputs import GatherLLMResponse
 from app.ai.graph.collected_data import (
-    build_collected_data_guide,
     build_collected_data_json_example,
     merge_collected_data,
 )
-from app.ai.graph.state import AgentState
+from app.ai.graph.state import AgentState, TurnPolicy
 from app.core.config import settings
 from app.rag.retriever import get_rag_context
 
@@ -47,16 +46,21 @@ structured_llm = ChatOpenAI(
 )
 
 RAG_EMPTY_CONTEXT = "(관련 레퍼런스를 찾지 못했습니다.)"
-FAST_MATES_REPLY = (
-    "부르셨네요. 지금 막힌 점이나 정리할 내용을 한 줄로 보내주시면 바로 핵심만 답할게요."
-)
 FAST_EXPLORE_REPLY = "좋아요. 최근 일주일 동안 '이거 좀 불편하다' 싶었던 순간이 있었나요?"
 SHORT_MESSAGE_PATTERN = re.compile(r"[^a-z0-9가-힣]+")
+MATES_MENTION_PATTERN = re.compile(r"@mates\b", re.IGNORECASE)
 FAST_TOPIC_EXISTS_REPLY = (
     "좋아요. 이미 생각해둔 주제가 있다면 그 주제를 한두 줄로만 보내주세요. "
     "예를 들면 '대학생 팀플 일정 관리 앱'처럼 적어주시면 바로 방향을 같이 정리하겠습니다."
 )
 BUTTON_ONLY_PATTERN = re.compile(r"[\s\.\,\!\?]+")
+TRAILING_TOPIC_ENDINGS_PATTERN = re.compile(
+    r"(이에요|예요|입니다|이요|요|입니다요|하고 싶어요|하려고 해요|생각 중이에요|같아요)$"
+)
+QUESTION_LINE_ENDING_PATTERN = re.compile(
+    r"(\?|？)\s*$|"
+    r"(인가요|있나요|없나요|어떤가요|뭔가요|무엇인가요|왜인가요|어떨까요|할까요|볼까요|나요|까요)\s*$"
+)
 TRIVIAL_MESSAGES = {
     "",
     "hi",
@@ -193,24 +197,22 @@ RAG_FILTERS_BY_PHASE: dict[str, dict[str, list[str]]] = {
 }
 
 
-def _wants_detailed_answer(user_message: str) -> bool:
-    detail_keywords = (
-        "자세히",
-        "구체",
-        "상세",
-        "예시",
-        "템플릿",
-        "단계",
-        "체크리스트",
-        "플랜",
-    )
-    return any(keyword in user_message for keyword in detail_keywords)
-
-
 def _normalize_message(value: str) -> str:
-    lowered = str(value or "").strip().lower().replace("@mates", " ")
+    lowered = MATES_MENTION_PATTERN.sub(" ", str(value or "").strip().lower())
     compact = SHORT_MESSAGE_PATTERN.sub("", lowered)
     return compact.strip()
+
+
+def _strip_mates_mention(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    stripped = MATES_MENTION_PATTERN.sub(" ", text)
+    return re.sub(r"\s+", " ", stripped).strip()
+
+
+def _effective_user_message(state: AgentState) -> str:
+    return _strip_mates_mention(state.get("user_message"))
 
 
 def _is_trivial_message(user_message: str) -> bool:
@@ -244,9 +246,112 @@ def _is_initial_button_selection(state: AgentState) -> bool:
     return all(candidate in INITIAL_BUTTON_TOKENS for candidate in normalized_candidates)
 
 
+def _get_turn_policy(state: AgentState) -> TurnPolicy:
+    return state.get("turn_policy", "ANSWER_THEN_ASK")
+
+
+def _is_answer_only_turn(state: AgentState) -> bool:
+    return _get_turn_policy(state) == "ANSWER_ONLY"
+
+
+def _is_capture_title_turn(state: AgentState) -> bool:
+    return _get_turn_policy(state) == "CAPTURE_TITLE"
+
+
+def _extract_topic_candidate(user_message: str) -> str:
+    text = _clean_text(user_message)
+    if not text or "?" in text:
+        return ""
+
+    patterns = (
+        r"^(?:프로젝트\s*주제|주제|아이디어)\s*(?:는|은|으론|로는|은요|는요)?\s*(.+)$",
+        r"^(?:저희|우리는|우리 팀은|저는)\s+(.+)$",
+    )
+    candidate = text
+    for pattern in patterns:
+        match = re.match(pattern, candidate, flags=re.IGNORECASE)
+        if match:
+            candidate = match.group(1).strip()
+            break
+
+    cleanup_patterns = (
+        r"\s*(?:을|를)?\s*주제로\s*(?:할게요|하려고 해요|하고 싶어요)$",
+        r"\s*(?:을|를)?\s*만들고\s*싶어요$",
+        r"\s*(?:을|를)?\s*생각하고\s*있어요$",
+        r"\s*(?:으로|로)\s*하려고\s*해요$",
+    )
+    for pattern in cleanup_patterns:
+        candidate = re.sub(pattern, "", candidate, flags=re.IGNORECASE).strip()
+
+    candidate = TRAILING_TOPIC_ENDINGS_PATTERN.sub("", candidate).strip(" .,!?:;\"'")
+    if not candidate:
+        return ""
+
+    if len(candidate) > 60:
+        return ""
+
+    return candidate
+
+
+def _seed_topic_title(state: AgentState, current_data: dict[str, str]) -> dict[str, str]:
+    if state.get("current_phase") != "TOPIC_SET":
+        return {}
+    if _is_meaningful_fact(current_data.get("title")):
+        return {}
+
+    candidate = _extract_topic_candidate(_effective_user_message(state))
+    if not candidate:
+        return {}
+
+    return {"title": candidate}
+
+
+def _looks_like_question_line(text: str) -> bool:
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return False
+    candidate = cleaned.lstrip("-*0123456789. ").strip()
+    return bool(QUESTION_LINE_ENDING_PATTERN.search(candidate))
+
+
+def _trim_trailing_question_lines(message: str) -> str:
+    lines = [line.rstrip() for line in str(message or "").splitlines()]
+    while lines and not lines[-1].strip():
+        lines.pop()
+    while lines and _looks_like_question_line(lines[-1]):
+        lines.pop()
+        while lines and not lines[-1].strip():
+            lines.pop()
+    return "\n".join(lines).strip()
+
+
+def _answer_only_fallback(state: AgentState, message: str) -> str:
+    if str(message or "").strip():
+        return str(message).strip()
+
+    phase = state.get("current_phase", "GATHER")
+    if phase == "EXPLORE":
+        return "지금까지 나온 이야기만 보면 먼저 팀이 실제로 자주 겪는 불편을 한 가지로 좁혀보는 게 좋겠습니다."
+    if phase == "TOPIC_SET":
+        return "지금까지 나온 내용을 기준으로 이 주제가 풀고 싶은 핵심 문제를 한 문장으로 정리해보는 게 좋겠습니다."
+    return "지금까지 나온 내용을 기준으로 핵심 방향부터 짧게 정리하고 다음 판단으로 넘어가는 게 좋겠습니다."
+
+
+def _apply_turn_policy_to_message(state: AgentState, message: str) -> str:
+    cleaned = str(message or "").strip()
+    if not cleaned:
+        return _answer_only_fallback(state, cleaned)
+
+    if _is_answer_only_turn(state):
+        trimmed = _trim_trailing_question_lines(cleaned)
+        return _answer_only_fallback(state, trimmed)
+
+    return cleaned
+
+
 def _should_skip_rag(state: AgentState) -> bool:
-    user_message = str(state.get("user_message", ""))
-    selected_message = str(state.get("selected_message") or "")
+    user_message = _effective_user_message(state)
+    selected_message = _strip_mates_mention(state.get("selected_message"))
     recent_messages = [msg for msg in state.get("recent_messages", []) if str(msg).strip()]
     return _is_trivial_message(user_message) and not selected_message.strip() and not recent_messages
 
@@ -259,9 +364,13 @@ def _invoke_llm(llm: ChatOpenAI, prompt: str, *, label: str, **kwargs):
 
 
 def _build_rag_query(state: AgentState) -> str:
-    user_message = (state.get("user_message") or "").strip()
-    selected = (state.get("selected_message") or "").strip()
-    recent = [msg.strip() for msg in state.get("recent_messages", []) if msg.strip()]
+    user_message = _effective_user_message(state)
+    selected = _strip_mates_mention(state.get("selected_message"))
+    recent = [
+        _strip_mates_mention(msg)
+        for msg in state.get("recent_messages", [])
+        if _strip_mates_mention(msg)
+    ]
 
     parts = [user_message]
     if selected:
@@ -342,8 +451,12 @@ def _detect_gather_focus(text: str) -> str | None:
 
 def _infer_conversation_focus(state: AgentState) -> str | None:
     candidates: list[str] = []
-    selected_message = _clean_text(state.get("selected_message"))
-    recent_messages = [_clean_text(msg) for msg in state.get("recent_messages", []) if _clean_text(msg)]
+    selected_message = _clean_text(_strip_mates_mention(state.get("selected_message")))
+    recent_messages = [
+        _clean_text(_strip_mates_mention(msg))
+        for msg in state.get("recent_messages", [])
+        if _clean_text(_strip_mates_mention(msg))
+    ]
 
     if selected_message:
         candidates.append(selected_message)
@@ -740,8 +853,12 @@ def _build_notion_template_payload(state: AgentState, sections: dict) -> dict:
 
 
 def _build_recent_context(state: AgentState) -> str:
-    selected_message = (state.get("selected_message") or "").strip()
-    recent_messages = [msg.strip() for msg in state.get("recent_messages", []) if msg.strip()]
+    selected_message = _strip_mates_mention(state.get("selected_message"))
+    recent_messages = [
+        _strip_mates_mention(msg)
+        for msg in state.get("recent_messages", [])
+        if _strip_mates_mention(msg)
+    ]
 
     context_blocks: list[str] = []
     if selected_message:
@@ -815,23 +932,22 @@ def _build_template_content_example() -> dict:
 
 
 def _build_topic_exists_fallback_message() -> str:
-    return (
-        "좋아요. 이미 프로젝트 주제가 있다면 이제 팀원끼리 자유롭게 논의하면 됩니다. "
-        "막히는 지점이 생기면 최근 대화와 함께 @mates 를 호출해 주세요. "
-        "제가 문맥을 읽고 방향 정리, 우선순위, 역할 분담, 요구사항 정리까지 도와드릴게요."
-    )
+    return FAST_TOPIC_EXISTS_REPLY
 
 
 # ----------------------------------------------------
 # 1. 아이디어가 없을 때 (NO 선택) : 탐색 노드
 def explore_problem_node(state: AgentState):
+    user_message = _effective_user_message(state)
+    turn_policy = _get_turn_policy(state)
+
     if _is_initial_button_selection(state):
         return {
             "ai_message": FAST_EXPLORE_REPLY,
             "next_phase": "EXPLORE",
         }
 
-    if _is_trivial_message(str(state.get("user_message", ""))) and not state.get("recent_messages"):
+    if _is_trivial_message(user_message) and not state.get("recent_messages"):
         return {
             "ai_message": FAST_EXPLORE_REPLY,
             "next_phase": "EXPLORE",
@@ -854,21 +970,28 @@ def explore_problem_node(state: AgentState):
     {recent_context}
 
     [중요 지시사항]
-    1. 무조건 **한 번에 딱 1개의 질문**만 던지세요. 절대 여러 개를 동시에 묻지 마세요!
-    2. 사용자가 대답을 했다면, 먼저 그 대답에 깊이 공감해 준 뒤에 꼬리를 무는 질문을 1개 던지세요.
-    3. 첫 시작이라면 이렇게 가볍게 물어보세요: "최근 일주일 동안 '아, 이거 진짜 귀찮다' 했던 적이 있나요?"
-    4. 대화가 자연스럽게 이어지도록 친구처럼 편안한 말투를 사용하세요.
-    5. 아래 원칙을 반드시 지키세요.
+    1. 사용자가 방금 말한 내용이나 최근 팀 대화에 담긴 질문/고민에 먼저 반응하고 답하세요.
+    2. 질문은 **정말 다음 판단에 필요할 때만** 마지막에 1개까지 하세요. 답변만으로 흐름이 충분히 이어지면 질문 없이 끝내세요.
+    3. 사용자가 대답을 했다면, 먼저 그 대답에 깊이 공감하거나 요약한 뒤에 필요한 경우에만 꼬리 질문을 1개 던지세요.
+    4. 첫 시작이고 아직 문맥이 거의 없다면 이렇게 가볍게 물어보세요: "최근 일주일 동안 '아, 이거 진짜 귀찮다' 했던 적이 있나요?"
+    5. 대화가 자연스럽게 이어지도록 친구처럼 편안한 말투를 사용하세요.
+    6. 직접 사용자 입력이 비어 있더라도 최근 팀 대화에 unresolved point가 있으면 그 문맥을 이어서 답하세요.
+    7. 아래 원칙을 반드시 지키세요.
     {PLAIN_LANGUAGE_RULES}
+
+    [현재 턴 정책]
+    {turn_policy}
+    - ANSWER_ONLY면 설명이나 정리로 답변을 끝내고, 질문으로 마무리하지 마세요.
+    - ANSWER_THEN_ASK면 답변이 충분한 경우 질문 없이 끝내도 됩니다.
     
     [사용자 입력]
-    {state['user_message']}
+    {user_message}
     """
 
     response = _invoke_llm(conversation_llm, prompt, label="explore_problem_node llm")
 
     return {
-        "ai_message": response.content,
+        "ai_message": _apply_turn_policy_to_message(state, str(response.content)),
         "next_phase": "EXPLORE",  # 계속 탐색 단계 유지
     }
 
@@ -883,7 +1006,33 @@ def topic_exists_node(state: AgentState):
             "next_phase": "TOPIC_SET",
         }
 
-    user_message = (state.get("user_message") or "").strip()
+    user_message = _effective_user_message(state)
+    current_data = _prune_collected_data(state.get("collected_data") or {})
+    extracted_title = ""
+    if _is_capture_title_turn(state) or not _is_meaningful_fact(current_data.get("title")):
+        extracted_title = _extract_topic_candidate(user_message)
+    if extracted_title:
+        merged_data = merge_collected_data(current_data, {"title": extracted_title})
+        return {
+            "ai_message": (
+                f"좋아요. 주제는 '{extracted_title}'로 이해했어요. "
+                "이 주제로 어떤 문제를 풀고 싶은지, 또는 어떤 결과물을 만들고 싶은지 한두 줄로 말해 주세요."
+            ),
+            "collected_data": merged_data,
+            "is_sufficient": _is_template_ready(merged_data),
+            "next_phase": "GATHER",
+        }
+    if not _is_meaningful_fact(current_data.get("title")) and user_message:
+        return {
+            "ai_message": (
+                "주제 후보를 이해하려면 한 줄로 더 구체적으로 적어주셔야 합니다. "
+                "예를 들면 '대학생 팀플 일정 관리 앱'처럼 적어 주세요."
+            ),
+            "collected_data": current_data,
+            "is_sufficient": False,
+            "next_phase": "TOPIC_SET",
+        }
+
     recent_context = _build_recent_context(state)
     has_recent_context = recent_context != "(전달된 최근 대화 없음)"
 
@@ -923,11 +1072,16 @@ def topic_exists_node(state: AgentState):
 # 2. 아이디어가 있을 때 (YES 선택) : 정보 수집 노드 (자연스러운 HMW)
 # ----------------------------------------------------
 def gather_information_node(state: AgentState):
+    user_message = _effective_user_message(state)
+    turn_policy = _get_turn_policy(state)
     current_data = _prune_collected_data(state.get("collected_data") or {})
+    prefilled_data = merge_collected_data(current_data, _seed_topic_title(state, current_data))
     was_ready = _is_template_ready(current_data)
     focus_type = _infer_conversation_focus(state)
+    if state.get("current_phase") == "TOPIC_SET" and _is_meaningful_fact(prefilled_data.get("title")):
+        focus_type = focus_type or "goal"
     focus_instruction = _build_gather_focus_instruction(focus_type)
-    missing_field_summary = _build_missing_field_summary(current_data)
+    missing_field_summary = _build_missing_field_summary(prefilled_data)
     rag_context = _fetch_rag_context(
         state,
         phase=state.get("current_phase", "GATHER"),
@@ -951,10 +1105,15 @@ def gather_information_node(state: AgentState):
 
     Core rules:
     - If the user asks a question, answer it first.
+    - If the direct user message is empty because the user only mentioned @mates, infer the request from the recent conversation and respond to the most relevant unresolved point.
+    - If current_phase is TOPIC_SET and the user seems to have provided a project subject, capture it as title in updated_data.title.
+    - If title is already identified in TOPIC_SET, the next turn should help clarify what problem the topic solves or what outcome the team wants, instead of asking for the title again.
     - If the user does not know, do not repeat the same question. Give options, examples, decision criteria, or a recommendation.
     - If the user asks for ideas, provide 2 to 4 realistic options and recommend one when possible.
     - If the user asks for a summary, summarize confirmed decisions, unresolved points, and the next decision to make.
+    - Do not jump to the next checklist question before addressing the current request.
     - Ask at most one short follow-up question, and only if it meaningfully helps the next decision.
+    - If your answer already feels complete enough for this turn, end without a follow-up question.
     - Avoid customer-support tone, interview-style repetitive questioning, and system-style phrases.
     - If the user sounds frustrated, acknowledge it briefly and then move to practical help.
     - collected_data is internal structured state. Only store confirmed facts from the conversation.
@@ -964,6 +1123,12 @@ def gather_information_node(state: AgentState):
     - Follow these writing rules as well:
     {PLAIN_LANGUAGE_RULES}
 
+    [Current turn policy]
+    {turn_policy}
+    - ANSWER_ONLY: answer the current request and finish without a follow-up question.
+    - ANSWER_THEN_ASK: answer first, then optionally add one short follow-up question only if needed.
+    - CAPTURE_TITLE: if a project subject is present, store it as updated_data.title before anything else.
+
     [Reference context]
     {rag_context}
 
@@ -971,7 +1136,7 @@ def gather_information_node(state: AgentState):
     {recent_context}
 
     [Current collected data]
-    {json.dumps(current_data, ensure_ascii=False)}
+    {json.dumps(prefilled_data, ensure_ascii=False)}
 
     [Still missing]
     {missing_field_summary}
@@ -980,7 +1145,7 @@ def gather_information_node(state: AgentState):
     {focus_type or "none"}
 
     [User message]
-    {state['user_message']}
+    {user_message}
 
     [Required JSON output]
     {{
@@ -993,6 +1158,7 @@ def gather_information_node(state: AgentState):
     [Output criteria]
     - ai_message should be 2 to 5 sentences, or up to 4 short bullets.
     - If the user asked for advice, ideas, or a summary, ai_message must contain real content. Do not only ask another question.
+    - Prefer finishing with an answer. Add a follow-up question only when the conversation genuinely needs one more decision input.
     - updated_data must contain only confirmed facts from this turn.
     - If the user asked for recommendations, explanations, or said they do not know, updated_data may be empty.
     - Be conservative with is_sufficient. The server will validate readiness again.
@@ -1014,13 +1180,13 @@ def gather_information_node(state: AgentState):
         )
 
     filtered_updates = _filter_gather_updates(
-        state["user_message"],
+        user_message,
         result.normalized_updated_data(),
         focus_type=focus_type,
     )
-    merged_data = merge_collected_data(current_data, filtered_updates)
+    merged_data = merge_collected_data(prefilled_data, filtered_updates)
     is_sufficient = _is_template_ready(merged_data)
-    ai_msg = result.ai_message.strip()
+    ai_msg = _apply_turn_policy_to_message(state, result.ai_message)
 
     if is_sufficient and not was_ready:
         ai_msg += (
@@ -1037,60 +1203,4 @@ def gather_information_node(state: AgentState):
         "next_phase": next_phase,
     }
 
-
-# ----------------------------------------------------
-# 4. @mates ?? ?? ?? 멘션 호출 노드
-# ----------------------------------------------------
-def mates_helper_node(state: AgentState):
-    user_message = str(state.get("user_message", ""))
-    if _is_trivial_message(user_message) and not state.get("recent_messages"):
-        return {"ai_message": FAST_MATES_REPLY, "next_phase": state["current_phase"]}
-
-    detailed_mode = _wants_detailed_answer(user_message)
-    response_style = (
-        "- 상세 모드(사용자가 상세 요청 시): 최대 6개 bullet, 각 bullet 1~2문장, 완결된 문장으로만 답하세요.\n"
-        if detailed_mode
-        else "- 기본 모드(기본값): 2~4문장 또는 bullet 최대 3개, 모든 문장은 끝까지 완결되게 작성하세요.\n"
-    )
-    recent_context = _build_recent_context(state)
-    current_phase = state.get("current_phase", "TOPIC_SET")
-    rag_filter_key = current_phase if current_phase in {"EXPLORE", "TOPIC_SET", "GATHER"} else "TOPIC_SET"
-    rag_context = _fetch_rag_context(
-        state,
-        phase=current_phase,
-        **_get_rag_filters(rag_filter_key),
-    )
-    helper_prompt = f"""
-    당신은 팀 대화방에 호출된 AI 팀메이트 @mates 입니다.
-    사용자는 평소에는 팀원끼리만 대화하고, 막히는 시점에만 당신을 호출합니다.
-    당신의 역할은 최근 팀 대화를 읽고 지금 프로젝트 진행에 실질적으로 도움이 되는 답을 주는 것입니다.
-
-    규칙:
-    - 사용자가 이미 질문했으면 바로 답하세요. 다시 "무엇을 도와드릴까요?"라고 묻지 마세요.
-    - 최근 팀 대화와 핵심 채팅이 있으면 반드시 반영하세요.
-    - @mates 멘션 자체는 무시하고, 실질적인 요청에 집중하세요.
-    - 한국어로 답하고, 팀 협업에 바로 쓸 수 있게 구체적으로 제안하세요.
-    - 프로젝트 진행에 도움이 되도록 다음 중 "필요한 것만" 포함하세요: 방향 정리, 우선순위 제안, 역할 분담, 요구사항 구조화, 다음 액션.
-    - 사용자가 개수나 형식을 요청했다면 그대로 맞추세요.
-    - 요청이 모호할 때만 한 가지 짧은 확인 질문을 하세요.
-    - 장황한 설명, 섹션 헤더, 과도한 단계별 매뉴얼, "원하시면 더 해드릴게요" 같은 꼬리말은 금지합니다.
-    - 답변은 처음부터 길이를 맞춰 작성하고, 문장 중간에 끊기지 않게 완결된 형태로 끝내세요.
-    - 아래 원칙을 반드시 지키세요.
-    {PLAIN_LANGUAGE_RULES}
-
-    출력 길이 규칙:
-    {response_style}
-
-    최근 대화 문맥:
-    {recent_context}
-
-    참고 레퍼런스:
-    {rag_context}
-
-    사용자 메시지:
-    {user_message}
-    """
-    response = _invoke_llm(conversation_llm, helper_prompt, label="mates_helper_node llm")
-    ai_message = str(response.content).strip()
-    return {"ai_message": ai_message, "next_phase": state["current_phase"]}
 

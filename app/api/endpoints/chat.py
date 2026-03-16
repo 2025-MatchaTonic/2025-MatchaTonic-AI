@@ -1,10 +1,12 @@
 # app/api/endpoints/chat.py
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, root_validator
 
+from app.ai.graph.state import TurnPolicy
 from app.ai.graph.workflow import ai_app
 from app.api.schemas.template import NotionTemplatePayload
 from app.core.request_normalization import (
@@ -17,6 +19,7 @@ from app.core.request_normalization import (
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+MATES_MENTION_PATTERN = re.compile(r"@mates\b", re.IGNORECASE)
 
 
 class AIChatRequest(BaseModel):
@@ -73,6 +76,45 @@ class AIChatResponse(BaseModel):
     notionTemplatePayload: Optional[NotionTemplatePayload] = None
 
 
+def _strip_mates_mention(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    stripped = MATES_MENTION_PATTERN.sub(" ", text)
+    return re.sub(r"\s+", " ", stripped).strip()
+
+
+def _has_mates_mention(request: AIChatRequest) -> bool:
+    candidates = [request.content, request.selectedMessage]
+    return any("@mates" in str(candidate or "").lower() for candidate in candidates)
+
+
+def _derive_turn_policy(request: AIChatRequest) -> TurnPolicy:
+    action = request.actionType
+    phase = request.currentStatus
+    current_title = str(request.collectedData.get("title", "")).strip()
+    effective_message = _strip_mates_mention(request.content)
+
+    if action == "BTN_NO":
+        return "ASK_ONLY"
+    if action in {"BTN_YES", "BTN_GO_DEF"}:
+        return "ASK_ONLY"
+    if action in {"BTN_PLAN", "BTN_DEV"}:
+        return "ANSWER_ONLY"
+    if action != "CHAT":
+        return "ANSWER_ONLY"
+
+    if phase == "TOPIC_SET" and not current_title and not effective_message:
+        return "ASK_ONLY"
+    if phase == "TOPIC_SET" and not current_title and effective_message:
+        return "CAPTURE_TITLE"
+    if _has_mates_mention(request):
+        return "ANSWER_ONLY"
+    if phase in {"EXPLORE", "TOPIC_SET", "GATHER", "READY"}:
+        return "ANSWER_THEN_ASK"
+    return "ANSWER_ONLY"
+
+
 @router.post("/", response_model=AIChatResponse)
 async def process_chat(request: AIChatRequest):
     try:
@@ -81,6 +123,7 @@ async def process_chat(request: AIChatRequest):
             "user_message": request.content,
             "action_type": request.actionType,
             "current_phase": request.currentStatus,
+            "turn_policy": _derive_turn_policy(request),
             "collected_data": request.collectedData,
             "recent_messages": request.recentMessages,
             "selected_message": request.selectedMessage,
