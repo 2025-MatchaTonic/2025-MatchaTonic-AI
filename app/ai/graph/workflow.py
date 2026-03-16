@@ -4,39 +4,23 @@ from app.ai.graph.state import AgentState
 from app.ai.graph.nodes import (
     explore_problem_node,
     gather_information_node,
-    mates_helper_node,
     topic_exists_node,
 )
 from app.ai.services.template_generation import generate_dev_template, generate_plan_template
 
 
-def _has_mates_mention(state: AgentState) -> bool:
-    user_message = str(state.get("user_message") or "")
-    selected_message = str(state.get("selected_message") or "")
-    recent_messages = state.get("recent_messages") or []
-
-    candidate_messages = [user_message]
-    if selected_message and selected_message != user_message:
-        candidate_messages.append(selected_message)
-    if not user_message.strip() and recent_messages:
-        candidate_messages.append(str(recent_messages[-1]))
-
-    return any("@mates" in message for message in candidate_messages)
-
-
 def route_logic(state: AgentState):
     action = state["action_type"]
-    msg = state["user_message"]
     phase = state["current_phase"]
-
-    # 0. 특수 호출 (@mates)
-    if _has_mates_mention(state):
-        return "mates_node"
+    turn_policy = state["turn_policy"]
 
     # 1. 초기 "프로젝트 주제가 있나요?" 응답 처리
     if action == "BTN_NO":
         return "explore_node"
     elif action in ["BTN_YES", "BTN_GO_DEF"]:
+        return "topic_exists_node"
+
+    if phase == "TOPIC_SET" and turn_policy in {"ASK_ONLY", "CAPTURE_TITLE"}:
         return "topic_exists_node"
 
     # 2. 명시적 AI 기능 호출
@@ -61,7 +45,6 @@ workflow.add_node("explore_node", explore_problem_node)
 workflow.add_node("gather_node", gather_information_node)
 workflow.add_node("generate_plan_node", generate_plan_template)
 workflow.add_node("generate_dev_node", generate_dev_template)
-workflow.add_node("mates_node", mates_helper_node)
 workflow.add_node("topic_exists_node", topic_exists_node)
 
 workflow.set_conditional_entry_point(
@@ -71,7 +54,6 @@ workflow.set_conditional_entry_point(
         "gather_node": "gather_node",
         "generate_plan_node": "generate_plan_node",
         "generate_dev_node": "generate_dev_node",
-        "mates_node": "mates_node",
         "topic_exists_node": "topic_exists_node",
         END: END,
     },
@@ -82,7 +64,6 @@ workflow.add_edge("explore_node", END)
 workflow.add_edge("gather_node", END)
 workflow.add_edge("generate_plan_node", END)
 workflow.add_edge("generate_dev_node", END)
-workflow.add_edge("mates_node", END)
 workflow.add_edge("topic_exists_node", END)
 
 ai_app = workflow.compile()
