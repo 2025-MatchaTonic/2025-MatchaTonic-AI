@@ -52,6 +52,11 @@ FAST_MATES_REPLY = (
 )
 FAST_EXPLORE_REPLY = "좋아요. 최근 일주일 동안 '이거 좀 불편하다' 싶었던 순간이 있었나요?"
 SHORT_MESSAGE_PATTERN = re.compile(r"[^a-z0-9가-힣]+")
+FAST_TOPIC_EXISTS_REPLY = (
+    "좋아요. 이미 생각해둔 주제가 있다면 그 주제를 한두 줄로만 보내주세요. "
+    "예를 들면 '대학생 팀플 일정 관리 앱'처럼 적어주시면 바로 방향을 같이 정리하겠습니다."
+)
+BUTTON_ONLY_PATTERN = re.compile(r"[\s\.\,\!\?]+")
 TRIVIAL_MESSAGES = {
     "",
     "hi",
@@ -65,6 +70,26 @@ TRIVIAL_MESSAGES = {
     "ㅎㅇ",
     "ㅁㅌ",
     "mates",
+}
+INITIAL_BUTTON_TOKENS = {
+    "",
+    "yes",
+    "y",
+    "no",
+    "n",
+    "네",
+    "예",
+    "응",
+    "ㅇㅇ",
+    "아니오",
+    "아니요",
+    "ㄴㄴ",
+    "있음",
+    "없음",
+    "있어요",
+    "없어요",
+    "주제있음",
+    "주제없음",
 }
 GATHER_FIELD_GUIDE = {
     "title": {
@@ -191,6 +216,32 @@ def _normalize_message(value: str) -> str:
 def _is_trivial_message(user_message: str) -> bool:
     normalized = _normalize_message(user_message)
     return normalized in TRIVIAL_MESSAGES
+
+
+def _normalize_button_token(value: object) -> str:
+    lowered = str(value or "").strip().lower()
+    return BUTTON_ONLY_PATTERN.sub("", lowered)
+
+
+def _is_initial_button_selection(state: AgentState) -> bool:
+    if state.get("action_type") not in {"BTN_NO", "BTN_YES", "BTN_GO_DEF"}:
+        return False
+
+    candidates = [
+        state.get("user_message"),
+        state.get("selected_message"),
+    ]
+    candidates.extend(state.get("recent_messages", [])[-2:])
+
+    normalized_candidates = [
+        _normalize_button_token(candidate)
+        for candidate in candidates
+        if str(candidate or "").strip()
+    ]
+    if not normalized_candidates:
+        return True
+
+    return all(candidate in INITIAL_BUTTON_TOKENS for candidate in normalized_candidates)
 
 
 def _should_skip_rag(state: AgentState) -> bool:
@@ -774,6 +825,12 @@ def _build_topic_exists_fallback_message() -> str:
 # ----------------------------------------------------
 # 1. 아이디어가 없을 때 (NO 선택) : 탐색 노드
 def explore_problem_node(state: AgentState):
+    if _is_initial_button_selection(state):
+        return {
+            "ai_message": FAST_EXPLORE_REPLY,
+            "next_phase": "EXPLORE",
+        }
+
     if _is_trivial_message(str(state.get("user_message", ""))) and not state.get("recent_messages"):
         return {
             "ai_message": FAST_EXPLORE_REPLY,
@@ -820,6 +877,12 @@ def explore_problem_node(state: AgentState):
 # 1-2. 아이디어가 있을 때 (YES 선택) : 팀 대화 안내 노드
 # ----------------------------------------------------
 def topic_exists_node(state: AgentState):
+    if _is_initial_button_selection(state):
+        return {
+            "ai_message": FAST_TOPIC_EXISTS_REPLY,
+            "next_phase": "TOPIC_SET",
+        }
+
     user_message = (state.get("user_message") or "").strip()
     recent_context = _build_recent_context(state)
     has_recent_context = recent_context != "(전달된 최근 대화 없음)"
