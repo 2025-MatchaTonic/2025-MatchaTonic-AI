@@ -75,20 +75,6 @@ TRIVIAL_MESSAGES = {
     "ㅁㅌ",
     "mates",
 }
-NEGATIVE_FACT_KEYWORDS = (
-    "모르겠",
-    "모름",
-    "없음",
-    "없어요",
-    "미정",
-    "tbd",
-    "unknown",
-    "not sure",
-    "idk",
-    "don't know",
-    "dont know",
-    "no idea",
-)
 INITIAL_BUTTON_TOKENS = {
     "",
     "yes",
@@ -441,7 +427,21 @@ def _is_meaningful_fact(value: object) -> bool:
     normalized = cleaned.lower()
     if "@mates" in normalized or "?" in cleaned:
         return False
-    return not any(keyword in normalized for keyword in NEGATIVE_FACT_KEYWORDS)
+    negative_fact_keywords = (
+        "모르겠",
+        "모름",
+        "없음",
+        "없어요",
+        "미정",
+        "tbd",
+        "unknown",
+        "not sure",
+        "idk",
+        "don't know",
+        "dont know",
+        "no idea",
+    )
+    return not any(keyword in normalized for keyword in negative_fact_keywords)
 
 
 def _prune_collected_data(data: dict[str, str]) -> dict[str, str]:
