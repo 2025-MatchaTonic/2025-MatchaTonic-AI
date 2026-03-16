@@ -1,4 +1,4 @@
-from typing import Dict, List
+from typing import Dict, List, Literal
 
 from pydantic import BaseModel, Field
 
@@ -6,6 +6,15 @@ from app.ai.graph.collected_data import COLLECTED_DATA_FIELDS
 
 
 class GatherLLMResponse(BaseModel):
+    intent: Literal[
+        "answer_fact",
+        "ask_advice",
+        "ask_idea",
+        "ask_summary",
+        "uncertain",
+        "frustrated",
+        "general",
+    ] = "general"
     ai_message: str = ""
     updated_data: Dict[str, str] = Field(default_factory=dict)
     is_sufficient: bool = False

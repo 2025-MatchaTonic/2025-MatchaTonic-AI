@@ -1,4 +1,4 @@
-﻿# app/ai/graph/nodes.py
+# app/ai/graph/nodes.py
 import json
 import logging
 import re
@@ -260,6 +260,24 @@ def _clean_text(value: object) -> str:
     return str(value).strip() if isinstance(value, str) else ""
 
 
+def _is_meaningful_fact(value: object) -> bool:
+    cleaned = _clean_text(value)
+    if not cleaned:
+        return False
+    normalized = cleaned.lower()
+    if "@mates" in normalized or "?" in cleaned:
+        return False
+    return not any(keyword in normalized for keyword in NEGATIVE_FACT_KEYWORDS)
+
+
+def _prune_collected_data(data: dict[str, str]) -> dict[str, str]:
+    return {
+        key: _clean_text(value)
+        for key, value in (data or {}).items()
+        if _is_meaningful_fact(value)
+    }
+
+
 def _detect_gather_focus(text: str) -> str | None:
     normalized = _clean_text(text)
     if not normalized:
@@ -322,9 +340,8 @@ def _is_help_request(user_message: str) -> bool:
 def _sanitize_gather_updates(updated_data: dict[str, str]) -> dict[str, str]:
     sanitized: dict[str, str] = {}
     for key, value in updated_data.items():
-        cleaned = _clean_text(value)
-        if cleaned and not _is_help_request(cleaned):
-            sanitized[key] = cleaned
+        if _is_meaningful_fact(value):
+            sanitized[key] = _clean_text(value)
     return sanitized
 
 
@@ -338,17 +355,25 @@ def _filter_gather_updates(
         return {}
 
     sanitized = _sanitize_gather_updates(updated_data)
-
     if focus_type in UNSUPPORTED_GATHER_TOPICS:
         return {}
-
-    if focus_type in GATHER_FIELD_GUIDE:
-        value = sanitized.get(focus_type)
-        if not value:
-            return {}
-        return {focus_type: value}
-
     return sanitized
+
+
+def _count_ready_fields(current_data: dict[str, str]) -> int:
+    return sum(1 for key in GATHER_FIELD_GUIDE if _is_meaningful_fact(current_data.get(key)))
+
+
+def _is_template_ready(current_data: dict[str, str]) -> bool:
+    normalized = _prune_collected_data(current_data)
+    if not _is_meaningful_fact(normalized.get("title")):
+        return False
+    if not (
+        _is_meaningful_fact(normalized.get("goal"))
+        or _is_meaningful_fact(normalized.get("deliverables"))
+    ):
+        return False
+    return _count_ready_fields(normalized) >= 4
 
 
 def _build_project_snapshot(data: dict) -> dict[str, str]:
@@ -835,9 +860,8 @@ def topic_exists_node(state: AgentState):
 # 2. 아이디어가 있을 때 (YES 선택) : 정보 수집 노드 (자연스러운 HMW)
 # ----------------------------------------------------
 def gather_information_node(state: AgentState):
-    # make sure we always have a dict for collected_data; older states
-    # may not include the new "roles" key yet.
-    current_data = state.get("collected_data") or {}
+    current_data = _prune_collected_data(state.get("collected_data") or {})
+    was_ready = _is_template_ready(current_data)
     focus_type = _infer_conversation_focus(state)
     focus_instruction = _build_gather_focus_instruction(focus_type)
     missing_field_summary = _build_missing_field_summary(current_data)
@@ -848,62 +872,69 @@ def gather_information_node(state: AgentState):
     )
     recent_context = _build_recent_context(state)
 
-    # 시스템 몰래 데이터를 평가하는 프롬프트 (JSON 반환 강제)
     eval_prompt = f"""
-    당신은 사용자와 대화하며 프로젝트 기획에 필요한 핵심 정보를 모으는 PM입니다.
-    딱딱한 학술적 HMW가 아니라, "그럼 우리가 어떻게 하면 ~할 수 있을까요?" 처럼 자연스럽고 친근하게 질문하세요.
-    한 번에 너무 많은 걸 묻지 말고, 비어있는 정보를 하나씩 유도하세요.
-    이미 들어온 정보는 유지하고, 새로 확인된 항목만 보강하세요.
-    기계적인 체크리스트 면접처럼 순서대로 캐묻지 말고, 최근 대화 흐름을 우선하세요.
-    {focus_instruction}
-    사용자가 값을 직접 답하지 않고 설명, 이유, 추천, 예시를 요청하면 그 요청에 먼저 답하세요.
-    target user, 혜택 대상, 왜 중요한지 같은 스키마 밖 정보는 대화 참고용으로만 다루고,
-    절대로 goal, roles, teamSize 같은 기존 필드에 억지로 매핑하지 마세요.
-    사용자가 현재 질문과 무관한 말을 했거나 도움을 요청한 경우, updated_data는 비워 두세요.
-    사용자가 특정 항목을 "추천", "예시", "후보", "뭐가 좋을지" 형태로 물으면 질문부터 되묻지 말고
-    먼저 현재 문맥에 맞는 구체적인 선택지 2~4개를 제안하세요.
-    특히 산출물을 추천해 달라는 요청이면 바로 노션에 옮길 수 있을 정도로 구체적인 산출물 후보를 제시하세요.
-    추천이나 예시를 제안할 때는 사용자가 아직 확정하지 않은 정보이므로 updated_data에 추측값을 넣지 마세요.
-    추천 뒤에는 필요할 때만 "이 중에서 어떤 방향이 맞나요?" 수준의 짧은 확인 질문 1개만 덧붙이세요.
-    필요한 정보 항목은 다음 키를 기준으로 정리하세요: {build_collected_data_guide()}  
-    (최근에 "roles"(담당 역할) 필드가 추가되었습니다. 빠뜨리지 말고 물어보세요.)
-    아래 원칙을 반드시 지키세요.
+    You are an AI PM who helps a project team make decisions, not a form-filling chatbot.
+    The user is a teammate who may ask for advice, options, examples, or summaries while the project is still unclear.
+    Respond in Korean.
+
+    First classify the user intent into one of these values:
+    - answer_fact: the user provides a concrete fact or decision
+    - ask_advice: the user asks for explanation, reasoning, criteria, or next-step guidance
+    - ask_idea: the user asks for ideas, options, or recommendations
+    - ask_summary: the user asks to summarize or organize the current session
+    - uncertain: the user does not know yet and wants help narrowing things down
+    - frustrated: the user is irritated or rejecting the current flow and needs a reset
+    - general: anything else
+
+    Core rules:
+    - If the user asks a question, answer it first.
+    - If the user does not know, do not repeat the same question. Give options, examples, decision criteria, or a recommendation.
+    - If the user asks for ideas, provide 2 to 4 realistic options and recommend one when possible.
+    - If the user asks for a summary, summarize confirmed decisions, unresolved points, and the next decision to make.
+    - Ask at most one short follow-up question, and only if it meaningfully helps the next decision.
+    - Avoid customer-support tone, interview-style repetitive questioning, and system-style phrases.
+    - If the user sounds frustrated, acknowledge it briefly and then move to practical help.
+    - collected_data is internal structured state. Only store confirmed facts from the conversation.
+    - Never store guesses, temporary ideas, user questions, complaints, or "I don't know" style replies in updated_data.
+    - Discussion about target users, benefit, or importance may appear in ai_message, but must not be force-mapped into unrelated collected_data keys.
+    - {focus_instruction}
+    - Follow these writing rules as well:
     {PLAIN_LANGUAGE_RULES}
 
-    [참고할 소프트웨어 엔지니어링 레퍼런스]
+    [Reference context]
     {rag_context}
 
-    [최근 대화 문맥]
+    [Recent conversation]
     {recent_context}
-    
-    [현재까지 모인 정보]
+
+    [Current collected data]
     {json.dumps(current_data, ensure_ascii=False)}
 
-    [아직 비어 있는 정보]
+    [Still missing]
     {missing_field_summary}
 
-    [현재 대화 초점]
-    {focus_type or "특정 초점 없음"}
-    
-    [사용자 대답]
+    [Current focus]
+    {focus_type or "none"}
+
+    [User message]
     {state['user_message']}
-    
-    [출력 형식 강제 (반드시 JSON 포맷으로 응답하세요)]
+
+    [Required JSON output]
     {{
-        "ai_message": "사용자에게 할 자연스러운 챗봇 응답 텍스트",
+        "intent": "answer_fact | ask_advice | ask_idea | ask_summary | uncertain | frustrated | general",
+        "ai_message": "A practical PM-style reply in Korean",
         "updated_data": {build_collected_data_json_example()},
         "is_sufficient": false
     }}
 
-    [판단 기준]
-    - updated_data에는 이번 대화로 명확해진 값만 채우세요.
-    - 사용자가 추천만 요청했고 아직 선택하지 않았다면 updated_data는 비워 둘 수 있습니다.
-    - 정보가 부족하더라도 사용자가 추천이나 예시를 요청한 경우에는 먼저 제안부터 하고, 필요하면 딱 한 가지 후속 질문만 넣으세요.
-    - 정보가 부족한 일반 상황에서는 ai_message에 딱 한 가지 후속 질문만 넣으세요.
-    - 모든 필수 항목이 충분히 구체적일 때만 is_sufficient를 true로 바꾸세요.
+    [Output criteria]
+    - ai_message should be 2 to 5 sentences, or up to 4 short bullets.
+    - If the user asked for advice, ideas, or a summary, ai_message must contain real content. Do not only ask another question.
+    - updated_data must contain only confirmed facts from this turn.
+    - If the user asked for recommendations, explanations, or said they do not know, updated_data may be empty.
+    - Be conservative with is_sufficient. The server will validate readiness again.
     """
 
-    # JSON 형태로만 응답하도록 강제
     response = _invoke_llm(
         structured_llm,
         eval_prompt,
@@ -911,37 +942,30 @@ def gather_information_node(state: AgentState):
         response_format={"type": "json_object"},
     )
     try:
-        # The LLM is expected to return JSON that conforms to the example
-        # above.  If the newly added "roles" field was mishandled we want
-        # to see the raw output for debugging.
         raw_result = json.loads(response.content)
         result = GatherLLMResponse.model_validate(raw_result)
     except (JSONDecodeError, ValidationError) as exc:
-        # include the raw content in the exception so callers can inspect
-        # what the model produced.
         raise RuntimeError(
             f"failed to parse JSON from LLM response: {exc}\n"
             f"raw output:\n{response.content}"
         )
 
-    ai_msg = result.ai_message
-    is_sufficient = result.is_sufficient
     filtered_updates = _filter_gather_updates(
         state["user_message"],
         result.normalized_updated_data(),
         focus_type=focus_type,
     )
     merged_data = merge_collected_data(current_data, filtered_updates)
+    is_sufficient = _is_template_ready(merged_data)
+    ai_msg = result.ai_message.strip()
 
-    # 데이터가 다 모였다면 템플릿 생성 안내 멘트 추가
-    if is_sufficient:
+    if is_sufficient and not was_ready:
         ai_msg += (
-            "\n\n필수 정보가 모두 모였습니다. "
-            "원하면 지금 템플릿 생성 단계로 넘어갈 수 있어요."
+            "\n\n???? ?? ???? ?? ??? ??? ?? ? ????. "
+            "??? ?? ??? ???? ???."
         )
-        next_phase = "READY"
-    else:
-        next_phase = "GATHER"
+
+    next_phase = "READY" if is_sufficient else "GATHER"
 
     return {
         "ai_message": ai_msg,
@@ -952,7 +976,7 @@ def gather_information_node(state: AgentState):
 
 
 # ----------------------------------------------------
-# 4. @mates 멘션 호출 노드
+# 4. @mates ?? ?? ?? 멘션 호출 노드
 # ----------------------------------------------------
 def mates_helper_node(state: AgentState):
     user_message = str(state.get("user_message", ""))
