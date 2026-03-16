@@ -160,6 +160,10 @@ HELP_REQUEST_KEYWORDS = (
     "모르겠",
     "도와",
 )
+AI_RESPONSE_MAX_CHARS = max(80, int(settings.AI_RESPONSE_MAX_CHARS))
+FAST_RAG_PHASES = {"EXPLORE", "TOPIC_SET", "GATHER"}
+RAG_CACHE_MAX_ITEMS = 128
+RAG_CONTEXT_CACHE: dict[tuple[str, str, tuple[str, ...], tuple[str, ...], int], str] = {}
 
 
 PLAIN_LANGUAGE_RULES = """
@@ -325,6 +329,18 @@ def _trim_trailing_question_lines(message: str) -> str:
     return "\n".join(lines).strip()
 
 
+def _truncate_ai_message(message: str, max_chars: int = AI_RESPONSE_MAX_CHARS) -> str:
+    text = str(message or "").strip()
+    if len(text) <= max_chars:
+        return text
+    truncated = text[: max_chars - 1].rstrip()
+    if not truncated:
+        return text[:max_chars]
+    if truncated[-1] in {".", "!", "?", "…"}:
+        return truncated
+    return f"{truncated}…"
+
+
 def _answer_only_fallback(state: AgentState, message: str) -> str:
     if str(message or "").strip():
         return str(message).strip()
@@ -340,13 +356,13 @@ def _answer_only_fallback(state: AgentState, message: str) -> str:
 def _apply_turn_policy_to_message(state: AgentState, message: str) -> str:
     cleaned = str(message or "").strip()
     if not cleaned:
-        return _answer_only_fallback(state, cleaned)
+        return _truncate_ai_message(_answer_only_fallback(state, cleaned))
 
     if _is_answer_only_turn(state):
         trimmed = _trim_trailing_question_lines(cleaned)
-        return _answer_only_fallback(state, trimmed)
+        return _truncate_ai_message(_answer_only_fallback(state, trimmed))
 
-    return cleaned
+    return _truncate_ai_message(cleaned)
 
 
 def _should_skip_rag(state: AgentState) -> bool:
@@ -356,9 +372,70 @@ def _should_skip_rag(state: AgentState) -> bool:
     return _is_trivial_message(user_message) and not selected_message.strip() and not recent_messages
 
 
+def _is_topic_not_set(state: AgentState) -> bool:
+    current_data = _prune_collected_data(state.get("collected_data") or {})
+    return not _is_meaningful_fact(current_data.get("title"))
+
+
+def _should_use_rag(state: AgentState, phase: str, query: str) -> bool:
+    if _should_skip_rag(state):
+        return False
+
+    action = state.get("action_type")
+    if action in {"BTN_NO", "BTN_YES", "BTN_GO_DEF"}:
+        return False
+
+    if phase == "TOPIC_SET" and _is_topic_not_set(state):
+        return False
+
+    query_text = str(query or "").strip()
+    if not query_text:
+        return False
+    if phase not in FAST_RAG_PHASES:
+        return True
+
+    has_question = "?" in query_text or "？" in query_text
+    asks_help = _is_help_request(query_text)
+    if not has_question and not asks_help and len(query_text) < max(1, settings.RAG_QUERY_MIN_CHARS):
+        return False
+
+    if _is_answer_only_turn(state) and not has_question and not asks_help and len(query_text) < 24:
+        return False
+
+    return True
+
+
+def _select_rag_top_k(state: AgentState, phase: str, query: str) -> int:
+    base_k = max(1, int(settings.RAG_TOP_K))
+    if phase not in FAST_RAG_PHASES:
+        return base_k
+
+    fast_k = min(base_k, max(1, int(settings.RAG_CHAT_TOP_K)))
+    if "?" in query or "？" in query or _is_help_request(query):
+        return min(base_k, fast_k + 1)
+    return fast_k
+
+
+def _trim_rag_context_for_phase(context: str, phase: str) -> str:
+    text = str(context or "").strip()
+    if not text:
+        return RAG_EMPTY_CONTEXT
+    if phase not in FAST_RAG_PHASES:
+        return text
+
+    max_chars = max(200, int(settings.RAG_CHAT_MAX_CONTEXT_CHARS))
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3].rstrip() + "..."
+
+
 def _invoke_llm(llm: ChatOpenAI, prompt: str, *, label: str, **kwargs):
     started_at = perf_counter()
-    response = llm.invoke(prompt, **kwargs)
+    try:
+        response = llm.invoke(prompt, **kwargs)
+    except Exception:
+        logger.exception("%s failed in %.2fs", label, perf_counter() - started_at)
+        return None
     logger.info("%s completed in %.2fs", label, perf_counter() - started_at)
     return response
 
@@ -387,27 +464,51 @@ def _fetch_rag_context(
     topics: list[str] | None = None,
     doc_types: list[str] | None = None,
 ) -> str:
-    if _should_skip_rag(state):
-        logger.info("rag skipped for trivial message phase=%s", phase)
+    query = _build_rag_query(state)
+    if not _should_use_rag(state, phase, query):
+        logger.info(
+            "rag skipped phase=%s action=%s query_chars=%d",
+            phase,
+            state.get("action_type"),
+            len(query or ""),
+        )
         return RAG_EMPTY_CONTEXT
 
-    query = _build_rag_query(state)
-    if not query:
-        return RAG_EMPTY_CONTEXT
+    top_k = _select_rag_top_k(state, phase, query)
+    topics_key = tuple((topics or []))
+    doc_types_key = tuple((doc_types or []))
+    cache_key = (phase, query, topics_key, doc_types_key, top_k)
+    cached_context = RAG_CONTEXT_CACHE.get(cache_key)
+    if cached_context:
+        logger.info(
+            "rag cache hit phase=%s query_chars=%d context_chars=%d",
+            phase,
+            len(query),
+            len(cached_context),
+        )
+        return cached_context
 
     started_at = perf_counter()
     context = get_rag_context(
         query=query,
         current_phase=phase,
+        k=top_k,
         topics=topics,
         doc_types=doc_types,
     )
+    context = _trim_rag_context_for_phase(context, phase)
+    RAG_CONTEXT_CACHE[cache_key] = context or RAG_EMPTY_CONTEXT
+    if len(RAG_CONTEXT_CACHE) > RAG_CACHE_MAX_ITEMS:
+        oldest_key = next(iter(RAG_CONTEXT_CACHE))
+        RAG_CONTEXT_CACHE.pop(oldest_key, None)
+
     logger.info(
-        "rag fetched in %.2fs phase=%s query_chars=%d context_chars=%d",
+        "rag fetched in %.2fs phase=%s query_chars=%d context_chars=%d top_k=%d",
         perf_counter() - started_at,
         phase,
         len(query),
         len(context or ""),
+        top_k,
     )
     return context or RAG_EMPTY_CONTEXT
 
@@ -991,6 +1092,7 @@ def explore_problem_node(state: AgentState):
     5. 대화가 자연스럽게 이어지도록 친구처럼 편안한 말투를 사용하세요.
     6. 직접 사용자 입력이 비어 있더라도 최근 팀 대화에 unresolved point가 있으면 그 문맥을 이어서 답하세요.
     7. 아래 원칙을 반드시 지키세요.
+    8. 최종 답변은 공백 포함 300자 이내로 작성하세요.
     {PLAIN_LANGUAGE_RULES}
 
     [현재 턴 정책]
@@ -1003,9 +1105,14 @@ def explore_problem_node(state: AgentState):
     """
 
     response = _invoke_llm(conversation_llm, prompt, label="explore_problem_node llm")
+    ai_message = (
+        str(response.content)
+        if response is not None and str(getattr(response, "content", "")).strip()
+        else FAST_EXPLORE_REPLY
+    )
 
     return {
-        "ai_message": _apply_turn_policy_to_message(state, str(response.content)),
+        "ai_message": _apply_turn_policy_to_message(state, ai_message),
         "next_phase": "EXPLORE",  # 계속 탐색 단계 유지
     }
 
@@ -1060,6 +1167,7 @@ def topic_exists_node(state: AgentState):
 
         규칙:
         - 2~3문장으로만 답하세요.
+        - 최종 답변은 공백 포함 300자 이내로 작성하세요.
         - 먼저 사용자의 현재 논의 주제나 관심사를 짧게 짚어 주세요.
         - 그 다음 팀원끼리 이어서 논의해도 된다는 점과, 막히면 @mates로 도움받을 수 있다는 점을 자연스럽게 안내하세요.
         - "무엇을 도와드릴까요?", "다음 중 선택하세요" 같은 고객센터식 문장은 금지합니다.
@@ -1074,10 +1182,16 @@ def topic_exists_node(state: AgentState):
         {user_message}
         """
         response = _invoke_llm(conversation_llm, prompt, label="topic_exists_node llm")
-        ai_message = str(response.content).strip() or _build_topic_exists_fallback_message()
+        ai_message = (
+            str(getattr(response, "content", "")).strip()
+            if response is not None
+            else _build_topic_exists_fallback_message()
+        )
+        if not ai_message:
+            ai_message = _build_topic_exists_fallback_message()
 
     return {
-        "ai_message": ai_message,
+        "ai_message": _apply_turn_policy_to_message(state, ai_message),
         "next_phase": "TOPIC_SET",
     }
 
@@ -1171,6 +1285,7 @@ def gather_information_node(state: AgentState):
 
     [Output criteria]
     - ai_message should be 2 to 5 sentences, or up to 4 short bullets.
+    - ai_message must be within 300 characters including spaces.
     - If the user asked for advice, ideas, or a summary, ai_message must contain real content. Do not only ask another question.
     - Prefer finishing with an answer. Add a follow-up question only when the conversation genuinely needs one more decision input.
     - updated_data must contain only confirmed facts from this turn.
@@ -1184,14 +1299,29 @@ def gather_information_node(state: AgentState):
         label="gather_information_node llm",
         response_format={"type": "json_object"},
     )
+    if response is None:
+        return {
+            "ai_message": _apply_turn_policy_to_message(state, _answer_only_fallback(state, "")),
+            "collected_data": prefilled_data,
+            "is_sufficient": was_ready,
+            "next_phase": "READY" if was_ready else "GATHER",
+        }
+
     try:
         raw_result = json.loads(response.content)
         result = GatherLLMResponse.model_validate(raw_result)
     except (JSONDecodeError, ValidationError) as exc:
-        raise RuntimeError(
-            f"failed to parse JSON from LLM response: {exc}\n"
-            f"raw output:\n{response.content}"
+        logger.exception(
+            "failed to parse gather_information_node JSON: %s raw_output=%s",
+            exc,
+            getattr(response, "content", ""),
         )
+        return {
+            "ai_message": _apply_turn_policy_to_message(state, _answer_only_fallback(state, "")),
+            "collected_data": prefilled_data,
+            "is_sufficient": was_ready,
+            "next_phase": "READY" if was_ready else "GATHER",
+        }
 
     filtered_updates = _filter_gather_updates(
         user_message,
@@ -1200,13 +1330,14 @@ def gather_information_node(state: AgentState):
     )
     merged_data = merge_collected_data(prefilled_data, filtered_updates)
     is_sufficient = _is_template_ready(merged_data)
-    ai_msg = _apply_turn_policy_to_message(state, result.ai_message)
+    ai_msg = str(result.ai_message or "").strip()
 
     if is_sufficient and not was_ready:
         ai_msg += (
             "\n\n???? ?? ???? ?? ??? ??? ?? ? ????. "
             "??? ?? ??? ???? ???."
         )
+    ai_msg = _apply_turn_policy_to_message(state, ai_msg)
 
     next_phase = "READY" if is_sufficient else "GATHER"
 
