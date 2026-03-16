@@ -66,6 +66,71 @@ TRIVIAL_MESSAGES = {
     "ㅁㅌ",
     "mates",
 }
+GATHER_FIELD_GUIDE = {
+    "title": {
+        "label": "프로젝트 제목",
+        "question": "프로젝트 제목을 한 줄로 어떻게 정리하면 될까요?",
+    },
+    "goal": {
+        "label": "프로젝트 목표",
+        "question": "이 프로젝트로 팀이 최종적으로 만들고 싶은 결과를 한 줄로 말하면 무엇인가요?",
+    },
+    "teamSize": {
+        "label": "팀 인원",
+        "question": "현재 이 프로젝트를 함께하는 팀원은 몇 명인가요?",
+    },
+    "roles": {
+        "label": "역할",
+        "question": "팀원 역할 분담은 어떻게 가져갈 생각인가요? 아직 미정이면 필요한 역할만 말해도 됩니다.",
+    },
+    "dueDate": {
+        "label": "마감일",
+        "question": "중간발표나 최종제출 기준으로 생각하는 마감일은 언제인가요?",
+    },
+    "deliverables": {
+        "label": "산출물",
+        "question": "최종적으로 제출하거나 보여줘야 하는 산출물은 무엇인가요?",
+    },
+}
+UNSUPPORTED_GATHER_TOPICS = {
+    "targetUser": {
+        "label": "혜택 대상",
+        "instruction": (
+            "최근 대화의 초점은 혜택 대상입니다. 사용자의 답변이나 질문에 먼저 반응하되 "
+            "이 정보는 collected_data의 기존 키로 억지로 저장하지 마세요."
+        ),
+    },
+    "importance": {
+        "label": "중요한 이유",
+        "instruction": (
+            "최근 대화의 초점은 문제의 중요성입니다. 먼저 이유를 설명하거나 정리해 주고, "
+            "이 정보는 collected_data의 기존 키로 억지로 저장하지 마세요."
+        ),
+    },
+}
+GATHER_FOCUS_KEYWORDS = {
+    "title": ("제목", "프로젝트명", "주제"),
+    "goal": ("목표", "무엇을 만들", "최종적으로 만들", "해결하려는 문제"),
+    "teamSize": ("몇 명", "팀원", "인원", "팀 규모"),
+    "roles": ("역할", "역할 분담", "담당", "누가 맡"),
+    "dueDate": ("마감", "마감일", "언제까지", "제출", "발표", "데드라인"),
+    "deliverables": ("산출물", "결과물", "제출물", "무엇을 제출", "최종 산출"),
+    "targetUser": ("누가 혜택", "대상 사용자", "누가 쓰", "누구를 위한", "누가 받"),
+    "importance": ("왜 중요", "왜 필요한", "이유", "왜 문제", "중요한가"),
+}
+HELP_REQUEST_KEYWORDS = (
+    "추천",
+    "예시",
+    "후보",
+    "뭐가 좋",
+    "어떻게",
+    "왜",
+    "이유",
+    "설명",
+    "알려",
+    "모르겠",
+    "도와",
+)
 
 
 PLAIN_LANGUAGE_RULES = """
@@ -193,6 +258,97 @@ def _get_rag_filters(filter_key: str) -> dict[str, list[str]]:
 
 def _clean_text(value: object) -> str:
     return str(value).strip() if isinstance(value, str) else ""
+
+
+def _detect_gather_focus(text: str) -> str | None:
+    normalized = _clean_text(text)
+    if not normalized:
+        return None
+
+    for focus, keywords in GATHER_FOCUS_KEYWORDS.items():
+        if any(keyword in normalized for keyword in keywords):
+            return focus
+    return None
+
+
+def _infer_conversation_focus(state: AgentState) -> str | None:
+    candidates: list[str] = []
+    selected_message = _clean_text(state.get("selected_message"))
+    recent_messages = [_clean_text(msg) for msg in state.get("recent_messages", []) if _clean_text(msg)]
+
+    if selected_message:
+        candidates.append(selected_message)
+    candidates.extend(reversed(recent_messages[-4:]))
+
+    for candidate in candidates:
+        focus = _detect_gather_focus(candidate)
+        if focus:
+            return focus
+    return None
+
+
+def _build_missing_field_summary(current_data: dict[str, str]) -> str:
+    missing_fields = [
+        f'- {key}: {meta["label"]}'
+        for key, meta in GATHER_FIELD_GUIDE.items()
+        if not _clean_text(current_data.get(key))
+    ]
+    return "\n".join(missing_fields) if missing_fields else "- 없음"
+
+
+def _build_gather_focus_instruction(focus_type: str | None) -> str:
+    if focus_type in GATHER_FIELD_GUIDE:
+        focus_info = GATHER_FIELD_GUIDE[focus_type]
+        return (
+            f'최근 대화의 초점은 "{focus_info["label"]}" 입니다. '
+            f'사용자가 이 항목에 답하면 updated_data에는 "{focus_type}"만 채우세요. '
+            f'답이 부족하면 "{focus_info["question"]}"처럼 같은 흐름에서 한 가지 질문만 이어가세요.'
+        )
+
+    if focus_type in UNSUPPORTED_GATHER_TOPICS:
+        return UNSUPPORTED_GATHER_TOPICS[focus_type]["instruction"]
+
+    return (
+        "고정된 질문 순서를 따르지 말고, 최근 대화 흐름에서 가장 자연스러운 주제를 이어가세요. "
+        "지금 맥락과 맞는 비어 있는 정보 하나만 골라 한 가지 질문으로 이어가세요."
+    )
+
+
+def _is_help_request(user_message: str) -> bool:
+    normalized = _clean_text(user_message)
+    return any(keyword in normalized for keyword in HELP_REQUEST_KEYWORDS)
+
+
+def _sanitize_gather_updates(updated_data: dict[str, str]) -> dict[str, str]:
+    sanitized: dict[str, str] = {}
+    for key, value in updated_data.items():
+        cleaned = _clean_text(value)
+        if cleaned and not _is_help_request(cleaned):
+            sanitized[key] = cleaned
+    return sanitized
+
+
+def _filter_gather_updates(
+    user_message: str,
+    updated_data: dict[str, str],
+    *,
+    focus_type: str | None,
+) -> dict[str, str]:
+    if _is_help_request(user_message):
+        return {}
+
+    sanitized = _sanitize_gather_updates(updated_data)
+
+    if focus_type in UNSUPPORTED_GATHER_TOPICS:
+        return {}
+
+    if focus_type in GATHER_FIELD_GUIDE:
+        value = sanitized.get(focus_type)
+        if not value:
+            return {}
+        return {focus_type: value}
+
+    return sanitized
 
 
 def _build_project_snapshot(data: dict) -> dict[str, str]:
@@ -682,6 +838,9 @@ def gather_information_node(state: AgentState):
     # make sure we always have a dict for collected_data; older states
     # may not include the new "roles" key yet.
     current_data = state.get("collected_data") or {}
+    focus_type = _infer_conversation_focus(state)
+    focus_instruction = _build_gather_focus_instruction(focus_type)
+    missing_field_summary = _build_missing_field_summary(current_data)
     rag_context = _fetch_rag_context(
         state,
         phase=state.get("current_phase", "GATHER"),
@@ -695,6 +854,12 @@ def gather_information_node(state: AgentState):
     딱딱한 학술적 HMW가 아니라, "그럼 우리가 어떻게 하면 ~할 수 있을까요?" 처럼 자연스럽고 친근하게 질문하세요.
     한 번에 너무 많은 걸 묻지 말고, 비어있는 정보를 하나씩 유도하세요.
     이미 들어온 정보는 유지하고, 새로 확인된 항목만 보강하세요.
+    기계적인 체크리스트 면접처럼 순서대로 캐묻지 말고, 최근 대화 흐름을 우선하세요.
+    {focus_instruction}
+    사용자가 값을 직접 답하지 않고 설명, 이유, 추천, 예시를 요청하면 그 요청에 먼저 답하세요.
+    target user, 혜택 대상, 왜 중요한지 같은 스키마 밖 정보는 대화 참고용으로만 다루고,
+    절대로 goal, roles, teamSize 같은 기존 필드에 억지로 매핑하지 마세요.
+    사용자가 현재 질문과 무관한 말을 했거나 도움을 요청한 경우, updated_data는 비워 두세요.
     사용자가 특정 항목을 "추천", "예시", "후보", "뭐가 좋을지" 형태로 물으면 질문부터 되묻지 말고
     먼저 현재 문맥에 맞는 구체적인 선택지 2~4개를 제안하세요.
     특히 산출물을 추천해 달라는 요청이면 바로 노션에 옮길 수 있을 정도로 구체적인 산출물 후보를 제시하세요.
@@ -713,6 +878,12 @@ def gather_information_node(state: AgentState):
     
     [현재까지 모인 정보]
     {json.dumps(current_data, ensure_ascii=False)}
+
+    [아직 비어 있는 정보]
+    {missing_field_summary}
+
+    [현재 대화 초점]
+    {focus_type or "특정 초점 없음"}
     
     [사용자 대답]
     {state['user_message']}
@@ -755,7 +926,12 @@ def gather_information_node(state: AgentState):
 
     ai_msg = result.ai_message
     is_sufficient = result.is_sufficient
-    merged_data = merge_collected_data(current_data, result.normalized_updated_data())
+    filtered_updates = _filter_gather_updates(
+        state["user_message"],
+        result.normalized_updated_data(),
+        focus_type=focus_type,
+    )
+    merged_data = merge_collected_data(current_data, filtered_updates)
 
     # 데이터가 다 모였다면 템플릿 생성 안내 멘트 추가
     if is_sufficient:
