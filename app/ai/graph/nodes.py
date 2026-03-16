@@ -160,6 +160,39 @@ HELP_REQUEST_KEYWORDS = (
     "모르겠",
     "도와",
 )
+TITLE_INSTRUCTION_KEYWORDS = (
+    "넣어",
+    "추천",
+    "알려",
+    "해줘",
+    "보여",
+    "데이터",
+    "후보",
+)
+TITLE_EXPLICIT_PATTERN = re.compile(
+    r"^\s*(?:프로젝트\s*주제|프로젝트명|주제|제목)\s*(?:은|는|:)?\s*",
+    re.IGNORECASE,
+)
+TEAM_SIZE_PATTERN = re.compile(r"(?:팀\s*인원|팀원|인원)\D{0,8}(\d{1,2})\s*명?")
+ROLE_PATTERN = re.compile(r"(?:역할|롤|role)\s*(?:은|는|:)?\s*(.+)$", re.IGNORECASE)
+DUE_DATE_PATTERN = re.compile(
+    r"(?:마감(?:일)?|데드라인|due)\s*(?:은|는|:)?\s*"
+    r"([0-9]{4}[./-][0-9]{1,2}[./-][0-9]{1,2}|[0-9]{1,2}월\s*[0-9]{1,2}일)",
+    re.IGNORECASE,
+)
+GOAL_PATTERN = re.compile(r"(?:목표|goal)\s*(?:은|는|:)?\s*(.+)$", re.IGNORECASE)
+DELIVERABLES_PATTERN = re.compile(
+    r"(?:산출물|결과물|제출물|deliverable[s]?)\s*(?:은|는|:)?\s*(.+)$",
+    re.IGNORECASE,
+)
+CHOICE_INDEX_PATTERN = re.compile(r"^\s*([1-9])\s*번\s*$")
+NUMBERED_OPTION_LINE_PATTERN = re.compile(r"^\s*(\d{1,2})[)\.\-:]\s*(.+?)\s*$")
+NUMBERED_OPTION_INLINE_PATTERN = re.compile(
+    r"(\d{1,2})[)\.\-:]\s*(.+?)(?=\s+\d{1,2}[)\.\-:]|$)"
+)
+DIRECT_FACT_ENDING_PATTERN = re.compile(
+    r"\s*(?:입니다|이에요|예요|이야|야|요)\s*$"
+)
 AI_RESPONSE_MAX_CHARS = max(80, int(settings.AI_RESPONSE_MAX_CHARS))
 FAST_RAG_PHASES = {"EXPLORE", "TOPIC_SET", "GATHER"}
 RAG_CACHE_MAX_ITEMS = 128
@@ -598,7 +631,8 @@ def _build_gather_focus_instruction(focus_type: str | None) -> str:
         focus_info = GATHER_FIELD_GUIDE[focus_type]
         return (
             f'최근 대화의 초점은 "{focus_info["label"]}" 입니다. '
-            f'사용자가 이 항목에 답하면 updated_data에는 "{focus_type}"만 채우세요. '
+            "우선 이 항목을 중심으로 답하되, 사용자가 다른 필드의 확정 사실을 함께 말하면 "
+            "그 사실도 updated_data에 반영하세요. "
             f'답이 부족하면 "{focus_info["question"]}"처럼 같은 흐름에서 한 가지 질문만 이어가세요.'
         )
 
@@ -614,6 +648,104 @@ def _build_gather_focus_instruction(focus_type: str | None) -> str:
 def _is_help_request(user_message: str) -> bool:
     normalized = _clean_text(user_message)
     return any(keyword in normalized for keyword in HELP_REQUEST_KEYWORDS)
+
+
+def _looks_like_title_instruction(candidate: str) -> bool:
+    normalized = str(candidate or "").strip().lower()
+    if not normalized:
+        return True
+    return any(keyword in normalized for keyword in TITLE_INSTRUCTION_KEYWORDS)
+
+
+def _normalize_direct_fact_value(value: str) -> str:
+    normalized = DIRECT_FACT_ENDING_PATTERN.sub("", str(value or "").strip())
+    return normalized.strip(" .,!?:;\"'")
+
+
+def _extract_direct_fact_updates(user_message: str) -> dict[str, str]:
+    message = _clean_text(_strip_mates_mention(user_message))
+    if not message:
+        return {}
+
+    updates: dict[str, str] = {}
+
+    if TITLE_EXPLICIT_PATTERN.match(message):
+        topic_candidate = _extract_topic_candidate(message)
+        if topic_candidate and not _looks_like_title_instruction(topic_candidate):
+            updates["title"] = topic_candidate
+
+    team_size_match = TEAM_SIZE_PATTERN.search(message)
+    if team_size_match:
+        updates["teamSize"] = team_size_match.group(1).strip()
+
+    role_match = ROLE_PATTERN.search(message)
+    if role_match:
+        updates["roles"] = _normalize_direct_fact_value(role_match.group(1))
+
+    due_date_match = DUE_DATE_PATTERN.search(message)
+    if due_date_match:
+        updates["dueDate"] = (
+            due_date_match.group(1).strip().replace("/", "-").replace(".", "-")
+        )
+
+    goal_match = GOAL_PATTERN.search(message)
+    if goal_match:
+        updates["goal"] = _normalize_direct_fact_value(goal_match.group(1))
+
+    deliverables_match = DELIVERABLES_PATTERN.search(message)
+    if deliverables_match:
+        updates["deliverables"] = _normalize_direct_fact_value(deliverables_match.group(1))
+
+    return _sanitize_gather_updates(updates)
+
+
+def _extract_choice_based_title(state: AgentState) -> str:
+    current_message = _effective_user_message(state)
+    choice_match = CHOICE_INDEX_PATTERN.match(current_message)
+    if not choice_match:
+        return ""
+
+    choice_index = int(choice_match.group(1))
+    text_blocks: list[str] = []
+
+    selected_raw = MATES_MENTION_PATTERN.sub(" ", str(state.get("selected_message") or ""))
+    selected = _clean_text(selected_raw)
+    if selected:
+        text_blocks.append(selected)
+
+    recent_messages = [
+        _clean_text(MATES_MENTION_PATTERN.sub(" ", str(msg or "")))
+        for msg in state.get("recent_messages", [])
+        if _clean_text(MATES_MENTION_PATTERN.sub(" ", str(msg or "")))
+    ]
+    text_blocks.extend(reversed(recent_messages[-6:]))
+
+    for block in text_blocks:
+        matched_line_option = False
+        for line in block.splitlines():
+            line_match = NUMBERED_OPTION_LINE_PATTERN.match(line.strip())
+            if not line_match:
+                continue
+            matched_line_option = True
+            if int(line_match.group(1)) != choice_index:
+                continue
+
+            candidate = line_match.group(2).strip(" .,!?:;\"'")
+            if candidate and not _looks_like_title_instruction(candidate):
+                return candidate
+
+        if matched_line_option:
+            continue
+
+        for inline_match in NUMBERED_OPTION_INLINE_PATTERN.finditer(block):
+            if int(inline_match.group(1)) != choice_index:
+                continue
+
+            candidate = inline_match.group(2).strip(" .,!?:;\"'")
+            if candidate and not _looks_like_title_instruction(candidate):
+                return candidate
+
+    return ""
 
 
 def _sanitize_gather_updates(updated_data: dict[str, str]) -> dict[str, str]:
@@ -1242,6 +1374,7 @@ def gather_information_node(state: AgentState):
     - Do not jump to the next checklist question before addressing the current request.
     - Ask at most one short follow-up question, and only if it meaningfully helps the next decision.
     - If your answer already feels complete enough for this turn, end without a follow-up question.
+    - Do not promise future actions like "I will show it soon". Finish this turn with concrete content now.
     - Avoid customer-support tone, interview-style repetitive questioning, and system-style phrases.
     - If the user sounds frustrated, acknowledge it briefly and then move to practical help.
     - collected_data is internal structured state. Only store confirmed facts from the conversation.
@@ -1328,7 +1461,20 @@ def gather_information_node(state: AgentState):
         result.normalized_updated_data(),
         focus_type=focus_type,
     )
+    direct_updates = _extract_direct_fact_updates(user_message)
+    if "title" not in direct_updates and not _is_meaningful_fact(prefilled_data.get("title")):
+        choice_title = _extract_choice_based_title(state)
+        if choice_title:
+            direct_updates["title"] = choice_title
     merged_data = merge_collected_data(prefilled_data, filtered_updates)
+    merged_data = merge_collected_data(merged_data, direct_updates)
+    if filtered_updates or direct_updates:
+        logger.info(
+            "collected_data updates llm=%s direct=%s merged=%s",
+            filtered_updates,
+            direct_updates,
+            merged_data,
+        )
     is_sufficient = _is_template_ready(merged_data)
     ai_msg = str(result.ai_message or "").strip()
 
