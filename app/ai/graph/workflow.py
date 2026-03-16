@@ -10,13 +10,27 @@ from app.ai.graph.nodes import (
 from app.ai.services.template_generation import generate_dev_template, generate_plan_template
 
 
+def _has_mates_mention(state: AgentState) -> bool:
+    user_message = str(state.get("user_message") or "")
+    selected_message = str(state.get("selected_message") or "")
+    recent_messages = state.get("recent_messages") or []
+
+    candidate_messages = [user_message]
+    if selected_message and selected_message != user_message:
+        candidate_messages.append(selected_message)
+    if not user_message.strip() and recent_messages:
+        candidate_messages.append(str(recent_messages[-1]))
+
+    return any("@mates" in message for message in candidate_messages)
+
+
 def route_logic(state: AgentState):
     action = state["action_type"]
     msg = state["user_message"]
     phase = state["current_phase"]
 
     # 0. 특수 호출 (@mates)
-    if "@mates" in msg:
+    if _has_mates_mention(state):
         return "mates_node"
 
     # 1. 초기 "프로젝트 주제가 있나요?" 응답 처리
