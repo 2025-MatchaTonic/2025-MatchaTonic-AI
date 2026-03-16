@@ -1,4 +1,5 @@
 # app/api/endpoints/chat.py
+import asyncio
 import logging
 import re
 from typing import Any, Dict, List, Optional
@@ -9,6 +10,7 @@ from pydantic import BaseModel, Field, root_validator
 from app.ai.graph.state import TurnPolicy
 from app.ai.graph.workflow import ai_app
 from app.api.schemas.template import NotionTemplatePayload
+from app.core.config import settings
 from app.core.request_normalization import (
     normalize_action_type,
     normalize_collected_data,
@@ -20,6 +22,7 @@ from app.core.request_normalization import (
 router = APIRouter()
 logger = logging.getLogger(__name__)
 MATES_MENTION_PATTERN = re.compile(r"@mates\b", re.IGNORECASE)
+AI_RESPONSE_MAX_CHARS = max(80, int(settings.AI_RESPONSE_MAX_CHARS))
 
 
 class AIChatRequest(BaseModel):
@@ -89,6 +92,18 @@ def _has_mates_mention(request: AIChatRequest) -> bool:
     return any("@mates" in str(candidate or "").lower() for candidate in candidates)
 
 
+def _truncate_content(content: str) -> str:
+    text = str(content or "").strip()
+    if len(text) <= AI_RESPONSE_MAX_CHARS:
+        return text
+    truncated = text[: AI_RESPONSE_MAX_CHARS - 1].rstrip()
+    if not truncated:
+        return text[:AI_RESPONSE_MAX_CHARS]
+    if truncated[-1] in {".", "!", "?", "…"}:
+        return truncated
+    return f"{truncated}…"
+
+
 def _derive_turn_policy(request: AIChatRequest) -> TurnPolicy:
     action = request.actionType
     phase = request.currentStatus
@@ -133,10 +148,10 @@ async def process_chat(request: AIChatRequest):
             "template_payload": None,
         }
 
-        result = ai_app.invoke(initial_state)
+        result = await asyncio.to_thread(ai_app.invoke, initial_state)
 
         return AIChatResponse(
-            content=result.get("ai_message", ""),
+            content=_truncate_content(result.get("ai_message", "")),
             suggestedQuestions=[],
             currentStatus=result.get("next_phase", request.currentStatus),
             isSufficient=result.get("is_sufficient", False),
