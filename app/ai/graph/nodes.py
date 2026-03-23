@@ -262,25 +262,39 @@ def _normalize_button_token(value: object) -> str:
     return BUTTON_ONLY_PATTERN.sub("", lowered)
 
 
-def _is_initial_button_selection(state: AgentState) -> bool:
-    if state.get("action_type") not in {"BTN_NO", "BTN_YES", "BTN_GO_DEF"}:
-        return False
-
-    candidates = [
-        state.get("user_message"),
-        state.get("selected_message"),
-    ]
-    candidates.extend(state.get("recent_messages", [])[-2:])
-
-    normalized_candidates = [
-        _normalize_button_token(candidate)
-        for candidate in candidates
-        if str(candidate or "").strip()
-    ]
-    if not normalized_candidates:
+def _matches_initial_button_message(action: str, message: object) -> bool:
+    normalized = _normalize_button_token(message)
+    if not normalized:
+        return True
+    if normalized in INITIAL_BUTTON_TOKENS:
         return True
 
-    return all(candidate in INITIAL_BUTTON_TOKENS for candidate in normalized_candidates)
+    cleaned = _clean_text(message).lower()
+    if action in {"BTN_YES", "BTN_GO_DEF"}:
+        return (
+            ("주제" in cleaned or "프로젝트" in cleaned)
+            and any(keyword in cleaned for keyword in ("있", "정해", "정했", "생각해"))
+        )
+    if action == "BTN_NO":
+        return (
+            ("주제" in cleaned or "프로젝트" in cleaned)
+            and any(keyword in cleaned for keyword in ("없", "미정", "아직"))
+        )
+    return False
+
+
+def _is_initial_button_selection(state: AgentState) -> bool:
+    action = state.get("action_type")
+    if action not in {"BTN_NO", "BTN_YES", "BTN_GO_DEF"}:
+        return False
+
+    message_candidate = _clean_text(state.get("user_message")) or _clean_text(
+        state.get("selected_message")
+    )
+    if not message_candidate:
+        return True
+
+    return _matches_initial_button_message(action, message_candidate)
 
 
 def _get_turn_policy(state: AgentState) -> TurnPolicy:
