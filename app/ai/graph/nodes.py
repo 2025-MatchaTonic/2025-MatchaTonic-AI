@@ -372,6 +372,7 @@ def _normalize_topic_title(candidate: str) -> str:
         title = re.sub(pattern, "", title, flags=re.IGNORECASE).strip()
 
     for separator in (
+        r"\s+(?:목표|goal|역할|role|team\s*size|팀\s*인원|인원|마감|deadline|due(?:\s*date)?|산출물|결과물|deliverable(?:s)?)\s*(?:은|는|이|가|:)\s+",
         r"\s*[,\n]\s*",
         r"\s+(?:그리고|근데|다만|인데|이지만|이라서|해서|라서)\s+",
     ):
@@ -1331,7 +1332,9 @@ def topic_exists_node(state: AgentState):
     if _is_capture_title_turn(state) or not _is_meaningful_fact(current_data.get("title")):
         extracted_title = _normalize_topic_title(_extract_topic_candidate(user_message))
     if extracted_title:
-        merged_data = merge_collected_data(current_data, {"title": extracted_title})
+        direct_updates = _extract_direct_fact_updates(user_message)
+        direct_updates["title"] = extracted_title
+        merged_data = merge_collected_data(current_data, direct_updates)
         return {
             "ai_message": (
                 f"좋아요. 주제는 '{extracted_title}'로 정리해둘게요. "

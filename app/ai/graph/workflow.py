@@ -2,11 +2,40 @@
 from langgraph.graph import StateGraph, END
 from app.ai.graph.state import AgentState
 from app.ai.graph.nodes import (
+    _extract_direct_fact_updates,
+    _extract_topic_candidate,
+    _is_meaningful_fact,
+    _normalize_topic_title,
+    _prune_collected_data,
     explore_problem_node,
     gather_information_node,
     topic_exists_node,
 )
 from app.ai.services.template_generation import generate_dev_template, generate_plan_template
+
+
+def _has_title(state: AgentState) -> bool:
+    current_data = _prune_collected_data(state.get("collected_data") or {})
+    return _is_meaningful_fact(current_data.get("title"))
+
+
+def _has_any_collected_fact(state: AgentState) -> bool:
+    current_data = _prune_collected_data(state.get("collected_data") or {})
+    return bool(current_data)
+
+
+def _should_promote_explore_to_topic_set(state: AgentState) -> bool:
+    if _has_any_collected_fact(state):
+        return True
+
+    user_message = str(state.get("user_message") or "").strip()
+    if not user_message:
+        return False
+
+    if _normalize_topic_title(_extract_topic_candidate(user_message)):
+        return True
+
+    return bool(_extract_direct_fact_updates(user_message))
 
 
 def route_logic(state: AgentState):
@@ -32,6 +61,10 @@ def route_logic(state: AgentState):
     # 3. 일반 채팅 흐름
     if action == "CHAT":
         if phase == "EXPLORE":
+            if _has_title(state):
+                return "gather_node"
+            if _should_promote_explore_to_topic_set(state):
+                return "topic_exists_node"
             return "explore_node"
         if phase in ["TOPIC_SET", "GATHER", "READY"]:
             return "gather_node"
