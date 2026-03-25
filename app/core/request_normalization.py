@@ -88,10 +88,19 @@ def normalize_collected_data(value: Any) -> Dict[str, str]:
 
     normalized: Dict[str, str] = {}
     for key, raw_item in value.items():
-        if not isinstance(raw_item, str):
-            continue
+        item = ""
+        if isinstance(raw_item, str):
+            item = raw_item.strip()
+        elif isinstance(raw_item, (int, float)) and not isinstance(raw_item, bool):
+            item = str(raw_item).strip()
+        elif isinstance(raw_item, list):
+            parts = [
+                str(part).strip()
+                for part in raw_item
+                if isinstance(part, (str, int, float)) and not isinstance(part, bool) and str(part).strip()
+            ]
+            item = ", ".join(parts).strip()
 
-        item = raw_item.strip()
         if not item:
             continue
 
