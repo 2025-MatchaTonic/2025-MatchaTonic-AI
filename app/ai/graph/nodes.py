@@ -1472,6 +1472,7 @@ def topic_exists_node(state: AgentState):
 def gather_information_node(state: AgentState):
     user_message = _effective_user_message(state)
     turn_policy = _get_turn_policy(state)
+    current_phase = str(state.get("current_phase") or "")
     current_data = _prune_collected_data(state.get("collected_data") or {})
     prefilled_data = merge_collected_data(current_data, _seed_topic_title(state, current_data))
     was_ready = _is_template_ready(current_data)
@@ -1622,11 +1623,16 @@ def gather_information_node(state: AgentState):
     is_sufficient = _is_template_ready(merged_data)
     ai_msg = str(result.ai_message or "").strip()
 
-    if is_sufficient and not was_ready:
-        ai_msg += (
-            "\n\n이제 템플릿을 만들 수 있을 만큼 정보가 모였어요. "
-            "템플릿 만드시겠습니까?"
-        )
+    should_prompt_template = is_sufficient and (not was_ready or current_phase != "READY")
+    if should_prompt_template and "템플릿" not in ai_msg:
+        if _is_answer_only_turn(state):
+            prompt_message = (
+                "이제 템플릿을 만들 수 있을 만큼 정보가 모였어요. "
+                "원하시면 기획용 또는 개발용 템플릿을 생성할 수 있어요."
+            )
+        else:
+            prompt_message = "이제 템플릿을 만들 수 있을 만큼 정보가 모였어요. 템플릿 만드시겠습니까?"
+        ai_msg = f"{ai_msg}\n\n{prompt_message}".strip() if ai_msg else prompt_message
     ai_msg = _apply_turn_policy_to_message(state, ai_msg)
 
     next_phase = "READY" if is_sufficient else "GATHER"
