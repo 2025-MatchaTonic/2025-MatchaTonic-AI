@@ -169,6 +169,46 @@ TITLE_INSTRUCTION_KEYWORDS = (
     "데이터",
     "후보",
 )
+FILL_REMAINING_EXACT_KEYWORDS = (
+    "나머지 다 확정해줘",
+    "나머지 확정해줘",
+    "나머지 다 정해줘",
+    "나머지 다 지정해줘",
+    "나머지 다 채워줘",
+    "남은 것들 다 확정해줘",
+    "전부 확정해줘",
+    "다 확정해줘",
+    "다 정해줘",
+    "다 지정해줘",
+    "다 채워줘",
+    "전부 정해줘",
+)
+FILL_REMAINING_TRIGGER_KEYWORDS = (
+    "확정",
+    "정해",
+    "지정",
+    "채워",
+    "반영",
+    "업데이트",
+    "저장",
+    "기록",
+    "맞춰",
+    "완성",
+)
+FILL_REMAINING_SCOPE_KEYWORDS = (
+    "나머지",
+    "남은",
+    "전부",
+    "전체",
+    "모두",
+    "세션 요약",
+    "세션요약",
+    "핵심 결정사항",
+    "저 부분",
+    "위 내용",
+    "방금 내용",
+    "이걸로",
+)
 TITLE_EXPLICIT_PATTERN = re.compile(
     r"^\s*(?:프로젝트\s*주제|프로젝트명|주제|제목)\s*(?:은|는|:)?\s*",
     re.IGNORECASE,
@@ -723,6 +763,31 @@ def _looks_like_title_instruction(candidate: str) -> bool:
 def _normalize_direct_fact_value(value: str) -> str:
     normalized = DIRECT_FACT_ENDING_PATTERN.sub("", str(value or "").strip())
     return normalized.strip(" .,!?:;\"'")
+
+
+def _is_fill_remaining_request(user_message: str, current_data: dict[str, str]) -> bool:
+    normalized = _clean_text(_strip_mates_mention(user_message)).lower()
+    if not normalized:
+        return False
+
+    missing_fields = [
+        key for key in GATHER_FIELD_GUIDE if not _is_meaningful_fact(current_data.get(key))
+    ]
+    if not missing_fields:
+        return False
+
+    if any(keyword in normalized for keyword in FILL_REMAINING_EXACT_KEYWORDS):
+        return True
+
+    has_trigger = any(keyword in normalized for keyword in FILL_REMAINING_TRIGGER_KEYWORDS)
+    has_scope = any(keyword in normalized for keyword in FILL_REMAINING_SCOPE_KEYWORDS)
+    if has_trigger and has_scope:
+        return True
+
+    if has_trigger and any(keyword in normalized for keyword in ("다", "전부", "모두", "전체")):
+        return True
+
+    return False
 
 
 def _extract_direct_fact_updates(user_message: str) -> dict[str, str]:
@@ -1415,6 +1480,7 @@ def gather_information_node(state: AgentState):
         focus_type = focus_type or "goal"
     focus_instruction = _build_gather_focus_instruction(focus_type)
     missing_field_summary = _build_missing_field_summary(prefilled_data)
+    fill_remaining_request = _is_fill_remaining_request(user_message, prefilled_data)
     rag_context = _fetch_rag_context(
         state,
         phase=state.get("current_phase", "GATHER"),
@@ -1452,6 +1518,7 @@ def gather_information_node(state: AgentState):
     - If the user sounds frustrated, acknowledge it briefly and then move to practical help.
     - collected_data is internal structured state. Only store confirmed facts from the conversation.
     - Never store guesses, temporary ideas, user questions, complaints, or "I don't know" style replies in updated_data.
+    - If fill_remaining_request is true, the user explicitly wants the remaining empty fields to be finalized now. In that case, you may choose concrete values for currently empty collected_data fields and store them in updated_data. Keep already confirmed values unless the user clearly asks to change them.
     - Discussion about target users, benefit, or importance may appear in ai_message, but must not be force-mapped into unrelated collected_data keys.
     - {focus_instruction}
     - Follow these writing rules as well:
@@ -1478,6 +1545,9 @@ def gather_information_node(state: AgentState):
     [Current focus]
     {focus_type or "none"}
 
+    [Fill remaining request]
+    {fill_remaining_request}
+
     [User message]
     {user_message}
 
@@ -1496,6 +1566,7 @@ def gather_information_node(state: AgentState):
     - Prefer finishing with an answer. Add a follow-up question only when the conversation genuinely needs one more decision input.
     - updated_data must contain only confirmed facts from this turn.
     - If the user asked for recommendations, explanations, or said they do not know, updated_data may be empty.
+    - If fill_remaining_request is true, prefer filling the currently missing fields in updated_data instead of leaving them blank. Use practical defaults grounded in the existing topic and recent conversation.
     - Be conservative with is_sufficient. The server will validate readiness again.
     """
 
