@@ -1,8 +1,6 @@
-# 환경변수 로드 (Pydantic Settings)
 import os
 from dotenv import load_dotenv
 
-# .env 파일 로드
 load_dotenv()
 
 

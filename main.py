@@ -9,6 +9,11 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
+
 app = FastAPI(title="MatchaTonic AI PM")
 
 cors_allow_origins = settings.AI_CORS_ALLOW_ORIGINS

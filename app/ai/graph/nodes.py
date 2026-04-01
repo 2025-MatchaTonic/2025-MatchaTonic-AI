@@ -2,53 +2,37 @@
 import json
 import logging
 import re
-from time import perf_counter
 from json import JSONDecodeError
 
-from langchain_openai import ChatOpenAI
 from pydantic import ValidationError
 
-from app.ai.schemas.llm_outputs import GatherLLMResponse
 from app.ai.graph.collected_data import (
     build_collected_data_json_example,
     merge_collected_data,
 )
+from app.ai.graph.llm_clients import (
+    conversation_llm,
+    invoke_llm as _invoke_llm,
+    structured_llm,
+)
 from app.ai.graph.state import AgentState, TurnPolicy
+from app.ai.graph.template_support import build_recent_context as _build_recent_context
+from app.ai.graph.text_support import (
+    MATES_MENTION_PATTERN,
+    PLAIN_LANGUAGE_RULES,
+    clean_text as _clean_text,
+    strip_mates_mention as _strip_mates_mention,
+    truncate_message as _truncate_ai_message,
+)
+from app.ai.schemas.llm_outputs import GatherLLMResponse
 from app.core.config import settings
 from app.rag.retriever import get_rag_context
 
-# NOTE
-# The `collected_data` structure was recently extended with a new key
-# "roles" (담당 역할).  All of the helper functions imported from
-# `collected_data.py` are dynamic, so new fields are included
-# automatically in prompts, examples and merging logic.  We also add
-# some extra safety checks below so that nodes remain robust as the
-# schema evolves.
-
 logger = logging.getLogger(__name__)
-
-LLM_MODEL = settings.OPENAI_MODEL
-
-conversation_llm = ChatOpenAI(
-    model=LLM_MODEL,
-    temperature=0.7,
-    openai_api_key=settings.OPENAI_API_KEY,
-    timeout=settings.OPENAI_TIMEOUT_SECONDS,
-    max_retries=settings.OPENAI_MAX_RETRIES,
-)
-
-structured_llm = ChatOpenAI(
-    model=LLM_MODEL,
-    temperature=0.2,
-    openai_api_key=settings.OPENAI_API_KEY,
-    timeout=settings.OPENAI_TIMEOUT_SECONDS,
-    max_retries=settings.OPENAI_MAX_RETRIES,
-)
 
 RAG_EMPTY_CONTEXT = "(관련 레퍼런스를 찾지 못했습니다.)"
 FAST_EXPLORE_REPLY = "좋아요. 최근 일주일 동안 '이거 좀 불편하다' 싶었던 순간이 있었나요?"
 SHORT_MESSAGE_PATTERN = re.compile(r"[^a-z0-9가-힣]+")
-MATES_MENTION_PATTERN = re.compile(r"@mates\b", re.IGNORECASE)
 FAST_TOPIC_EXISTS_REPLY = (
     "좋아요. 이미 생각해둔 주제가 있다면 지금 한두 줄로 보내주세요. "
     "입력해주신 내용을 바탕으로 프로젝트 주제를 짧게 정리해서 collected data에 반영하겠습니다."
@@ -233,17 +217,9 @@ NUMBERED_OPTION_INLINE_PATTERN = re.compile(
 DIRECT_FACT_ENDING_PATTERN = re.compile(
     r"\s*(?:입니다|이에요|예요|이야|야|요)\s*$"
 )
-AI_RESPONSE_MAX_CHARS = max(80, int(settings.AI_RESPONSE_MAX_CHARS))
 FAST_RAG_PHASES = {"EXPLORE", "TOPIC_SET", "GATHER"}
 RAG_CACHE_MAX_ITEMS = 128
 RAG_CONTEXT_CACHE: dict[tuple[str, str, tuple[str, ...], tuple[str, ...], int], str] = {}
-
-
-PLAIN_LANGUAGE_RULES = """
-- 참고 레퍼런스의 전문용어를 그대로 복붙하지 말고, 초보 팀도 이해할 수 있는 쉬운 한국어로 풀어서 설명하세요.
-- 꼭 필요한 전문용어를 써야 하면 한 번만 쓰고, 바로 뒤에 괄호나 짧은 설명으로 뜻을 덧붙이세요.
-- 문장은 짧고 분명하게 쓰고, 현업자가 아닌 사람도 바로 이해할 수 있는 표현을 우선하세요.
-""".strip()
 
 RAG_FILTERS_BY_PHASE: dict[str, dict[str, list[str]]] = {
     "EXPLORE": {
@@ -278,14 +254,6 @@ def _normalize_message(value: str) -> str:
     lowered = MATES_MENTION_PATTERN.sub(" ", str(value or "").strip().lower())
     compact = SHORT_MESSAGE_PATTERN.sub("", lowered)
     return compact.strip()
-
-
-def _strip_mates_mention(value: object) -> str:
-    text = str(value or "").strip()
-    if not text:
-        return ""
-    stripped = MATES_MENTION_PATTERN.sub(" ", text)
-    return re.sub(r"\s+", " ", stripped).strip()
 
 
 def _effective_user_message(state: AgentState) -> str:
@@ -465,18 +433,6 @@ def _trim_trailing_question_lines(message: str) -> str:
     return "\n".join(lines).strip()
 
 
-def _truncate_ai_message(message: str, max_chars: int = AI_RESPONSE_MAX_CHARS) -> str:
-    text = str(message or "").strip()
-    if len(text) <= max_chars:
-        return text
-    truncated = text[: max_chars - 1].rstrip()
-    if not truncated:
-        return text[:max_chars]
-    if truncated[-1] in {".", "!", "?", "…"}:
-        return truncated
-    return f"{truncated}…"
-
-
 def _answer_only_fallback(state: AgentState, message: str) -> str:
     if str(message or "").strip():
         return str(message).strip()
@@ -565,17 +521,6 @@ def _trim_rag_context_for_phase(context: str, phase: str) -> str:
     return text[: max_chars - 3].rstrip() + "..."
 
 
-def _invoke_llm(llm: ChatOpenAI, prompt: str, *, label: str, **kwargs):
-    started_at = perf_counter()
-    try:
-        response = llm.invoke(prompt, **kwargs)
-    except Exception:
-        logger.exception("%s failed in %.2fs", label, perf_counter() - started_at)
-        return None
-    logger.info("%s completed in %.2fs", label, perf_counter() - started_at)
-    return response
-
-
 def _build_rag_query(state: AgentState) -> str:
     user_message = _effective_user_message(state)
     selected = _strip_mates_mention(state.get("selected_message"))
@@ -651,10 +596,6 @@ def _fetch_rag_context(
 
 def _get_rag_filters(filter_key: str) -> dict[str, list[str]]:
     return RAG_FILTERS_BY_PHASE.get(filter_key, {})
-
-
-def _clean_text(value: object) -> str:
-    return str(value).strip() if isinstance(value, str) else ""
 
 
 def _is_meaningful_fact(value: object) -> bool:
@@ -917,397 +858,6 @@ def _is_template_ready(current_data: dict[str, str]) -> bool:
     return _count_ready_fields(normalized) >= 4
 
 
-def _build_project_snapshot(data: dict) -> dict[str, str]:
-    title = _clean_text(data.get("title")) or "프로젝트 제목 미정"
-    goal = _clean_text(data.get("goal")) or "프로젝트 목표는 추가 논의가 필요합니다."
-    team_size = _clean_text(data.get("teamSize")) or "팀 규모 미정"
-    roles = _clean_text(data.get("roles")) or "역할 분담 추가 논의 필요"
-    due_date = _clean_text(data.get("dueDate")) or "마감 일정 미정"
-    deliverables = _clean_text(data.get("deliverables")) or "산출물 범위 추가 논의 필요"
-
-    return {
-        "title": title,
-        "goal": goal,
-        "team_size": team_size,
-        "roles": roles,
-        "due_date": due_date,
-        "deliverables": deliverables,
-    }
-
-
-def _build_default_template_sections(state: AgentState, mode: str = "plan") -> dict:
-    snapshot = _build_project_snapshot(state.get("collected_data") or {})
-    title = snapshot["title"]
-    goal = snapshot["goal"]
-    team_size = snapshot["team_size"]
-    roles = snapshot["roles"]
-    due_date = snapshot["due_date"]
-    deliverables = snapshot["deliverables"]
-
-    if mode == "dev":
-        return {
-            "project_home": {
-                "project_overview": (
-                    f"{title} 프로젝트의 개발 실행 초안입니다. 목표는 {goal} "
-                    f"현재 기준 팀 규모는 {team_size}, 역할은 {roles}, "
-                    f"주요 산출물은 {deliverables}, 마감 기준은 {due_date}입니다."
-                ),
-            },
-            "planning": {
-                "project_intro": f"{title} 개발 실행 초안: {goal}",
-                "problem_definition": [
-                    {
-                        "id": 1,
-                        "situation": (
-                            "개발 범위, 책임 분담, 산출물 연결 방식이 한 문서에 정리되지 않으면 "
-                            "구현 우선순위와 핸드오프가 흔들릴 수 있습니다."
-                        ),
-                        "reason": (
-                            f"팀 규모 {team_size}에서 역할({roles})과 마감({due_date})이 있는 만큼 "
-                            "실행 기준을 미리 고정해야 개발 속도와 품질을 맞출 수 있습니다."
-                        ),
-                        "limitation": (
-                            "현재 수집된 정보만으로는 세부 기술 스택, API 명세, 데이터 모델, "
-                            "세부 태스크 단위까지는 확정할 수 없습니다."
-                        ),
-                    }
-                ],
-                "solution": {
-                    "core_summary": (
-                        "목표, 역할, 산출물, 마감 기준을 바탕으로 개발 범위와 실행 기준을 단일 문서로 정리합니다."
-                    ),
-                    "problem_solutions": [
-                        {
-                            "problem_id": 1,
-                            "solution_desc": (
-                                f"역할은 {roles}, 산출물은 {deliverables}, 마감은 {due_date} 기준으로 "
-                                "개발 범위와 책임을 정리하고 구현 전에 공통 기준을 맞춥니다."
-                            ),
-                        }
-                    ],
-                    "features": [
-                        f"개발 목표 정리: {goal}",
-                        f"역할 및 책임 기준: {roles} / {team_size}",
-                        f"구현 산출물 및 일정 기준: {deliverables} / {due_date}",
-                    ],
-                },
-                "target_persona": {
-                    "name": "추가 논의 필요",
-                    "age": "추가 논의 필요",
-                    "job_role": "개발 실행 담당 팀",
-                    "main_activities": deliverables,
-                    "pain_points": [
-                        "구현 범위와 책임 분담이 문서로 정리되지 않으면 실행 속도가 떨어집니다.",
-                        "산출물 기준이 분산되면 개발과 검토 과정에서 반복 조율이 발생합니다.",
-                    ],
-                    "needs": [
-                        f"{due_date}까지 바로 실행 가능한 개발 기준 문서가 필요합니다.",
-                        "역할, 산출물, 우선순위를 한 번에 볼 수 있는 정리된 실행 초안이 필요합니다.",
-                    ],
-                },
-            },
-            "ground_rules": (
-                "1. 개발 범위와 우선순위는 수집된 목표, 역할, 산출물, 마감 기준을 우선 근거로 삼습니다.\n"
-                "2. 역할별 책임과 산출물 연결 관계를 문서에 명시한 뒤 작업을 시작합니다.\n"
-                "3. 세부 기술 선택과 구현 방식은 팀 합의 전까지 확정 표현으로 쓰지 않습니다.\n"
-                "4. 마감에 영향을 주는 변경 사항은 문서에 즉시 반영하고 공유합니다."
-            ),
-        }
-
-    return {
-        "project_home": {
-            "project_overview": (
-                f"{title} 프로젝트입니다. 목표는 {goal} "
-                f"현재 기준 팀 규모는 {team_size}, 주요 산출물은 {deliverables}, "
-                f"마감 기준은 {due_date}입니다."
-            ),
-        },
-        "planning": {
-            "project_intro": f"{title}: {goal}",
-            "problem_definition": [
-                {
-                    "id": 1,
-                    "situation": (
-                        f"{title} 프로젝트는 목표가 정해져 있지만 실행 기준을 한 문서로 "
-                        "정리할 필요가 있습니다."
-                    ),
-                    "reason": (
-                        f"팀 규모 {team_size} 기준으로 역할, 산출물, 일정이 분산되면 "
-                        "실행 우선순위가 흔들릴 수 있습니다."
-                    ),
-                    "limitation": (
-                        "현재 수집된 최소 정보만으로는 세부 사용자 시나리오와 세부 요구사항을 "
-                        "확정하기 어렵습니다."
-                    ),
-                }
-            ],
-            "solution": {
-                "core_summary": (
-                    "목표, 역할, 산출물, 일정 기준을 하나의 템플릿에 정리해 팀의 실행 기준을 맞춥니다."
-                ),
-                "problem_solutions": [
-                    {
-                        "problem_id": 1,
-                        "solution_desc": (
-                            f"{goal}에 맞춰 역할은 {roles}, 산출물은 {deliverables}, "
-                            f"마감은 {due_date} 기준으로 정리합니다."
-                        ),
-                    }
-                ],
-                "features": [
-                    f"프로젝트 목표 정리: {goal}",
-                    f"팀 운영 기준 정리: {roles} / {team_size}",
-                    f"산출물 및 일정 기준 정리: {deliverables} / {due_date}",
-                ],
-            },
-            "target_persona": {
-                "name": "추가 논의 필요",
-                "age": "추가 논의 필요",
-                "job_role": roles,
-                "main_activities": deliverables,
-                "pain_points": [
-                    "목표는 정해졌지만 세부 실행 기준과 우선순위가 문서로 정리되지 않았습니다.",
-                    f"팀 규모 {team_size}에서 역할 경계와 일정 기준을 맞춰야 합니다.",
-                ],
-                "needs": [
-                    f"{due_date}까지 공유 가능한 실행 템플릿이 필요합니다.",
-                    "산출물과 역할을 한 번에 확인할 수 있는 기획 문서가 필요합니다.",
-                ],
-            },
-        },
-        "ground_rules": (
-            "1. 프로젝트 목표, 역할, 산출물, 일정은 수집된 데이터를 기준으로 정리합니다.\n"
-            "2. 최근 팀 대화는 문서의 톤과 우선순위를 보완하는 참고 문맥으로 활용합니다.\n"
-            "3. 역할, 산출물, 일정은 팀이 합의한 표현으로 명시합니다.\n"
-            "4. 목표와 직접 연결되는 실행 기준부터 먼저 정리합니다."
-        ),
-    }
-
-
-def _get_template_mode_config(action_type: str) -> dict[str, str]:
-    if action_type == "BTN_DEV":
-        return {
-            "mode": "dev",
-            "mode_label": "개발용 템플릿",
-            "focus": (
-                "문제 정의보다 개발 범위, 구현 기준, 역할 분담, 산출물 연결, "
-                "실행 우선순위가 더 잘 드러나도록 작성하세요."
-            ),
-            "summary_fallback": "개발용 템플릿 초안을 생성했습니다.",
-        }
-
-    return {
-        "mode": "plan",
-        "mode_label": "기획용 템플릿",
-        "focus": (
-            "사용자 문제, 기획 의도, 산출물 방향, 팀 정렬 포인트가 더 잘 드러나도록 작성하세요."
-        ),
-        "summary_fallback": "기획용 템플릿 초안을 생성했습니다.",
-    }
-
-
-def _merge_template_sections(base: dict, generated: dict) -> dict:
-    merged = dict(base)
-
-    project_home = generated.get("project_home")
-    if isinstance(project_home, dict):
-        overview = str(project_home.get("project_overview", "")).strip()
-        if overview:
-            merged["project_home"] = {"project_overview": overview}
-
-    planning = generated.get("planning")
-    if isinstance(planning, dict):
-        merged_planning = dict(base["planning"])
-
-        project_intro = str(planning.get("project_intro", "")).strip()
-        if project_intro:
-            merged_planning["project_intro"] = project_intro
-
-        problem_definition = planning.get("problem_definition")
-        if isinstance(problem_definition, list) and problem_definition:
-            cleaned_problem_definition = []
-            for index, item in enumerate(problem_definition, start=1):
-                if not isinstance(item, dict):
-                    continue
-                cleaned_problem_definition.append(
-                    {
-                        "id": item.get("id") or index,
-                        "situation": str(item.get("situation", "")).strip(),
-                        "reason": str(item.get("reason", "")).strip(),
-                        "limitation": str(item.get("limitation", "")).strip(),
-                    }
-                )
-            if cleaned_problem_definition:
-                merged_planning["problem_definition"] = cleaned_problem_definition
-
-        solution = planning.get("solution")
-        if isinstance(solution, dict):
-            merged_solution = dict(base["planning"]["solution"])
-
-            core_summary = str(solution.get("core_summary", "")).strip()
-            if core_summary:
-                merged_solution["core_summary"] = core_summary
-
-            problem_solutions = solution.get("problem_solutions")
-            if isinstance(problem_solutions, list) and problem_solutions:
-                cleaned_problem_solutions = []
-                for item in problem_solutions:
-                    if not isinstance(item, dict):
-                        continue
-                    solution_desc = str(item.get("solution_desc", "")).strip()
-                    if not solution_desc:
-                        continue
-                    cleaned_problem_solutions.append(
-                        {
-                            "problem_id": item.get("problem_id") or 1,
-                            "solution_desc": solution_desc,
-                        }
-                    )
-                if cleaned_problem_solutions:
-                    merged_solution["problem_solutions"] = cleaned_problem_solutions
-
-            features = solution.get("features")
-            if isinstance(features, list):
-                cleaned_features = [
-                    str(feature).strip() for feature in features if str(feature).strip()
-                ]
-                if cleaned_features:
-                    merged_solution["features"] = cleaned_features
-
-            merged_planning["solution"] = merged_solution
-
-        target_persona = planning.get("target_persona")
-        if isinstance(target_persona, dict):
-            merged_persona = dict(base["planning"]["target_persona"])
-            for key in ["name", "age", "job_role", "main_activities"]:
-                value = str(target_persona.get(key, "")).strip()
-                if value:
-                    merged_persona[key] = value
-
-            for key in ["pain_points", "needs"]:
-                values = target_persona.get(key)
-                if isinstance(values, list):
-                    cleaned_values = [
-                        str(value).strip() for value in values if str(value).strip()
-                    ]
-                    if cleaned_values:
-                        merged_persona[key] = cleaned_values
-
-            merged_planning["target_persona"] = merged_persona
-        merged["planning"] = merged_planning
-
-    ground_rules = generated.get("ground_rules")
-    if isinstance(ground_rules, str) and ground_rules.strip():
-        merged["ground_rules"] = ground_rules.strip()
-
-    return merged
-
-
-def _build_notion_template_payload(state: AgentState, sections: dict) -> dict:
-    return {
-        "projectId": int(state["project_id"]),
-        "templates": [
-            {
-                "key": "PROJECT_HOME",
-                "parentKey": None,
-                "title": "Project Home",
-                "content": sections["project_home"],
-            },
-            {
-                "key": "PLANNING",
-                "parentKey": "PROJECT_HOME",
-                "title": "기획",
-                "content": sections["planning"],
-            },
-            {
-                "key": "GROUND_RULES",
-                "parentKey": "PROJECT_HOME",
-                "title": "그라운드룰",
-                "content": sections["ground_rules"],
-            },
-        ],
-    }
-
-
-def _build_recent_context(state: AgentState) -> str:
-    selected_message = _strip_mates_mention(state.get("selected_message"))
-    recent_messages = [
-        _strip_mates_mention(msg)
-        for msg in state.get("recent_messages", [])
-        if _strip_mates_mention(msg)
-    ]
-
-    context_blocks: list[str] = []
-    if selected_message:
-        context_blocks.append(f"[현재 집중 포인트]\n- {selected_message}")
-    if recent_messages:
-        latest_messages = recent_messages[-5:]
-        flow_summary = "\n".join(f"- {message}" for message in latest_messages)
-        context_blocks.append("[최근 흐름 요약]\n" + flow_summary)
-
-    return "\n\n".join(context_blocks) if context_blocks else "(전달된 최근 대화 없음)"
-
-
-def _build_template_input_summary(state: AgentState) -> str:
-    snapshot = _build_project_snapshot(state.get("collected_data") or {})
-    return (
-        f"- 제목: {snapshot['title']}\n"
-        f"- 목표: {snapshot['goal']}\n"
-        f"- 팀 규모: {snapshot['team_size']}\n"
-        f"- 역할: {snapshot['roles']}\n"
-        f"- 마감일: {snapshot['due_date']}\n"
-        f"- 산출물: {snapshot['deliverables']}"
-    )
-
-
-def _build_template_content_example() -> dict:
-    return {
-        "project_home": {
-            "project_overview": "내용",
-        },
-        "planning": {
-            "project_intro": "프로젝트 한 줄 소개",
-            "problem_definition": [
-                {
-                    "id": 1,
-                    "situation": "불편한 상황 (상황·경험 중심)",
-                    "reason": "왜 문제인가?",
-                    "limitation": "기존 해결 방식의 한계",
-                }
-            ],
-            "solution": {
-                "core_summary": "핵심 솔루션 한 줄 요약",
-                "problem_solutions": [
-                    {
-                        "problem_id": 1,
-                        "solution_desc": "문제 1에 대한 우리 서비스의 해결 방식",
-                    }
-                ],
-                "features": [
-                    "우리 솔루션의 특징 1",
-                    "우리 솔루션의 특징 2",
-                    "우리 솔루션의 특징 3",
-                ],
-            },
-            "target_persona": {
-                "name": "이름(가명)",
-                "age": "나이",
-                "job_role": "직업 / 역할",
-                "main_activities": "주요 활동",
-                "pain_points": [
-                    "불편함 1",
-                    "불편함 2",
-                ],
-                "needs": [
-                    "니즈 1",
-                    "니즈 2",
-                ],
-            },
-        },
-        "ground_rules": " ",
-    }
-
-
 def _build_topic_exists_fallback_message() -> str:
     return FAST_TOPIC_EXISTS_REPLY
 
@@ -1337,36 +887,28 @@ def explore_problem_node(state: AgentState):
     )
     recent_context = _build_recent_context(state)
     prompt = f"""
-    당신은 친절하고 센스 있는 브레인스토밍 파트너입니다. 
-    사용자가 아직 프로젝트 주제가 없거나, 불편함을 탐색하는 중입니다.
+    You are an AI PM helping a team that does not have a topic yet.
+    Respond in Korean.
 
-    [참고 레퍼런스]
-    {rag_context}
-
-    [최근 대화 문맥]
-    {recent_context}
-
-    [중요 지시사항]
-    1. 사용자가 방금 말한 내용이나 최근 팀 대화에 담긴 질문/고민에 먼저 반응하고 답하세요.
-    2. 질문은 **정말 다음 판단에 필요할 때만** 마지막에 1개까지 하세요. 답변만으로 흐름이 충분히 이어지면 질문 없이 끝내세요.
-    3. 사용자가 대답을 했다면, 먼저 그 대답에 깊이 공감하거나 요약한 뒤에 필요한 경우에만 꼬리 질문을 1개 던지세요.
-    4. 첫 시작이고 아직 문맥이 거의 없다면 이렇게 가볍게 물어보세요: "최근 일주일 동안 '아, 이거 진짜 귀찮다' 했던 적이 있나요?"
-    5. 대화가 자연스럽게 이어지도록 친구처럼 편안한 말투를 사용하세요.
-    6. 직접 사용자 입력이 비어 있더라도 최근 팀 대화에 unresolved point가 있으면 그 문맥을 이어서 답하세요.
-    7. 사용자가 "주제가 없다", "추천해줘", "아이디어 줘"처럼 프로젝트 주제 제안을 원하면, 3개의 옵션을 제시하되 반드시 서로 다른 문제영역과 다른 타겟 사용자로 구성하세요.
-    8. 같은 카테고리의 변형 3개를 주지 마세요. 예를 들어 모두 숙소, 모두 배달, 모두 일정관리처럼 한 범주로 몰리면 안 됩니다.
-    9. 주제 추천이 필요할 때는 팀 생산성, 교육, 로컬 커뮤니티, 생활 편의, 취업/진로처럼 범주가 확실히 다른 옵션을 우선 섞으세요.
-    10. 추천할 때는 각 옵션마다 "누구의 어떤 문제를 푸는지"를 짧게 붙이고, 마지막에 가장 현실적인 1개만 추천하세요.
-    11. 아래 원칙을 반드시 지키세요.
-    12. 최종 답변은 공백 포함 300자 이내로 작성하세요.
+    Rules:
+    - Answer the current request first.
+    - Keep the reply within 220 characters.
+    - Ask at most one short follow-up question only if needed.
+    - If the user wants topic ideas, give exactly 3 options from different domains or user groups and recommend 1.
+    - Do not give 3 variants from the same category.
+    - Sound practical, not like customer support.
     {PLAIN_LANGUAGE_RULES}
 
-    [현재 턴 정책]
+    [Turn policy]
     {turn_policy}
-    - ANSWER_ONLY면 설명이나 정리로 답변을 끝내고, 질문으로 마무리하지 마세요.
-    - ANSWER_THEN_ASK면 답변이 충분한 경우 질문 없이 끝내도 됩니다.
-    
-    [사용자 입력]
+
+    [Reference context]
+    {rag_context}
+
+    [Recent conversation]
+    {recent_context}
+
+    [User message]
     {user_message}
     """
 
@@ -1431,24 +973,21 @@ def topic_exists_node(state: AgentState):
         ai_message = _build_topic_exists_fallback_message()
     else:
         prompt = f"""
-        당신은 프로젝트 주제가 이미 정해진 팀을 돕는 AI PM입니다.
-        사용자의 최신 입력과 최근 팀 대화를 읽고, 지금 상황에 맞는 짧은 안내를 한국어로 작성하세요.
-        아래 규칙을 지키세요.
+        You are an AI PM for a team that already has a topic.
+        Respond in Korean.
 
-        규칙:
-        - 2~3문장으로만 답하세요.
-        - 최종 답변은 공백 포함 300자 이내로 작성하세요.
-        - 먼저 사용자의 현재 논의 주제나 관심사를 짧게 짚어 주세요.
-        - 그 다음 팀원끼리 이어서 논의해도 된다는 점과, 막히면 @mates로 도움받을 수 있다는 점을 자연스럽게 안내하세요.
-        - "무엇을 도와드릴까요?", "다음 중 선택하세요" 같은 고객센터식 문장은 금지합니다.
-        - 입력 정보가 적으면 과장하지 말고 일반적인 표현으로 답하세요.
-        - 아래 원칙을 반드시 지키세요.
+        Rules:
+        - Give a short practical reply for the current situation.
+        - Keep it to 2 or 3 sentences and within 220 characters.
+        - Reflect the current topic or recent context first.
+        - If helpful, suggest only one next useful step.
+        - Avoid customer-support phrasing.
         {PLAIN_LANGUAGE_RULES}
 
-        [최근 대화 문맥]
+        [Recent conversation]
         {recent_context}
 
-        [사용자 입력]
+        [User message]
         {user_message}
         """
         response = _invoke_llm(conversation_llm, prompt, label="topic_exists_node llm")
@@ -1490,46 +1029,24 @@ def gather_information_node(state: AgentState):
     recent_context = _build_recent_context(state)
 
     eval_prompt = f"""
-    You are an AI PM who helps a project team make decisions, not a form-filling chatbot.
-    The user is a teammate who may ask for advice, options, examples, or summaries while the project is still unclear.
-    Respond in Korean.
+    You are an AI PM. Respond in Korean and output JSON only.
 
-    First classify the user intent into one of these values:
-    - answer_fact: the user provides a concrete fact or decision
-    - ask_advice: the user asks for explanation, reasoning, criteria, or next-step guidance
-    - ask_idea: the user asks for ideas, options, or recommendations
-    - ask_summary: the user asks to summarize or organize the current session
-    - uncertain: the user does not know yet and wants help narrowing things down
-    - frustrated: the user is irritated or rejecting the current flow and needs a reset
-    - general: anything else
+    intent must be one of:
+    answer_fact | ask_advice | ask_idea | ask_summary | uncertain | frustrated | general
 
-    Core rules:
-    - If the user asks a question, answer it first.
-    - If the direct user message is empty because the user only mentioned @mates, infer the request from the recent conversation and respond to the most relevant unresolved point.
-    - If current_phase is TOPIC_SET and the user seems to have provided a project subject, capture it as title in updated_data.title.
-    - If title is already identified in TOPIC_SET, the next turn should help clarify what problem the topic solves or what outcome the team wants, instead of asking for the title again.
-    - If the user does not know, do not repeat the same question. Give options, examples, decision criteria, or a recommendation.
-    - If the user asks for ideas, provide 2 to 4 realistic options and recommend one when possible.
-    - If the user asks for a summary, summarize confirmed decisions, unresolved points, and the next decision to make.
-    - Do not jump to the next checklist question before addressing the current request.
-    - Ask at most one short follow-up question, and only if it meaningfully helps the next decision.
-    - If your answer already feels complete enough for this turn, end without a follow-up question.
-    - Do not promise future actions like "I will show it soon". Finish this turn with concrete content now.
-    - Avoid customer-support tone, interview-style repetitive questioning, and system-style phrases.
-    - If the user sounds frustrated, acknowledge it briefly and then move to practical help.
-    - collected_data is internal structured state. Only store confirmed facts from the conversation.
-    - Never store guesses, temporary ideas, user questions, complaints, or "I don't know" style replies in updated_data.
-    - If fill_remaining_request is true, the user explicitly wants the remaining empty fields to be finalized now. In that case, you may choose concrete values for currently empty collected_data fields and store them in updated_data. Keep already confirmed values unless the user clearly asks to change them.
-    - Discussion about target users, benefit, or importance may appear in ai_message, but must not be force-mapped into unrelated collected_data keys.
+    Rules:
+    - Answer the current request first.
+    - ai_message must be practical and within 220 characters.
+    - Ask at most one short follow-up question only if needed.
+    - updated_data stores confirmed facts only.
+    - Never store guesses, questions, complaints, or temporary ideas.
+    - If current_phase is TOPIC_SET and the user gave a topic, store it in updated_data.title.
+    - If fill_remaining_request is true, you may fill empty fields with practical defaults grounded in the topic and recent context. Do not overwrite confirmed values unless the user clearly changes them.
     - {focus_instruction}
-    - Follow these writing rules as well:
     {PLAIN_LANGUAGE_RULES}
 
-    [Current turn policy]
+    [Turn policy]
     {turn_policy}
-    - ANSWER_ONLY: answer the current request and finish without a follow-up question.
-    - ANSWER_THEN_ASK: answer first, then optionally add one short follow-up question only if needed.
-    - CAPTURE_TITLE: if a project subject is present, store it as updated_data.title before anything else.
 
     [Reference context]
     {rag_context}
@@ -1552,23 +1069,13 @@ def gather_information_node(state: AgentState):
     [User message]
     {user_message}
 
-    [Required JSON output]
+    Output:
     {{
         "intent": "answer_fact | ask_advice | ask_idea | ask_summary | uncertain | frustrated | general",
-        "ai_message": "A practical PM-style reply in Korean",
+        "ai_message": "short Korean reply",
         "updated_data": {build_collected_data_json_example()},
         "is_sufficient": false
     }}
-
-    [Output criteria]
-    - ai_message should be 2 to 5 sentences, or up to 4 short bullets.
-    - ai_message must be within 300 characters including spaces.
-    - If the user asked for advice, ideas, or a summary, ai_message must contain real content. Do not only ask another question.
-    - Prefer finishing with an answer. Add a follow-up question only when the conversation genuinely needs one more decision input.
-    - updated_data must contain only confirmed facts from this turn.
-    - If the user asked for recommendations, explanations, or said they do not know, updated_data may be empty.
-    - If fill_remaining_request is true, prefer filling the currently missing fields in updated_data instead of leaving them blank. Use practical defaults grounded in the existing topic and recent conversation.
-    - Be conservative with is_sufficient. The server will validate readiness again.
     """
 
     response = _invoke_llm(

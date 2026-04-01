@@ -1,16 +1,18 @@
 # app/api/endpoints/chat.py
 import asyncio
 import logging
-import re
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, root_validator
 
+from app.ai.graph.text_support import (
+    strip_mates_mention as _strip_mates_mention,
+    truncate_message as _truncate_content,
+)
 from app.ai.graph.state import TurnPolicy
 from app.ai.graph.workflow import ai_app
 from app.api.schemas.template import NotionTemplatePayload
-from app.core.config import settings
 from app.core.request_normalization import (
     normalize_action_type,
     normalize_collected_data,
@@ -21,8 +23,6 @@ from app.core.request_normalization import (
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
-MATES_MENTION_PATTERN = re.compile(r"@mates\b", re.IGNORECASE)
-AI_RESPONSE_MAX_CHARS = max(80, int(settings.AI_RESPONSE_MAX_CHARS))
 
 
 class AIChatRequest(BaseModel):
@@ -79,29 +79,9 @@ class AIChatResponse(BaseModel):
     notionTemplatePayload: Optional[NotionTemplatePayload] = None
 
 
-def _strip_mates_mention(value: Any) -> str:
-    text = str(value or "").strip()
-    if not text:
-        return ""
-    stripped = MATES_MENTION_PATTERN.sub(" ", text)
-    return re.sub(r"\s+", " ", stripped).strip()
-
-
 def _has_mates_mention(request: AIChatRequest) -> bool:
     candidates = [request.content, request.selectedMessage]
     return any("@mates" in str(candidate or "").lower() for candidate in candidates)
-
-
-def _truncate_content(content: str) -> str:
-    text = str(content or "").strip()
-    if len(text) <= AI_RESPONSE_MAX_CHARS:
-        return text
-    truncated = text[: AI_RESPONSE_MAX_CHARS - 1].rstrip()
-    if not truncated:
-        return text[:AI_RESPONSE_MAX_CHARS]
-    if truncated[-1] in {".", "!", "?", "…"}:
-        return truncated
-    return f"{truncated}…"
 
 
 def _derive_turn_policy(request: AIChatRequest) -> TurnPolicy:
