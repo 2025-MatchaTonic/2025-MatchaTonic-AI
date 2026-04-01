@@ -210,7 +210,7 @@ DELIVERABLES_PATTERN = re.compile(
     r"(?:산출물|결과물|제출물|deliverable[s]?)\s*(?:은|는|:)?\s*(.+)$",
     re.IGNORECASE,
 )
-CHOICE_INDEX_PATTERN = re.compile(r"^\s*([1-9])\s*번\s*$")
+CHOICE_INDEX_PATTERN = re.compile(r"^\s*([1-9])\s*(?:번)?\s*$")
 NUMBERED_OPTION_LINE_PATTERN = re.compile(r"^\s*(\d{1,2})[)\.\-:]\s*(.+?)\s*$")
 NUMBERED_OPTION_INLINE_PATTERN = re.compile(
     r"(\d{1,2})[)\.\-:]\s*(.+?)(?=\s+\d{1,2}[)\.\-:]|$)"
@@ -400,19 +400,31 @@ def _normalize_topic_title(candidate: str) -> str:
     return title
 
 
-def _seed_topic_title(state: AgentState, current_data: dict[str, str]) -> dict[str, str]:
-    if state.get("current_phase") != "TOPIC_SET":
-        return {}
+def _extract_title_updates_for_topic_set(
+    state: AgentState, current_data: dict[str, str] | None = None
+) -> dict[str, str]:
+    current_data = _prune_collected_data(current_data or state.get("collected_data") or {})
     if _is_meaningful_fact(current_data.get("title")):
         return {}
 
-    candidate = _normalize_topic_title(
-        _extract_topic_candidate(_effective_user_message(state))
-    )
-    if not candidate:
+    user_message = _effective_user_message(state)
+    if not user_message:
         return {}
 
-    return {"title": candidate}
+    direct_updates = _extract_direct_fact_updates(user_message)
+    if "title" in direct_updates:
+        return {"title": direct_updates["title"]}
+
+    choice_title = _extract_choice_based_title(state)
+    if choice_title:
+        return {"title": choice_title}
+
+    if _is_capture_title_turn(state) or state.get("current_phase") in {"EXPLORE", "TOPIC_SET"}:
+        candidate = _normalize_topic_title(_extract_topic_candidate(user_message))
+        if candidate:
+            return {"title": candidate}
+
+    return {}
 
 
 def _looks_like_question_line(text: str) -> bool:
@@ -707,6 +719,38 @@ def _normalize_direct_fact_value(value: str) -> str:
     return normalized.strip(" .,!?:;\"'")
 
 
+def _trim_option_description(candidate: str) -> str:
+    text = _clean_text(candidate)
+    if not text:
+        return ""
+
+    parts = re.split(r"\s+[—-]\s+", text, maxsplit=1)
+    if len(parts) == 2 and len(parts[0].strip()) >= 2:
+        return parts[0].strip()
+    return text
+
+
+def _looks_like_choice_token(value: str) -> bool:
+    return bool(CHOICE_INDEX_PATTERN.match(str(value or "").strip()))
+
+
+def _looks_like_multi_option_block(value: str) -> bool:
+    text = _clean_text(value)
+    if not text:
+        return False
+
+    line_match_count = sum(
+        1
+        for line in text.splitlines()
+        if NUMBERED_OPTION_LINE_PATTERN.match(line.strip())
+    )
+    if line_match_count >= 2:
+        return True
+
+    inline_match_count = sum(1 for _ in NUMBERED_OPTION_INLINE_PATTERN.finditer(text))
+    return inline_match_count >= 2
+
+
 def _is_fill_remaining_request(user_message: str, current_data: dict[str, str]) -> bool:
     normalized = _clean_text(_strip_mates_mention(user_message)).lower()
     if not normalized:
@@ -800,7 +844,7 @@ def _extract_choice_based_title(state: AgentState) -> str:
             if int(line_match.group(1)) != choice_index:
                 continue
 
-            candidate = _normalize_topic_title(line_match.group(2))
+            candidate = _normalize_topic_title(_trim_option_description(line_match.group(2)))
             if candidate and not _looks_like_title_instruction(candidate):
                 return candidate
 
@@ -811,7 +855,7 @@ def _extract_choice_based_title(state: AgentState) -> str:
             if int(inline_match.group(1)) != choice_index:
                 continue
 
-            candidate = _normalize_topic_title(inline_match.group(2))
+            candidate = _normalize_topic_title(_trim_option_description(inline_match.group(2)))
             if candidate and not _looks_like_title_instruction(candidate):
                 return candidate
 
@@ -821,6 +865,10 @@ def _extract_choice_based_title(state: AgentState) -> str:
 def _sanitize_gather_updates(updated_data: dict[str, str]) -> dict[str, str]:
     sanitized: dict[str, str] = {}
     for key, value in updated_data.items():
+        if key != "teamSize" and _looks_like_choice_token(value):
+            continue
+        if key in {"title", "goal"} and _looks_like_multi_option_block(value):
+            continue
         if key == "title":
             value = _normalize_topic_title(value)
         if _is_meaningful_fact(value):
@@ -940,13 +988,10 @@ def topic_exists_node(state: AgentState):
 
     user_message = _effective_user_message(state)
     current_data = _prune_collected_data(state.get("collected_data") or {})
-    extracted_title = ""
-    if _is_capture_title_turn(state) or not _is_meaningful_fact(current_data.get("title")):
-        extracted_title = _normalize_topic_title(_extract_topic_candidate(user_message))
+    title_updates = _extract_title_updates_for_topic_set(state, current_data)
+    extracted_title = title_updates.get("title", "")
     if extracted_title:
-        direct_updates = _extract_direct_fact_updates(user_message)
-        direct_updates["title"] = extracted_title
-        merged_data = merge_collected_data(current_data, direct_updates)
+        merged_data = merge_collected_data(current_data, title_updates)
         return {
             "ai_message": (
                 f"좋아요. 주제는 '{extracted_title}'로 정리해둘게요. "
@@ -1014,7 +1059,7 @@ def gather_information_node(state: AgentState):
     turn_policy = _get_turn_policy(state)
     current_phase = str(state.get("current_phase") or "")
     current_data = _prune_collected_data(state.get("collected_data") or {})
-    prefilled_data = merge_collected_data(current_data, _seed_topic_title(state, current_data))
+    prefilled_data = dict(current_data)
     was_ready = _is_template_ready(current_data)
     focus_type = _infer_conversation_focus(state)
     if state.get("current_phase") == "TOPIC_SET" and _is_meaningful_fact(prefilled_data.get("title")):
@@ -1041,7 +1086,6 @@ def gather_information_node(state: AgentState):
     - Ask at most one short follow-up question only if needed.
     - updated_data stores confirmed facts only.
     - Never store guesses, questions, complaints, or temporary ideas.
-    - If current_phase is TOPIC_SET and the user gave a topic, store it in updated_data.title.
     - If fill_remaining_request is true, you may fill empty fields with practical defaults grounded in the topic and recent context. Do not overwrite confirmed values unless the user clearly changes them.
     - {focus_instruction}
     {PLAIN_LANGUAGE_RULES}
@@ -1114,11 +1158,12 @@ def gather_information_node(state: AgentState):
         result.normalized_updated_data(),
         focus_type=focus_type,
     )
-    direct_updates = _extract_direct_fact_updates(user_message)
-    if "title" not in direct_updates and not _is_meaningful_fact(prefilled_data.get("title")):
-        choice_title = _extract_choice_based_title(state)
-        if choice_title:
-            direct_updates["title"] = choice_title
+    filtered_updates.pop("title", None)
+    direct_updates = {
+        key: value
+        for key, value in _extract_direct_fact_updates(user_message).items()
+        if key != "title"
+    }
     merged_data = merge_collected_data(prefilled_data, filtered_updates)
     merged_data = merge_collected_data(merged_data, direct_updates)
     if filtered_updates or direct_updates:
