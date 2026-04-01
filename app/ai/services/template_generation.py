@@ -1,32 +1,32 @@
-﻿import json
+import json
 from json import JSONDecodeError
 
-from app.ai.schemas.llm_outputs import TemplateContentLLMResponse
 from pydantic import ValidationError
-from app.ai.graph.nodes import (
-    PLAIN_LANGUAGE_RULES,
-    _build_default_template_sections,
-    _build_notion_template_payload,
-    _build_recent_context,
-    _build_template_content_example,
-    _build_template_input_summary,
-    _fetch_rag_context,
-    _get_rag_filters,
-    _get_template_mode_config,
-    _merge_template_sections,
-    structured_llm,
-)
+
+from app.ai.graph.llm_clients import structured_llm
+from app.ai.graph.nodes import _fetch_rag_context, _get_rag_filters
 from app.ai.graph.state import AgentState
+from app.ai.graph.template_support import (
+    build_default_template_sections,
+    build_notion_template_payload,
+    build_recent_context,
+    build_template_content_example,
+    build_template_input_summary,
+    get_template_mode_config,
+    merge_template_sections,
+)
+from app.ai.graph.text_support import PLAIN_LANGUAGE_RULES
+from app.ai.schemas.llm_outputs import TemplateContentLLMResponse
 
 
 def generate_template_from_state(state: AgentState, *, action_type: str) -> dict:
-    mode_config = _get_template_mode_config(action_type)
-    default_sections = _build_default_template_sections(state, mode=mode_config["mode"])
-    template_content_example = _build_template_content_example()
+    mode_config = get_template_mode_config(action_type)
+    default_sections = build_default_template_sections(state, mode=mode_config["mode"])
+    template_content_example = build_template_content_example()
     rag_filter_key = "READY_DEV" if action_type == "BTN_DEV" else "READY_PLAN"
     rag_context = _fetch_rag_context(state, phase="READY", **_get_rag_filters(rag_filter_key))
-    recent_context = _build_recent_context(state)
-    template_input_summary = _build_template_input_summary(state)
+    recent_context = build_recent_context(state)
+    template_input_summary = build_template_input_summary(state)
 
     prompt = f"""
     당신은 {mode_config["mode_label"]}용 노션 프로젝트 템플릿 문구를 작성하는 PM입니다.
@@ -96,8 +96,8 @@ def generate_template_from_state(state: AgentState, *, action_type: str) -> dict
             f"raw output:\n{response.content}"
         )
 
-    template_sections = _merge_template_sections(default_sections, result.to_merged_dict())
-    template_payload = _build_notion_template_payload(state, template_sections)
+    template_sections = merge_template_sections(default_sections, result.to_merged_dict())
+    template_payload = build_notion_template_payload(state, template_sections)
     summary_message = result.summary_message.strip()
     if not summary_message:
         summary_message = mode_config["summary_fallback"]
@@ -116,6 +116,3 @@ def generate_plan_template(state: AgentState) -> dict:
 
 def generate_dev_template(state: AgentState) -> dict:
     return generate_template_from_state(state, action_type="BTN_DEV")
-
-
-

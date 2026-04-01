@@ -1,4 +1,3 @@
-# app/ai/graph/workflow.py
 from langgraph.graph import StateGraph, END
 from app.ai.graph.state import AgentState
 from app.ai.graph.nodes import (
@@ -43,7 +42,6 @@ def route_logic(state: AgentState):
     phase = state["current_phase"]
     turn_policy = state["turn_policy"]
 
-    # 1. 초기 "프로젝트 주제가 있나요?" 응답 처리
     if action == "BTN_NO":
         return "explore_node"
     elif action in ["BTN_YES", "BTN_GO_DEF"]:
@@ -52,13 +50,11 @@ def route_logic(state: AgentState):
     if phase == "TOPIC_SET" and turn_policy in {"ASK_ONLY", "CAPTURE_TITLE"}:
         return "topic_exists_node"
 
-    # 2. 명시적 AI 기능 호출
     if action == "BTN_PLAN":
         return "generate_plan_node"
     if action == "BTN_DEV":
         return "generate_dev_node"
 
-    # 3. 일반 채팅 흐름
     if action == "CHAT":
         if phase == "EXPLORE":
             if _has_title(state):
@@ -92,7 +88,6 @@ workflow.set_conditional_entry_point(
     },
 )
 
-# 모든 노드가 끝나면 종료 (상태는 DB나 클라이언트에 반환)
 workflow.add_edge("explore_node", END)
 workflow.add_edge("gather_node", END)
 workflow.add_edge("generate_plan_node", END)
