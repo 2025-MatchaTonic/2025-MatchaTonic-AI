@@ -1,6 +1,7 @@
 from langgraph.graph import StateGraph, END
 from app.ai.graph.state import AgentState
 from app.ai.graph.nodes import (
+    _extract_title_updates_for_topic_set,
     _extract_direct_fact_updates,
     _extract_topic_candidate,
     _is_meaningful_fact,
@@ -27,6 +28,9 @@ def _should_promote_explore_to_topic_set(state: AgentState) -> bool:
     if _has_any_collected_fact(state):
         return True
 
+    if _extract_title_updates_for_topic_set(state):
+        return True
+
     user_message = str(state.get("user_message") or "").strip()
     if not user_message:
         return False
@@ -40,14 +44,10 @@ def _should_promote_explore_to_topic_set(state: AgentState) -> bool:
 def route_logic(state: AgentState):
     action = state["action_type"]
     phase = state["current_phase"]
-    turn_policy = state["turn_policy"]
 
     if action == "BTN_NO":
         return "explore_node"
     elif action in ["BTN_YES", "BTN_GO_DEF"]:
-        return "topic_exists_node"
-
-    if phase == "TOPIC_SET" and turn_policy in {"ASK_ONLY", "CAPTURE_TITLE"}:
         return "topic_exists_node"
 
     if action == "BTN_PLAN":
@@ -62,7 +62,11 @@ def route_logic(state: AgentState):
             if _should_promote_explore_to_topic_set(state):
                 return "topic_exists_node"
             return "explore_node"
-        if phase in ["TOPIC_SET", "GATHER", "READY"]:
+        if phase == "TOPIC_SET":
+            if _has_title(state):
+                return "gather_node"
+            return "topic_exists_node"
+        if phase in ["GATHER", "READY"]:
             return "gather_node"
 
     return END
