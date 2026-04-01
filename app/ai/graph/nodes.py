@@ -3,6 +3,7 @@ import json
 import logging
 import re
 from json import JSONDecodeError
+from time import perf_counter
 
 from pydantic import ValidationError
 
