@@ -79,11 +79,6 @@ class AIChatResponse(BaseModel):
     notionTemplatePayload: Optional[NotionTemplatePayload] = None
 
 
-def _has_mates_mention(request: AIChatRequest) -> bool:
-    candidates = [request.content, request.selectedMessage]
-    return any("@mates" in str(candidate or "").lower() for candidate in candidates)
-
-
 def _has_meaningful_value(value: Any) -> bool:
     return bool(str(value or "").strip())
 
@@ -129,8 +124,6 @@ def _derive_turn_policy(request: AIChatRequest) -> TurnPolicy:
         return "ASK_ONLY"
     if phase == "TOPIC_SET" and not current_title and effective_message:
         return "CAPTURE_TITLE"
-    if _has_mates_mention(request):
-        return "ANSWER_ONLY"
     if phase in {"EXPLORE", "TOPIC_SET", "GATHER", "READY"}:
         return "ANSWER_THEN_ASK"
     return "ANSWER_ONLY"
