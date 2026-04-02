@@ -60,6 +60,15 @@ TRIVIAL_MESSAGES = {
     "ㅁㅌ",
     "mates",
 }
+GREETING_TOKENS = {
+    "hi",
+    "hello",
+    "hey",
+    "\uc548\ub155",
+    "\uc548\ub155\ud558\uc138\uc694",
+    "\ubc18\uac00\uc6cc",
+    "\ubc18\uac11\uc2b5\ub2c8\ub2e4",
+}
 INITIAL_BUTTON_TOKENS = {
     "",
     "yes",
@@ -266,6 +275,11 @@ def _is_trivial_message(user_message: str) -> bool:
     return normalized in TRIVIAL_MESSAGES
 
 
+def _is_greeting_message(user_message: str) -> bool:
+    normalized = _normalize_button_token(_strip_mates_mention(user_message))
+    return normalized in GREETING_TOKENS
+
+
 def _normalize_button_token(value: object) -> str:
     lowered = str(value or "").strip().lower()
     return BUTTON_ONLY_PATTERN.sub("", lowered)
@@ -449,6 +463,39 @@ def _trim_trailing_question_lines(message: str) -> str:
 def _answer_only_fallback(state: AgentState, message: str) -> str:
     if str(message or "").strip():
         return str(message).strip()
+
+    user_message = _effective_user_message(state)
+    current_data = _prune_collected_data(state.get("collected_data") or {})
+    title = _clean_text(current_data.get("title"))
+    requested_focus = _detect_requested_gather_focus(user_message) or _infer_conversation_focus(
+        state
+    )
+
+    if _is_greeting_message(user_message):
+        if title:
+            return (
+                f"\uc548\ub155\ud558\uc138\uc694. '{title}' \uae30\uc900\uc73c\ub85c "
+                "\ubaa9\ud45c, \uc5ed\ud560, \uc77c\uc815 \uc911 \ud544\uc694\ud55c \uac83\ubd80\ud130 "
+                "\ubc14\ub85c \uc815\ub9ac\ud574\ub4dc\ub9b4\uac8c\uc694."
+            )
+        return (
+            "\uc548\ub155\ud558\uc138\uc694. \uc8fc\uc81c\ub098 \ud544\uc694\ud55c \ud56d\ubaa9\uc744 "
+            "\ud55c \uc904\ub85c \ub9d0\ud574\uc8fc\uc2dc\uba74 \uadf8 \ub2e8\uacc4\ubd80\ud130 "
+            "\ubc14\ub85c \uc774\uc5b4\uac00\uaca0\uc2b5\ub2c8\ub2e4."
+        )
+
+    if title and requested_focus == "goal":
+        return f"'{title}' \uae30\uc900\uc73c\ub85c \ud504\ub85c\uc81d\ud2b8 \ubaa9\ud45c\ubd80\ud130 \uc815\ub9ac\ud574\ubcfc\uac8c\uc694."
+    if title and requested_focus == "roles":
+        return f"'{title}' \uae30\uc900\uc73c\ub85c \ud300 \uc5ed\ud560 \ubd84\ub2f4\ubd80\ud130 \uc815\ub9ac\ud574\ubcfc\uac8c\uc694."
+    if title and requested_focus == "teamSize":
+        return f"'{title}' \uae30\uc900\uc73c\ub85c \ud300 \uc778\uc6d0 \uad6c\uc131\ubd80\ud130 \uc815\ub9ac\ud574\ubcfc\uac8c\uc694."
+    if title and requested_focus == "dueDate":
+        return f"'{title}' \uae30\uc900\uc73c\ub85c \ub9c8\uac10 \uc77c\uc815\ubd80\ud130 \uc815\ub9ac\ud574\ubcfc\uac8c\uc694."
+    if title and requested_focus == "deliverables":
+        return f"'{title}' \uae30\uc900\uc73c\ub85c \uc0b0\ucd9c\ubb3c\ubd80\ud130 \uc815\ub9ac\ud574\ubcfc\uac8c\uc694."
+    if title:
+        return f"'{title}' \uae30\uc900\uc73c\ub85c \ub2e4\uc74c \ud56d\ubaa9\uc744 \uc774\uc5b4\uc11c \uc815\ub9ac\ud574\ubcfc\uac8c\uc694."
 
     phase = state.get("current_phase", "GATHER")
     if phase == "EXPLORE":
@@ -668,6 +715,26 @@ def _detect_requested_gather_focus(text: str) -> str | None:
             matched_index = keyword_index
 
     return matched_focus if matched_index >= 0 else None
+
+
+def _infer_latest_user_intent(state: AgentState) -> str:
+    user_message = _effective_user_message(state)
+    current_data = _prune_collected_data(state.get("collected_data") or {})
+
+    if _is_greeting_message(user_message):
+        return "greeting"
+    if _is_fill_remaining_request(user_message, current_data):
+        return "fill_remaining"
+
+    requested_focus = _detect_requested_gather_focus(user_message)
+    if requested_focus:
+        return f"direct_request:{requested_focus}"
+
+    if _is_help_request(user_message):
+        return "help_request"
+    if _extract_title_updates_for_topic_set(state, current_data):
+        return "set_topic"
+    return "general"
 
 
 def _infer_conversation_focus(state: AgentState) -> str | None:
@@ -938,6 +1005,7 @@ def _build_topic_exists_fallback_message() -> str:
 def explore_problem_node(state: AgentState):
     user_message = _effective_user_message(state)
     turn_policy = _get_turn_policy(state)
+    latest_intent = _infer_latest_user_intent(state)
 
     if _is_initial_button_selection(state):
         return {
@@ -945,9 +1013,15 @@ def explore_problem_node(state: AgentState):
             "next_phase": "EXPLORE",
         }
 
+    if latest_intent == "greeting":
+        return {
+            "ai_message": _apply_turn_policy_to_message(state, _answer_only_fallback(state, "")),
+            "next_phase": "EXPLORE",
+        }
+
     if _is_trivial_message(user_message) and not state.get("recent_messages"):
         return {
-            "ai_message": FAST_EXPLORE_REPLY,
+            "ai_message": _apply_turn_policy_to_message(state, _answer_only_fallback(state, "")),
             "next_phase": "EXPLORE",
         }
 
@@ -972,6 +1046,9 @@ def explore_problem_node(state: AgentState):
 
     [Turn policy]
     {turn_policy}
+
+    [Latest user intent]
+    {latest_intent}
 
     [Reference context]
     {rag_context}
@@ -1010,6 +1087,7 @@ def topic_exists_node(state: AgentState):
 
     user_message = _effective_user_message(state)
     current_data = _prune_collected_data(state.get("collected_data") or {})
+    latest_intent = _infer_latest_user_intent(state)
     title_updates = _extract_title_updates_for_topic_set(state, current_data)
     extracted_title = title_updates.get("title", "")
     if extracted_title:
@@ -1048,9 +1126,13 @@ def topic_exists_node(state: AgentState):
         - Give a short practical reply for the current situation.
         - Keep it to 2 or 3 sentences and within 220 characters.
         - Reflect the current topic or recent context first.
+        - Prioritize the latest user request over phase guidance.
         - If helpful, suggest only one next useful step.
         - Avoid customer-support phrasing.
         {PLAIN_LANGUAGE_RULES}
+
+        [Latest user intent]
+        {latest_intent}
 
         [Recent conversation]
         {recent_context}
@@ -1083,6 +1165,7 @@ def gather_information_node(state: AgentState):
     current_data = _prune_collected_data(state.get("collected_data") or {})
     prefilled_data = dict(current_data)
     was_ready = _is_template_ready(current_data)
+    latest_intent = _infer_latest_user_intent(state)
     focus_type = _infer_conversation_focus(state)
     if state.get("current_phase") == "TOPIC_SET" and _is_meaningful_fact(prefilled_data.get("title")):
         focus_type = focus_type or "goal"
@@ -1104,6 +1187,7 @@ def gather_information_node(state: AgentState):
 
     Rules:
     - Answer the current request first.
+    - Prioritize the latest user request over phase guidance.
     - ai_message must be practical and within 220 characters.
     - Ask at most one short follow-up question only if needed.
     - updated_data stores confirmed facts only.
@@ -1129,6 +1213,9 @@ def gather_information_node(state: AgentState):
 
     [Current focus]
     {focus_type or "none"}
+
+    [Latest user intent]
+    {latest_intent}
 
     [Fill remaining request]
     {fill_remaining_request}
