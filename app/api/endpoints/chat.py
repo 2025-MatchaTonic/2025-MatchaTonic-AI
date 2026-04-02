@@ -84,9 +84,35 @@ def _has_mates_mention(request: AIChatRequest) -> bool:
     return any("@mates" in str(candidate or "").lower() for candidate in candidates)
 
 
+def _has_meaningful_value(value: Any) -> bool:
+    return bool(str(value or "").strip())
+
+
+def _derive_effective_phase(request: AIChatRequest) -> str:
+    phase = request.currentStatus
+    data = request.collectedData or {}
+    has_title = _has_meaningful_value(data.get("title"))
+    has_goalish = _has_meaningful_value(data.get("goal")) or _has_meaningful_value(
+        data.get("deliverables")
+    )
+    ready_field_count = sum(
+        1
+        for key in ("title", "goal", "teamSize", "roles", "dueDate", "deliverables")
+        if _has_meaningful_value(data.get(key))
+    )
+
+    if phase in {"EXPLORE", "TOPIC_SET", "GATHER"} and has_title and has_goalish and ready_field_count >= 4:
+        return "READY"
+    if phase in {"EXPLORE", "TOPIC_SET"} and has_title:
+        return "GATHER"
+    if phase == "EXPLORE" and any(_has_meaningful_value(value) for value in data.values()):
+        return "TOPIC_SET"
+    return phase
+
+
 def _derive_turn_policy(request: AIChatRequest) -> TurnPolicy:
     action = request.actionType
-    phase = request.currentStatus
+    phase = _derive_effective_phase(request)
     current_title = str(request.collectedData.get("title", "")).strip()
     effective_message = _strip_mates_mention(request.content)
 
@@ -113,18 +139,19 @@ def _derive_turn_policy(request: AIChatRequest) -> TurnPolicy:
 @router.post("/", response_model=AIChatResponse)
 async def process_chat(request: AIChatRequest):
     try:
+        effective_phase = _derive_effective_phase(request)
         initial_state = {
             "project_id": str(request.roomId),
             "user_message": request.content,
             "action_type": request.actionType,
-            "current_phase": request.currentStatus,
+            "current_phase": effective_phase,
             "turn_policy": _derive_turn_policy(request),
             "collected_data": request.collectedData,
             "recent_messages": request.recentMessages,
             "selected_message": request.selectedMessage,
             "is_sufficient": False,
             "ai_message": "",
-            "next_phase": request.currentStatus,
+            "next_phase": effective_phase,
             "template_payload": None,
         }
 
@@ -133,7 +160,7 @@ async def process_chat(request: AIChatRequest):
         return AIChatResponse(
             content=_truncate_content(result.get("ai_message", "")),
             suggestedQuestions=[],
-            currentStatus=result.get("next_phase", request.currentStatus),
+            currentStatus=result.get("next_phase", effective_phase),
             isSufficient=result.get("is_sufficient", False),
             collectedData=result.get("collected_data", {}),
             notionTemplatePayload=result.get("template_payload"),
