@@ -69,6 +69,42 @@ GREETING_TOKENS = {
     "\ubc18\uac00\uc6cc",
     "\ubc18\uac11\uc2b5\ub2c8\ub2e4",
 }
+TEAM_SIZE_GENERIC_PATTERN = re.compile(r"(?<!\d)(\d{1,2})\s*명(?!\d)")
+ROLE_SPLIT_PATTERN = re.compile(r"\s*(?:,|/|및|그리고|와|과)\s*")
+ROLE_PREFIX_PATTERN = re.compile(
+    r"^\s*(?:역할|역할은|담당|담당은|구성|구성은|멤버|멤버는)\s*[:은는이가]?\s*"
+)
+ROLE_TRAILING_SPLIT_PATTERN = re.compile(
+    r"\s*(?:이렇게|정도로|정할게|정할 거|정할|나눌 거|나눌게|나눌|나눠|운영|하려고|할게|세부|포지션)"
+)
+SUMMARY_REQUEST_KEYWORDS = (
+    "요약",
+    "정리해줘",
+    "정리해 줘",
+    "지금 모인 정보",
+    "현재까지",
+    "세션 요약",
+)
+TEAM_SIZE_HINT_KEYWORDS = ("팀", "인원", "멤버", "우리", "총", "전체")
+ROLE_TOKEN_HINTS = (
+    "개발자",
+    "개발",
+    "기획자",
+    "기획",
+    "pm",
+    "po",
+    "디자이너",
+    "디자인",
+    "백엔드",
+    "프론트엔드",
+    "프론트",
+    "서버",
+    "ios",
+    "android",
+    "안드로이드",
+    "데이터",
+    "ai",
+)
 INITIAL_BUTTON_TOKENS = {
     "",
     "yes",
@@ -682,11 +718,22 @@ def _is_meaningful_fact(value: object) -> bool:
     return not any(keyword in normalized for keyword in negative_fact_keywords)
 
 
+def _is_valid_collected_value(key: str, value: object) -> bool:
+    cleaned = _clean_text(value)
+    if not _is_meaningful_fact(cleaned):
+        return False
+
+    if key in {"title", "goal"} and re.fullmatch(r"\d+(?:\.\d+)?", cleaned):
+        return False
+
+    return True
+
+
 def _prune_collected_data(data: dict[str, str]) -> dict[str, str]:
     return {
         key: _clean_text(value)
         for key, value in (data or {}).items()
-        if _is_meaningful_fact(value)
+        if _is_valid_collected_value(key, value)
     }
 
 
@@ -767,7 +814,7 @@ def _build_missing_field_summary(current_data: dict[str, str]) -> str:
     missing_fields = [
         f'- {key}: {meta["label"]}'
         for key, meta in GATHER_FIELD_GUIDE.items()
-        if not _clean_text(current_data.get(key))
+        if not _is_valid_collected_value(key, current_data.get(key))
     ]
     return "\n".join(missing_fields) if missing_fields else "- 없음"
 
@@ -806,6 +853,141 @@ def _looks_like_title_instruction(candidate: str) -> bool:
 def _normalize_direct_fact_value(value: str) -> str:
     normalized = DIRECT_FACT_ENDING_PATTERN.sub("", str(value or "").strip())
     return normalized.strip(" .,!?:;\"'")
+
+
+def _is_summary_request(user_message: str) -> bool:
+    normalized = _clean_text(_strip_mates_mention(user_message))
+    if not normalized:
+        return False
+    return any(keyword in normalized for keyword in SUMMARY_REQUEST_KEYWORDS)
+
+
+def _extract_team_size_from_message(message: str) -> str:
+    explicit_match = TEAM_SIZE_PATTERN.search(message)
+    if explicit_match:
+        return explicit_match.group(1).strip()
+
+    generic_matches = list(TEAM_SIZE_GENERIC_PATTERN.finditer(message))
+    if not generic_matches:
+        return ""
+
+    if len(generic_matches) == 1:
+        if any(keyword in message for keyword in TEAM_SIZE_HINT_KEYWORDS) or len(message) <= 16:
+            return generic_matches[0].group(1).strip()
+        return ""
+
+    for match in generic_matches:
+        window_start = max(0, match.start() - 8)
+        window_end = min(len(message), match.end() + 8)
+        window = message[window_start:window_end]
+        if any(keyword in window for keyword in TEAM_SIZE_HINT_KEYWORDS):
+            return match.group(1).strip()
+
+    return ""
+
+
+def _looks_like_role_token(token: str) -> bool:
+    lowered = token.lower()
+    if not token or len(token) > 20:
+        return False
+    return any(keyword in lowered for keyword in ROLE_TOKEN_HINTS)
+
+
+def _normalize_role_token(token: str) -> str:
+    cleaned = _clean_text(token)
+    if not cleaned:
+        return ""
+
+    cleaned = ROLE_PREFIX_PATTERN.sub("", cleaned)
+    cleaned = ROLE_TRAILING_SPLIT_PATTERN.split(cleaned, maxsplit=1)[0].strip()
+    cleaned = cleaned.strip(" .,!?:;\"'()[]")
+    if not cleaned:
+        return ""
+
+    lowered = cleaned.lower()
+    if lowered == "pm":
+        return "PM"
+    if lowered == "po":
+        return "PO"
+    if lowered == "ai":
+        return "AI"
+    if lowered == "ios":
+        return "iOS"
+    return cleaned
+
+
+def _extract_roles_from_message(message: str) -> str:
+    role_match = ROLE_PATTERN.search(message)
+    candidate = role_match.group(1) if role_match else message
+    candidate = ROLE_TRAILING_SPLIT_PATTERN.split(candidate, maxsplit=1)[0]
+    candidate = candidate.split("\n", 1)[0].strip()
+
+    roles: list[str] = []
+    for part in ROLE_SPLIT_PATTERN.split(candidate):
+        normalized = _normalize_role_token(part)
+        if not _looks_like_role_token(normalized):
+            continue
+        if normalized not in roles:
+            roles.append(normalized)
+
+    return ", ".join(roles)
+
+
+def _build_collected_data_summary(current_data: dict[str, str]) -> str:
+    normalized = _prune_collected_data(current_data)
+    labels = {
+        "title": "제목",
+        "goal": "목표",
+        "teamSize": "팀 인원",
+        "roles": "역할",
+        "dueDate": "마감일",
+        "deliverables": "산출물",
+    }
+    ordered_keys = ["title", "goal", "teamSize", "roles", "dueDate", "deliverables"]
+
+    confirmed_parts = []
+    for key in ordered_keys:
+        if not _is_meaningful_fact(normalized.get(key)):
+            continue
+        value = normalized[key]
+        if key == "teamSize":
+            value = f"{value}명"
+        confirmed_parts.append(f"{labels[key]} {value}")
+    missing_parts = [labels[key] for key in ordered_keys if not _is_meaningful_fact(normalized.get(key))]
+
+    if confirmed_parts and missing_parts:
+        return (
+            "현재까지 확정된 정보는 "
+            + ", ".join(confirmed_parts)
+            + "입니다. 아직 미정인 항목은 "
+            + ", ".join(missing_parts)
+            + "입니다."
+        )
+    if confirmed_parts:
+        return "현재까지 확정된 정보는 " + ", ".join(confirmed_parts) + "입니다."
+    return "아직 확정된 정보는 없습니다. 제목, 목표, 팀 인원, 역할 중 하나부터 정리하면 됩니다."
+
+
+def _build_next_missing_field_prompt(current_data: dict[str, str]) -> str:
+    normalized = _prune_collected_data(current_data)
+    for key in ("title", "goal", "dueDate", "deliverables", "roles", "teamSize"):
+        if _is_meaningful_fact(normalized.get(key)):
+            continue
+        if key == "title":
+            return "다음으로 프로젝트 제목을 한 줄로 정해볼까요?"
+        return GATHER_FIELD_GUIDE[key]["question"]
+    return ""
+
+
+def _looks_like_template_ready_claim(message: str) -> bool:
+    normalized = _clean_text(message)
+    if not normalized:
+        return False
+    template_keywords = ("템플릿", "template", "생성", "만들")
+    ready_keywords = ("충분", "모였", "만들 수", "준비", "ready")
+    return any(keyword in normalized for keyword in template_keywords) and any(
+        keyword in normalized for keyword in ready_keywords
+    )
 
 
 def _trim_option_description(candidate: str) -> str:
@@ -877,13 +1059,13 @@ def _extract_direct_fact_updates(user_message: str) -> dict[str, str]:
         if topic_candidate and not _looks_like_title_instruction(topic_candidate):
             updates["title"] = topic_candidate
 
-    team_size_match = TEAM_SIZE_PATTERN.search(message)
-    if team_size_match:
-        updates["teamSize"] = team_size_match.group(1).strip()
+    team_size = _extract_team_size_from_message(message)
+    if team_size:
+        updates["teamSize"] = team_size
 
-    role_match = ROLE_PATTERN.search(message)
-    if role_match:
-        updates["roles"] = _normalize_direct_fact_value(role_match.group(1))
+    roles = _extract_roles_from_message(message)
+    if roles:
+        updates["roles"] = roles
 
     due_date_match = DUE_DATE_PATTERN.search(message)
     if due_date_match:
@@ -960,7 +1142,7 @@ def _sanitize_gather_updates(updated_data: dict[str, str]) -> dict[str, str]:
             continue
         if key == "title":
             value = _normalize_topic_title(value)
-        if _is_meaningful_fact(value):
+        if _is_valid_collected_value(key, value):
             sanitized[key] = _clean_text(value)
     return sanitized
 
@@ -981,19 +1163,12 @@ def _filter_gather_updates(
 
 
 def _count_ready_fields(current_data: dict[str, str]) -> int:
-    return sum(1 for key in GATHER_FIELD_GUIDE if _is_meaningful_fact(current_data.get(key)))
+    return sum(1 for key in GATHER_FIELD_GUIDE if _is_valid_collected_value(key, current_data.get(key)))
 
 
 def _is_template_ready(current_data: dict[str, str]) -> bool:
     normalized = _prune_collected_data(current_data)
-    if not _is_meaningful_fact(normalized.get("title")):
-        return False
-    if not (
-        _is_meaningful_fact(normalized.get("goal"))
-        or _is_meaningful_fact(normalized.get("deliverables"))
-    ):
-        return False
-    return _count_ready_fields(normalized) >= 4
+    return all(_is_valid_collected_value(key, normalized.get(key)) for key in GATHER_FIELD_GUIDE)
 
 
 def _build_topic_exists_fallback_message() -> str:
@@ -1167,8 +1342,24 @@ def gather_information_node(state: AgentState):
     was_ready = _is_template_ready(current_data)
     latest_intent = _infer_latest_user_intent(state)
     focus_type = _infer_conversation_focus(state)
+    direct_updates = {
+        key: value
+        for key, value in _extract_direct_fact_updates(user_message).items()
+        if key != "title"
+    }
+    merged_preview = merge_collected_data(prefilled_data, direct_updates)
     if state.get("current_phase") == "TOPIC_SET" and _is_meaningful_fact(prefilled_data.get("title")):
         focus_type = focus_type or "goal"
+    if _is_summary_request(user_message):
+        preview_is_sufficient = _is_template_ready(merged_preview)
+        return {
+            "ai_message": _apply_turn_policy_to_message(
+                state, _build_collected_data_summary(merged_preview)
+            ),
+            "collected_data": merged_preview,
+            "is_sufficient": preview_is_sufficient,
+            "next_phase": "READY" if preview_is_sufficient else "GATHER",
+        }
     focus_instruction = _build_gather_focus_instruction(focus_type)
     missing_field_summary = _build_missing_field_summary(prefilled_data)
     fill_remaining_request = _is_fill_remaining_request(user_message, prefilled_data)
@@ -1192,6 +1383,7 @@ def gather_information_node(state: AgentState):
     - Ask at most one short follow-up question only if needed.
     - updated_data stores confirmed facts only.
     - Never store guesses, questions, complaints, or temporary ideas.
+    - Do not say the project is ready for template generation unless all collected data fields are filled with valid values.
     - If fill_remaining_request is true, you may fill empty fields with practical defaults grounded in the topic and recent context. Do not overwrite confirmed values unless the user clearly changes them.
     - {focus_instruction}
     {PLAIN_LANGUAGE_RULES}
@@ -1268,11 +1460,6 @@ def gather_information_node(state: AgentState):
         focus_type=focus_type,
     )
     filtered_updates.pop("title", None)
-    direct_updates = {
-        key: value
-        for key, value in _extract_direct_fact_updates(user_message).items()
-        if key != "title"
-    }
     merged_data = merge_collected_data(prefilled_data, filtered_updates)
     merged_data = merge_collected_data(merged_data, direct_updates)
     if filtered_updates or direct_updates:
@@ -1284,6 +1471,12 @@ def gather_information_node(state: AgentState):
         )
     is_sufficient = _is_template_ready(merged_data)
     ai_msg = str(result.ai_message or "").strip()
+
+    if not is_sufficient and _looks_like_template_ready_claim(ai_msg):
+        follow_up = _build_next_missing_field_prompt(merged_data)
+        ai_msg = _build_collected_data_summary(merged_data)
+        if follow_up:
+            ai_msg = f"{ai_msg} {follow_up}"
 
     should_prompt_template = is_sufficient and (not was_ready or current_phase != "READY")
     if should_prompt_template and "템플릿" not in ai_msg:
