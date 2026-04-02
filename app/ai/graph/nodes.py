@@ -654,8 +654,25 @@ def _detect_gather_focus(text: str) -> str | None:
     return None
 
 
+def _detect_requested_gather_focus(text: str) -> str | None:
+    normalized = _clean_text(text)
+    if not normalized:
+        return None
+
+    matched_focus: str | None = None
+    matched_index = -1
+    for focus, keywords in GATHER_FOCUS_KEYWORDS.items():
+        keyword_index = max((normalized.rfind(keyword) for keyword in keywords if keyword in normalized), default=-1)
+        if keyword_index > matched_index:
+            matched_focus = focus
+            matched_index = keyword_index
+
+    return matched_focus if matched_index >= 0 else None
+
+
 def _infer_conversation_focus(state: AgentState) -> str | None:
     candidates: list[str] = []
+    user_message = _clean_text(_effective_user_message(state))
     selected_message = _clean_text(_strip_mates_mention(state.get("selected_message")))
     recent_messages = [
         _clean_text(_strip_mates_mention(msg))
@@ -663,6 +680,11 @@ def _infer_conversation_focus(state: AgentState) -> str | None:
         if _clean_text(_strip_mates_mention(msg))
     ]
 
+    if user_message:
+        explicit_focus = _detect_requested_gather_focus(user_message)
+        if explicit_focus:
+            return explicit_focus
+        candidates.append(user_message)
     if selected_message:
         candidates.append(selected_message)
     candidates.extend(reversed(recent_messages[-4:]))
