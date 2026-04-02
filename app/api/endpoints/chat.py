@@ -83,24 +83,33 @@ def _has_meaningful_value(value: Any) -> bool:
     return bool(str(value or "").strip())
 
 
+def _has_valid_collected_value(key: str, value: Any) -> bool:
+    cleaned = str(value or "").strip()
+    if not cleaned:
+        return False
+    if key in {"title", "goal"} and cleaned.replace(".", "", 1).isdigit():
+        return False
+    return True
+
+
 def _derive_effective_phase(request: AIChatRequest) -> str:
     phase = request.currentStatus
     data = request.collectedData or {}
-    has_title = _has_meaningful_value(data.get("title"))
-    has_goalish = _has_meaningful_value(data.get("goal")) or _has_meaningful_value(
-        data.get("deliverables")
-    )
+    has_title = _has_valid_collected_value("title", data.get("title"))
     ready_field_count = sum(
         1
         for key in ("title", "goal", "teamSize", "roles", "dueDate", "deliverables")
-        if _has_meaningful_value(data.get(key))
+        if _has_valid_collected_value(key, data.get(key))
     )
+    all_required_fields_ready = ready_field_count == 6
 
-    if phase in {"EXPLORE", "TOPIC_SET", "GATHER"} and has_title and has_goalish and ready_field_count >= 4:
+    if phase in {"EXPLORE", "TOPIC_SET", "GATHER"} and all_required_fields_ready:
         return "READY"
     if phase in {"EXPLORE", "TOPIC_SET"} and has_title:
         return "GATHER"
-    if phase == "EXPLORE" and any(_has_meaningful_value(value) for value in data.values()):
+    if phase == "EXPLORE" and any(
+        _has_valid_collected_value(key, value) for key, value in data.items()
+    ):
         return "TOPIC_SET"
     return phase
 
@@ -133,6 +142,17 @@ def _derive_turn_policy(request: AIChatRequest) -> TurnPolicy:
 async def process_chat(request: AIChatRequest):
     try:
         effective_phase = _derive_effective_phase(request)
+        logger.info(
+            "chat request room=%s action=%s current_status=%s effective_phase=%s content=%r collected_data=%s recent_count=%d selected_message=%r",
+            request.roomId,
+            request.actionType,
+            request.currentStatus,
+            effective_phase,
+            request.content,
+            request.collectedData,
+            len(request.recentMessages),
+            request.selectedMessage,
+        )
         initial_state = {
             "project_id": str(request.roomId),
             "user_message": request.content,
@@ -149,13 +169,23 @@ async def process_chat(request: AIChatRequest):
         }
 
         result = await asyncio.to_thread(ai_app.invoke, initial_state)
+        response_phase = result.get("next_phase", effective_phase)
+        response_collected_data = result.get("collected_data", {})
+        logger.info(
+            "chat response room=%s next_phase=%s is_sufficient=%s collected_data=%s ai_message=%r",
+            request.roomId,
+            response_phase,
+            result.get("is_sufficient", False),
+            response_collected_data,
+            result.get("ai_message", ""),
+        )
 
         return AIChatResponse(
             content=_truncate_content(result.get("ai_message", "")),
             suggestedQuestions=[],
-            currentStatus=result.get("next_phase", effective_phase),
+            currentStatus=response_phase,
             isSufficient=result.get("is_sufficient", False),
-            collectedData=result.get("collected_data", {}),
+            collectedData=response_collected_data,
             notionTemplatePayload=result.get("template_payload"),
         )
 
