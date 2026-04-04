@@ -181,6 +181,10 @@ def test_help_request_is_not_extracted_as_title():
     assert _extract_title_updates_for_topic_set(state) == {}
 
 
+def test_topic_presence_button_message_is_not_extracted_as_subject():
+    assert _extract_direct_fact_updates("예, 프로젝트 주제가 있습니다") == {}
+
+
 def test_topic_exists_node_reprompts_after_yes_button_label_chat_message():
     result = topic_exists_node(
         _make_topic_state(
