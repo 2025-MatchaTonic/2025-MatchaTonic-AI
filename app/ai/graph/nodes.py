@@ -330,6 +330,39 @@ def _normalize_button_token(value: object) -> str:
     return BUTTON_ONLY_PATTERN.sub("", lowered)
 
 
+def _matches_topic_presence_button_message(message: object) -> bool:
+    normalized = _normalize_button_token(message)
+    if not normalized:
+        return False
+    if normalized in INITIAL_BUTTON_TOKENS:
+        return True
+
+    cleaned = _clean_text(message).lower()
+    if not cleaned or ("주제" not in cleaned and "프로젝트" not in cleaned):
+        return False
+
+    if any(
+        phrase in cleaned
+        for phrase in (
+            "주제가 있습니다",
+            "주제 있습니다",
+            "정해진 주제가 있습니다",
+            "생각해둔 주제가 있습니다",
+            "이미 주제가 있습니다",
+            "주제가 없습니다",
+            "주제 없습니다",
+            "정해진 주제가 없습니다",
+            "아직 주제가 없습니다",
+            "주제는 아직 없습니다",
+        )
+    ):
+        return True
+
+    return len(cleaned) <= 40 and any(
+        keyword in cleaned for keyword in ("있", "없", "미정", "정해", "정했", "생각해")
+    )
+
+
 def _matches_initial_button_message(action: str, message: object) -> bool:
     normalized = _normalize_button_token(message)
     if not normalized:
@@ -353,12 +386,22 @@ def _matches_initial_button_message(action: str, message: object) -> bool:
 
 def _is_initial_button_selection(state: AgentState) -> bool:
     action = state.get("action_type")
-    if action not in {"BTN_NO", "BTN_YES", "BTN_GO_DEF"}:
-        return False
-
     message_candidate = _clean_text(state.get("user_message")) or _clean_text(
         state.get("selected_message")
     )
+
+    if action == "CHAT":
+        current_data = _prune_collected_data(state.get("collected_data") or {})
+        if (
+            state.get("current_phase") in {"EXPLORE", "TOPIC_SET"}
+            and not _is_meaningful_fact(current_data.get("title"))
+        ):
+            return _matches_topic_presence_button_message(message_candidate)
+        return False
+
+    if action not in {"BTN_NO", "BTN_YES", "BTN_GO_DEF"}:
+        return False
+
     if not message_candidate:
         return True
 
@@ -494,6 +537,8 @@ def _extract_title_updates_for_topic_set(
 
     user_message = _effective_user_message(state)
     if not user_message:
+        return {}
+    if _matches_topic_presence_button_message(user_message):
         return {}
     if _is_summary_request(user_message) or _is_fill_remaining_request(user_message, current_data):
         return {}

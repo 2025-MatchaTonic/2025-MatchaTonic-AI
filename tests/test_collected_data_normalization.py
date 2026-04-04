@@ -3,8 +3,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from app.api.endpoints.chat import AIChatRequest, _derive_turn_policy
 from app.ai.graph.collected_data import merge_collected_data
-from app.ai.graph.nodes import _extract_direct_fact_updates, gather_information_node
+from app.ai.graph.nodes import (
+    _extract_direct_fact_updates,
+    _extract_title_updates_for_topic_set,
+    gather_information_node,
+    topic_exists_node,
+)
 from app.core.request_normalization import normalize_collected_data
 
 
@@ -21,6 +27,29 @@ def _make_state(*, message: str, collected_data: dict | None = None) -> dict:
         "is_sufficient": False,
         "ai_message": "",
         "next_phase": "GATHER",
+        "template_payload": None,
+    }
+
+
+def _make_topic_state(
+    *,
+    message: str,
+    action_type: str = "CHAT",
+    turn_policy: str = "ASK_ONLY",
+    collected_data: dict | None = None,
+) -> dict:
+    return {
+        "project_id": "1",
+        "user_message": message,
+        "action_type": action_type,
+        "current_phase": "TOPIC_SET",
+        "turn_policy": turn_policy,
+        "recent_messages": [],
+        "selected_message": None,
+        "collected_data": collected_data or {},
+        "is_sufficient": False,
+        "ai_message": "",
+        "next_phase": "TOPIC_SET",
         "template_payload": None,
     }
 
@@ -111,3 +140,37 @@ def test_role_count_mismatch_is_not_silently_truncated():
     assert result["collected_data"]["teamSize"] == 4
     assert "roles" not in result["collected_data"]
     assert "역할 인원 합계가 5명" in result["ai_message"]
+
+
+def test_topic_button_label_is_not_extracted_as_title():
+    state = _make_topic_state(
+        message="예, 프로젝트 주제가 있습니다",
+        turn_policy="CAPTURE_TITLE",
+    )
+
+    assert _extract_title_updates_for_topic_set(state) == {}
+
+
+def test_topic_exists_node_reprompts_after_yes_button_label_chat_message():
+    result = topic_exists_node(
+        _make_topic_state(
+            message="예, 프로젝트 주제가 있습니다",
+            turn_policy="ASK_ONLY",
+        )
+    )
+
+    assert result["collected_data"] == {}
+    assert result["next_phase"] == "TOPIC_SET"
+    assert "한두 줄로 보내주세요" in result["ai_message"]
+
+
+def test_chat_turn_policy_treats_topic_presence_button_label_as_ask_only():
+    request = AIChatRequest(
+        roomId=1,
+        content="예, 프로젝트 주제가 있습니다",
+        actionType="CHAT",
+        currentStatus="TOPIC_SET",
+        collectedData={},
+    )
+
+    assert _derive_turn_policy(request) == "ASK_ONLY"
