@@ -15,6 +15,7 @@ from app.ai.graph.collected_data import (
     has_role_team_size_conflict,
     is_template_ready as _shared_is_template_ready,
     is_valid_collected_value as _shared_is_valid_collected_value,
+    looks_like_non_committal_value,
     merge_collected_data,
     missing_collected_fields as _shared_missing_collected_fields,
     sanitize_candidate_updates as _shared_sanitize_candidate_updates,
@@ -198,6 +199,21 @@ HELP_REQUEST_KEYWORDS = (
     "알려",
     "모르겠",
     "도와",
+)
+GUIDANCE_SIGNAL_PATTERNS = (
+    re.compile(r"잘\s*모르겠", re.IGNORECASE),
+    re.compile(r"모르겠", re.IGNORECASE),
+    re.compile(r"도와\s*(?:줘|주세요|주라)?", re.IGNORECASE),
+    re.compile(r"추천해\s*(?:줘|주세요|주라)?", re.IGNORECASE),
+    re.compile(r"정해\s*(?:줘|주세요|주라)?", re.IGNORECASE),
+    re.compile(r"같이\s*(?:정하|골라|좁혀)", re.IGNORECASE),
+    re.compile(r"고민\s*중", re.IGNORECASE),
+    re.compile(r"감이\s*안", re.IGNORECASE),
+    re.compile(r"(?:뭘|뭐를|무엇을|어떤\s*걸?)\s*(?:해야|만들어야|하고\s*싶은지)", re.IGNORECASE),
+)
+META_CONVERSATION_PATTERNS = (
+    re.compile(r"^\s*(?:아니|아니야|아뇨)\b", re.IGNORECASE),
+    re.compile(r"^\s*(?:그게\s+아니라|다시|잠깐)\b", re.IGNORECASE),
 )
 TITLE_INSTRUCTION_KEYWORDS = (
     "넣어",
@@ -459,6 +475,8 @@ def _normalize_topic_title(candidate: str) -> str:
     title = _clean_text(candidate)
     if not title:
         return ""
+    if looks_like_non_committal_value(title):
+        return ""
 
     title = re.sub(
         r"^\s*(?:프로젝트\s*주제|프로젝트명|주제|제목|아이디어)\s*(?:은|는|:)?\s*",
@@ -496,6 +514,8 @@ def _normalize_topic_title(candidate: str) -> str:
     if not title:
         return ""
     if len(title) > 40:
+        return ""
+    if looks_like_non_committal_value(title):
         return ""
     if _looks_like_title_instruction(title):
         return ""
@@ -539,6 +559,8 @@ def _extract_title_updates_for_topic_set(
     if not user_message:
         return {}
     if _matches_topic_presence_button_message(user_message):
+        return {}
+    if _is_non_storable_freeform_message(user_message):
         return {}
     if _is_summary_request(user_message) or _is_fill_remaining_request(user_message, current_data):
         return {}
@@ -838,14 +860,17 @@ def _detect_requested_gather_focus(text: str) -> str | None:
 def _interpret_turn_type(state: AgentState, current_data: dict[str, str] | None = None) -> str:
     current_data = _prune_collected_data(current_data or state.get("collected_data") or {})
     user_message = _effective_user_message(state)
+    direct_updates = _extract_direct_fact_updates(user_message)
 
     if _is_summary_request(user_message):
         return "request_summary"
     if _is_fill_remaining_request(user_message, current_data):
         return "request_fill_missing"
+    if _should_offer_topic_guidance(current_data, user_message, direct_updates=direct_updates):
+        return "request_refine_topic"
     if _extract_title_updates_for_topic_set(state, current_data):
         return "provide_topic"
-    if _extract_direct_fact_updates(user_message):
+    if direct_updates:
         return "provide_fact"
     if _is_next_step_request(user_message) or _is_help_request(user_message) or "템플릿" in _clean_text(user_message):
         return "request_next_step"
@@ -918,6 +943,93 @@ def _build_gather_focus_instruction(focus_type: str | None) -> str:
 def _is_help_request(user_message: str) -> bool:
     normalized = _clean_text(user_message)
     return any(keyword in normalized for keyword in HELP_REQUEST_KEYWORDS)
+
+
+def _is_guidance_signal(user_message: str) -> bool:
+    normalized = _clean_text(user_message)
+    if not normalized:
+        return False
+    return any(pattern.search(normalized) for pattern in GUIDANCE_SIGNAL_PATTERNS)
+
+
+def _is_meta_conversation_message(user_message: str) -> bool:
+    normalized = _clean_text(user_message)
+    if not normalized:
+        return False
+    return any(pattern.match(normalized) for pattern in META_CONVERSATION_PATTERNS)
+
+
+def _is_non_storable_freeform_message(user_message: str) -> bool:
+    normalized = _clean_text(user_message)
+    if not normalized:
+        return False
+    return (
+        looks_like_non_committal_value(normalized)
+        or _is_guidance_signal(normalized)
+        or _is_meta_conversation_message(normalized)
+    )
+
+
+def _should_offer_topic_guidance(
+    current_data: dict[str, object],
+    user_message: str,
+    *,
+    direct_updates: dict[str, object] | None = None,
+) -> bool:
+    title = _clean_text(current_data.get("title"))
+    if not title:
+        return False
+    if direct_updates:
+        return False
+    if _is_valid_collected_value("goal", current_data.get("goal")):
+        return False
+    if not _is_guidance_signal(user_message):
+        return False
+    return True
+
+
+def _topic_refinement_options(title: str) -> list[str]:
+    normalized = _clean_text(title).lower()
+
+    if any(keyword in normalized for keyword in ("공공시설", "시설 이용", "체육시설", "도서관", "공원")):
+        return [
+            "혼잡도 확인",
+            "예약/대기 관리",
+            "운영시간·위치 안내",
+            "불편 신고·접근성 정보",
+        ]
+    if any(keyword in normalized for keyword in ("일정", "스케줄", "팀플", "협업", "과제")):
+        return [
+            "일정 조율",
+            "역할 분담",
+            "마감 리마인드",
+            "진행 상황 공유",
+        ]
+    if any(keyword in normalized for keyword in ("환경", "에너지", "재활용", "탄소")):
+        return [
+            "사용량 시각화",
+            "절감 행동 유도",
+            "분리배출 안내",
+            "이상 징후 알림",
+        ]
+
+    return [
+        "정보 찾기 쉽게 하기",
+        "예약·신청 흐름 줄이기",
+        "불편 접수 빠르게 하기",
+        "개인 맞춤 안내 제공",
+    ]
+
+
+def _build_topic_refinement_message(current_data: dict[str, object]) -> str:
+    title = _clean_text(current_data.get("title"))
+    options = _topic_refinement_options(title)
+    option_lines = "\n".join(f"{index}. {option}" for index, option in enumerate(options, start=1))
+    return (
+        f"좋아요. '{title}'까지는 잡혔고 아직 구체 문제는 미정이에요. 같이 좁혀볼게요.\n"
+        f"{option_lines}\n"
+        "번호로 답하거나 더 끌리는 방향을 한 줄로 적어 주세요."
+    )
 
 
 def _looks_like_title_instruction(candidate: str) -> bool:
@@ -1151,6 +1263,8 @@ def _finalize_committed_response(
         if follow_up:
             return follow_up
         return _build_collected_data_summary(merged_data)
+    if turn_type == "request_refine_topic":
+        return _build_topic_refinement_message(merged_data)
     if turn_type == "request_next_step":
         if is_sufficient:
             return _build_collected_data_summary(merged_data)
@@ -1369,7 +1483,7 @@ def _filter_gather_updates(
     *,
     focus_type: str | None,
 ) -> dict[str, object]:
-    if _is_help_request(user_message):
+    if _is_guidance_signal(user_message):
         return {}
 
     sanitized = _sanitize_gather_updates(updated_data)
@@ -1539,7 +1653,7 @@ def topic_exists_node(state: AgentState):
             "is_sufficient": is_sufficient,
             "next_phase": next_phase,
         }
-    if turn_type in {"request_summary", "request_fill_missing", "request_next_step"}:
+    if turn_type in {"request_summary", "request_fill_missing", "request_next_step", "request_refine_topic"}:
         return {
             "ai_message": _apply_turn_policy_to_message(
                 state,
@@ -1673,6 +1787,30 @@ def gather_information_node(state: AgentState):
         is_sufficient = _is_template_ready(prefilled_data)
         logger.info(
             "gather fill_missing before=%s next_phase=%s is_sufficient=%s",
+            prefilled_data,
+            next_phase,
+            is_sufficient,
+        )
+        return {
+            "ai_message": _apply_turn_policy_to_message(
+                state,
+                _finalize_committed_response(
+                    turn_type=turn_type,
+                    merged_data=prefilled_data,
+                    accepted_updates={},
+                    ai_message="",
+                    is_sufficient=is_sufficient,
+                ),
+            ),
+            "collected_data": raw_current_data,
+            "is_sufficient": is_sufficient,
+            "next_phase": next_phase,
+        }
+    if turn_type == "request_refine_topic" and not direct_updates:
+        next_phase = derive_phase_from_collected_data(prefilled_data, current_phase=current_phase)
+        is_sufficient = _is_template_ready(prefilled_data)
+        logger.info(
+            "gather refine_topic before=%s next_phase=%s is_sufficient=%s",
             prefilled_data,
             next_phase,
             is_sufficient,

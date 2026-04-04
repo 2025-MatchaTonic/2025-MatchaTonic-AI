@@ -46,6 +46,20 @@ REQUEST_LIKE_VALUE_KEYWORDS: tuple[str, ...] = (
     "summary",
 )
 
+NON_COMMITTAL_VALUE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^\s*(?:아니|아니야|아뇨)\s*(?:도와(?:줘|주세요)|추천해(?:줘|주세요)|정해(?:줘|주세요))?\s*$"),
+    re.compile(r"^\s*(?:그게\s+아니라|다시|잠깐)\s*$"),
+    re.compile(r"^\s*(?:잘\s*)?모르겠(?:어|어요|네|다)?\s*$"),
+    re.compile(r"^\s*(?:잘\s*)?모르겠.*(?:도와|추천해|정해|같이)\S*\s*$"),
+    re.compile(r"^\s*.*잘\s*모르겠.*(?:도와|추천해|정해|같이)\S*\s*$"),
+    re.compile(r"^\s*도와(?:줘|주세요|주라)\s*$"),
+    re.compile(r"^\s*추천해(?:줘|주세요|주라)\s*$"),
+    re.compile(r"^\s*정해(?:줘|주세요|주라)\s*$"),
+    re.compile(r"^\s*같이\s*(?:정하|해보)\S*\s*$"),
+    re.compile(r"^\s*아직\s*(?:고민\s*중|못\s*정했|미정)\S*\s*$"),
+    re.compile(r"^\s*(?:뭘|뭐를|무엇을|어떤\s*걸?)\s*(?:해야|만들어야|하고\s*싶은지)\s*잘\s*모르겠.*\s*$"),
+)
+
 NEGATIVE_VALUE_KEYWORDS: tuple[str, ...] = (
     "모르겠",
     "모름",
@@ -75,6 +89,18 @@ ROLE_TRAILING_PARTICLE_PATTERN = re.compile(r"(?:으로|로|은|는|이|가)$")
 
 def _clean_string(value: object) -> str:
     return value.strip() if isinstance(value, str) else ""
+
+
+def looks_like_non_committal_value(value: object) -> bool:
+    cleaned = _clean_string(value)
+    if not cleaned:
+        return False
+
+    normalized = cleaned.lower()
+    if any(keyword in normalized for keyword in REQUEST_LIKE_VALUE_KEYWORDS):
+        return True
+
+    return any(pattern.match(cleaned) for pattern in NON_COMMITTAL_VALUE_PATTERNS)
 
 
 def normalize_team_size(value: object) -> int | None:
@@ -289,7 +315,7 @@ def is_valid_collected_value(key: str, value: object, *, team_size: object = Non
         return False
     if any(keyword in normalized for keyword in NEGATIVE_VALUE_KEYWORDS):
         return False
-    if any(keyword in normalized for keyword in REQUEST_LIKE_VALUE_KEYWORDS):
+    if looks_like_non_committal_value(cleaned):
         return False
     if key in {"title", "goal"} and re.fullmatch(r"\d+(?:\.\d+)?", cleaned):
         return False
