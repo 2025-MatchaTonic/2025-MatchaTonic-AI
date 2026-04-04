@@ -229,6 +229,16 @@ def test_direct_subject_typo_is_corrected_with_llm():
         assert _extract_direct_fact_updates("주제는 공공시설 ㅇ용") == {"subject": "공공시설 이용"}
 
 
+def test_direct_subject_with_guidance_tail_keeps_subject_only():
+    with patch("app.ai.graph.nodes.settings.OPENAI_API_KEY", "test-key"), patch(
+        "app.ai.graph.nodes._invoke_llm",
+        return_value=SimpleNamespace(content='{"normalized":"공공시설 예약 효율화"}'),
+    ):
+        assert _extract_direct_fact_updates(
+            "주제는 공공시설 예약 효율화이고 아직 어떤 문제를 풀어야할지 모르겠어"
+        ) == {"subject": "공공시설 예약 효율화"}
+
+
 def test_topic_exists_node_reprompts_after_yes_button_label_chat_message():
     result = topic_exists_node(
         _make_topic_state(
@@ -263,6 +273,25 @@ def test_help_request_with_existing_topic_returns_refinement_options():
     assert result["next_phase"] == "GATHER"
     assert "같이 좁혀볼게요" in result["ai_message"]
     assert "혼잡도 확인" in result["ai_message"]
+    assert "예약/대기 관리" in result["ai_message"]
+
+
+def test_topic_exists_node_commits_subject_and_returns_refinement_for_mixed_message():
+    with patch("app.ai.graph.nodes.settings.OPENAI_API_KEY", "test-key"), patch(
+        "app.ai.graph.nodes._invoke_llm",
+        return_value=SimpleNamespace(content='{"normalized":"공공시설 예약 효율화"}'),
+    ):
+        result = topic_exists_node(
+            _make_topic_state(
+                message="주제는 공공시설 예약 효율화이고 아직 어떤 문제를 풀어야할지 모르겠어",
+                turn_policy="CAPTURE_TITLE",
+            )
+        )
+
+    assert result["collected_data"] == {"subject": "공공시설 예약 효율화"}
+    assert result["next_phase"] == "TOPIC_SET"
+    assert "공공시설 예약 효율화" in result["ai_message"]
+    assert "같이 좁혀볼게요" in result["ai_message"]
     assert "예약/대기 관리" in result["ai_message"]
 
 
