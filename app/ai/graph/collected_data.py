@@ -76,6 +76,7 @@ NEGATIVE_VALUE_KEYWORDS: tuple[str, ...] = (
     "no idea",
 )
 
+IDENTIFIER_LIKE_NOISE_PATTERN = re.compile(r"^(?=.*\d{4,})(?=.*[ㄱ-ㅎㅏ-ㅣ])[A-Za-z0-9ㄱ-ㅎㅏ-ㅣ_-]+$")
 TEAM_SIZE_VALUE_PATTERN = re.compile(r"^\s*(\d{1,2})(?:\s*명)?\s*$")
 ROLE_VALUE_PREFIX_PATTERN = re.compile(
     r"^\s*(?:역할|역할은|구성|구성은|담당|담당은)\s*[:은는이가]?\s*",
@@ -90,6 +91,29 @@ ROLE_TRAILING_PARTICLE_PATTERN = re.compile(r"(?:으로|로|은|는|이|가)$")
 
 def _clean_string(value: object) -> str:
     return value.strip() if isinstance(value, str) else ""
+
+
+def _looks_like_identifier_noise(value: object) -> bool:
+    cleaned = _clean_string(value)
+    if not cleaned:
+        return False
+
+    compact = re.sub(r"\s+", "", cleaned)
+    if len(compact) < 8:
+        return False
+    if IDENTIFIER_LIKE_NOISE_PATTERN.fullmatch(compact):
+        return True
+
+    digit_count = sum(ch.isdigit() for ch in compact)
+    jamo_count = len(re.findall(r"[ㄱ-ㅎㅏ-ㅣ]", compact))
+    hangul_syllable_count = len(re.findall(r"[가-힣]", compact))
+    latin_count = len(re.findall(r"[A-Za-z]", compact))
+
+    return (
+        digit_count >= max(5, len(compact) // 2)
+        and hangul_syllable_count < 2
+        and (jamo_count > 0 or latin_count < 3)
+    )
 
 
 def looks_like_non_committal_value(value: object) -> bool:
@@ -317,6 +341,8 @@ def is_valid_collected_value(key: str, value: object, *, team_size: object = Non
     if any(keyword in normalized for keyword in NEGATIVE_VALUE_KEYWORDS):
         return False
     if looks_like_non_committal_value(cleaned):
+        return False
+    if key in {"subject", "title"} and _looks_like_identifier_noise(cleaned):
         return False
     if key in {"title", "goal"} and re.fullmatch(r"\d+(?:\.\d+)?", cleaned):
         return False

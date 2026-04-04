@@ -1,5 +1,7 @@
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -76,6 +78,30 @@ def test_request_normalization_preserves_subject_separately_from_goal():
 
     assert normalized["subject"] == "공공시설 이용"
     assert normalized["goal"] == "예약 불편 해결"
+
+
+def test_request_normalization_drops_identifier_like_room_title():
+    normalized = normalize_collected_data(
+        {
+            "title": "0982348ㅅ278045ㅍ",
+            "goal": "예약 불편 해결",
+        }
+    )
+
+    assert "title" not in normalized
+    assert normalized["goal"] == "예약 불편 해결"
+
+
+def test_ai_chat_request_discards_identifier_like_room_title():
+    request = AIChatRequest(
+        roomId=1030,
+        content="@mates 공공시설 이용",
+        actionType="CHAT",
+        currentStatus="EXPLORE",
+        collectedData={"title": "0982348ㅅ278045ㅍ"},
+    )
+
+    assert request.collectedData == {}
 
 
 def test_merge_normalizes_roles_and_team_size():
@@ -181,8 +207,26 @@ def test_help_request_is_not_extracted_as_title():
     assert _extract_title_updates_for_topic_set(state) == {}
 
 
+def test_topic_candidate_typo_is_corrected_with_llm():
+    state = _make_topic_state(message="공공시설 ㅇ용", turn_policy="CAPTURE_TITLE")
+
+    with patch("app.ai.graph.nodes.settings.OPENAI_API_KEY", "test-key"), patch(
+        "app.ai.graph.nodes._invoke_llm",
+        return_value=SimpleNamespace(content='{"normalized":"공공시설 이용"}'),
+    ):
+        assert _extract_title_updates_for_topic_set(state) == {"subject": "공공시설 이용"}
+
+
 def test_topic_presence_button_message_is_not_extracted_as_subject():
     assert _extract_direct_fact_updates("예, 프로젝트 주제가 있습니다") == {}
+
+
+def test_direct_subject_typo_is_corrected_with_llm():
+    with patch("app.ai.graph.nodes.settings.OPENAI_API_KEY", "test-key"), patch(
+        "app.ai.graph.nodes._invoke_llm",
+        return_value=SimpleNamespace(content='{"normalized":"공공시설 이용"}'),
+    ):
+        assert _extract_direct_fact_updates("주제는 공공시설 ㅇ용") == {"subject": "공공시설 이용"}
 
 
 def test_topic_exists_node_reprompts_after_yes_button_label_chat_message():
