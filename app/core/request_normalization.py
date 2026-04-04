@@ -40,6 +40,9 @@ ACTION_ALIASES = {
 }
 
 COLLECTED_DATA_ALIASES = {
+    "subject": "subject",
+    "topic": "subject",
+    "projectsubject": "subject",
     "title": "title",
     "projecttitle": "title",
     "projectname": "title",
@@ -47,7 +50,6 @@ COLLECTED_DATA_ALIASES = {
     "goal": "goal",
     "projectgoal": "goal",
     "objective": "goal",
-    "subject": "goal",
     "teamsize": "teamSize",
     "team_size": "teamSize",
     "members": "teamSize",

@@ -3,7 +3,7 @@ import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field, root_validator
 
 from app.ai.graph.nodes import _matches_topic_presence_button_message
@@ -15,6 +15,7 @@ from app.ai.graph.collected_data import CollectedData, derive_phase_from_collect
 from app.ai.graph.state import TurnPolicy
 from app.ai.graph.workflow import ai_app
 from app.api.schemas.template import NotionTemplatePayload
+from app.core.config import settings
 from app.core.request_normalization import (
     normalize_action_type,
     normalize_collected_data,
@@ -22,6 +23,7 @@ from app.core.request_normalization import (
     normalize_phase,
     normalize_string_list,
 )
+from app.core.spring_summary import SpringSummarySyncError, sync_project_summary
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -91,7 +93,10 @@ def _derive_effective_phase(request: AIChatRequest) -> str:
 def _derive_turn_policy(request: AIChatRequest) -> TurnPolicy:
     action = request.actionType
     phase = _derive_effective_phase(request)
-    current_title = str(request.collectedData.get("title", "")).strip()
+    current_topic = (
+        str(request.collectedData.get("subject", "")).strip()
+        or str(request.collectedData.get("title", "")).strip()
+    )
     effective_message = _strip_mates_mention(request.content)
 
     if action == "BTN_NO":
@@ -103,9 +108,9 @@ def _derive_turn_policy(request: AIChatRequest) -> TurnPolicy:
     if action != "CHAT":
         return "ANSWER_ONLY"
 
-    if phase == "TOPIC_SET" and not current_title and not effective_message:
+    if phase == "TOPIC_SET" and not current_topic and not effective_message:
         return "ASK_ONLY"
-    if phase == "TOPIC_SET" and not current_title and effective_message:
+    if phase == "TOPIC_SET" and not current_topic and effective_message:
         if _matches_topic_presence_button_message(effective_message):
             return "ASK_ONLY"
         return "CAPTURE_TITLE"
@@ -115,7 +120,7 @@ def _derive_turn_policy(request: AIChatRequest) -> TurnPolicy:
 
 
 @router.post("/", response_model=AIChatResponse)
-async def process_chat(request: AIChatRequest):
+async def process_chat(request: AIChatRequest, http_request: Request):
     try:
         effective_phase = _derive_effective_phase(request)
         logger.info(
@@ -156,6 +161,20 @@ async def process_chat(request: AIChatRequest):
             result.get("ai_message", ""),
         )
 
+        try:
+            sync_project_summary(
+                request.roomId,
+                response_collected_data,
+                authorization=http_request.headers.get("Authorization"),
+            )
+        except SpringSummarySyncError as exc:
+            if settings.SPRING_SUMMARY_SYNC_STRICT:
+                raise HTTPException(
+                    status_code=502,
+                    detail="Spring summary sync failed.",
+                ) from exc
+            logger.exception("Spring summary sync failed but strict mode is off: %s", exc)
+
         return AIChatResponse(
             content=_truncate_content(result.get("ai_message", "")),
             suggestedQuestions=[],
@@ -165,6 +184,8 @@ async def process_chat(request: AIChatRequest):
             notionTemplatePayload=result.get("template_payload"),
         )
 
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.exception("AI chat processing failed: %s", exc)
         raise HTTPException(status_code=500, detail="AI 처리 중 오류 발생")

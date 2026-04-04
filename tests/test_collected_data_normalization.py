@@ -66,6 +66,18 @@ def test_request_normalization_returns_int_and_list_shapes():
     assert normalized["roles"] == ["개발자", "기획자", "PM"]
 
 
+def test_request_normalization_preserves_subject_separately_from_goal():
+    normalized = normalize_collected_data(
+        {
+            "subject": "공공시설 이용",
+            "goal": "예약 불편 해결",
+        }
+    )
+
+    assert normalized["subject"] == "공공시설 이용"
+    assert normalized["goal"] == "예약 불편 해결"
+
+
 def test_merge_normalizes_roles_and_team_size():
     merged = merge_collected_data(
         {"title": "공공화장실 실시간 혼잡 안내"},
@@ -151,6 +163,15 @@ def test_topic_button_label_is_not_extracted_as_title():
     assert _extract_title_updates_for_topic_set(state) == {}
 
 
+def test_topic_candidate_is_stored_as_subject_first():
+    state = _make_topic_state(
+        message="공공시설 이용 관련",
+        turn_policy="CAPTURE_TITLE",
+    )
+
+    assert _extract_title_updates_for_topic_set(state) == {"subject": "공공시설 이용 관련"}
+
+
 def test_help_request_is_not_extracted_as_title():
     state = _make_topic_state(
         message="어떤걸 하고 싶은지 잘 모르겠어 도와줘",
@@ -186,11 +207,11 @@ def test_help_request_with_existing_topic_returns_refinement_options():
     result = gather_information_node(
         _make_state(
             message="어떤걸 하고 싶은지 잘 모르겠어 도와줘",
-            collected_data={"title": "공공시설 이용 관련"},
+            collected_data={"subject": "공공시설 이용 관련"},
         )
     )
 
-    assert result["collected_data"] == {"title": "공공시설 이용 관련"}
+    assert result["collected_data"] == {"subject": "공공시설 이용 관련"}
     assert result["next_phase"] == "GATHER"
     assert "같이 좁혀볼게요" in result["ai_message"]
     assert "혼잡도 확인" in result["ai_message"]

@@ -3,6 +3,7 @@ from typing import Dict, Mapping, TypeAlias
 
 
 COLLECTED_DATA_FIELDS: Dict[str, str] = {
+    "subject": "프로젝트 주제",
     "title": "프로젝트 제목",
     "goal": "프로젝트 목표",
     "teamSize": "팀 인원",
@@ -373,15 +374,25 @@ def sanitize_candidate_updates(
 
 def missing_collected_fields(data: Mapping[str, object] | None) -> list[str]:
     sanitized = sanitize_collected_data(data)
-    return [
-        key
-        for key in COLLECTED_DATA_FIELDS
+    missing: list[str] = []
+
+    if not (
+        is_valid_collected_value("subject", sanitized.get("subject"))
+        or is_valid_collected_value("title", sanitized.get("title"))
+    ):
+        missing.append("subject")
+
+    for key in COLLECTED_DATA_FIELDS:
+        if key in {"subject", "title"}:
+            continue
         if not is_valid_collected_value(
             key,
             sanitized.get(key),
             team_size=sanitized.get("teamSize"),
-        )
-    ]
+        ):
+            missing.append(key)
+
+    return missing
 
 
 def is_template_ready(data: Mapping[str, object] | None) -> bool:
@@ -391,6 +402,11 @@ def is_template_ready(data: Mapping[str, object] | None) -> bool:
 def has_title(data: Mapping[str, object] | None) -> bool:
     sanitized = sanitize_collected_data(data)
     return is_valid_collected_value("title", sanitized.get("title"))
+
+
+def has_subject(data: Mapping[str, object] | None) -> bool:
+    sanitized = sanitize_collected_data(data)
+    return is_valid_collected_value("subject", sanitized.get("subject"))
 
 
 def has_any_collected_fact(data: Mapping[str, object] | None) -> bool:
@@ -406,9 +422,15 @@ def derive_phase_from_collected_data(
     derived = "EXPLORE"
     if is_template_ready(sanitized):
         derived = "READY"
-    elif has_title(sanitized):
+    elif has_title(sanitized) or (
+        has_subject(sanitized)
+        and any(
+            is_valid_collected_value(key, sanitized.get(key), team_size=sanitized.get("teamSize"))
+            for key in ("goal", "teamSize", "roles", "dueDate", "deliverables")
+        )
+    ):
         derived = "GATHER"
-    elif sanitized:
+    elif has_subject(sanitized) or sanitized:
         derived = "TOPIC_SET"
 
     if derived == "EXPLORE" and current_phase == "TOPIC_SET":
@@ -424,6 +446,7 @@ def build_collected_data_guide() -> str:
 
 def build_collected_data_json_example() -> str:
     lines = [
+        '            "subject": "..."',
         '            "title": "..."',
         '            "goal": "..."',
         '            "teamSize": 4',
