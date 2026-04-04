@@ -1,4 +1,5 @@
-from typing import Dict
+import re
+from typing import Dict, Mapping, TypeAlias
 
 
 COLLECTED_DATA_FIELDS: Dict[str, str] = {
@@ -9,27 +10,414 @@ COLLECTED_DATA_FIELDS: Dict[str, str] = {
     "dueDate": "마감일",
     "deliverables": "산출물",
 }
+CollectedDataValue: TypeAlias = str | int | list[str]
+CollectedData: TypeAlias = Dict[str, CollectedDataValue]
+
+PHASE_ORDER = {
+    "EXPLORE": 0,
+    "TOPIC_SET": 1,
+    "GATHER": 2,
+    "READY": 3,
+}
+
+REQUEST_LIKE_VALUE_KEYWORDS: tuple[str, ...] = (
+    "요약해줘",
+    "요약해 줘",
+    "정리해줘",
+    "정리해 줘",
+    "채워줘",
+    "채워 줘",
+    "정해줘",
+    "정해 줘",
+    "세워줘",
+    "세워 줘",
+    "만들어줘",
+    "만들어 줘",
+    "추천해줘",
+    "추천해 줘",
+    "알려줘",
+    "알려 줘",
+    "미정인 항목",
+    "정의되지 않은 부분",
+    "남은 항목",
+    "지금 모인 정보",
+    "세션 요약",
+    "fill missing",
+    "summary",
+)
+
+NEGATIVE_VALUE_KEYWORDS: tuple[str, ...] = (
+    "모르겠",
+    "모름",
+    "없음",
+    "없어",
+    "미정",
+    "tbd",
+    "unknown",
+    "not sure",
+    "idk",
+    "don't know",
+    "dont know",
+    "no idea",
+)
+
+TEAM_SIZE_VALUE_PATTERN = re.compile(r"^\s*(\d{1,2})(?:\s*명)?\s*$")
+ROLE_VALUE_PREFIX_PATTERN = re.compile(
+    r"^\s*(?:역할|역할은|구성|구성은|담당|담당은)\s*[:은는이가]?\s*",
+    re.IGNORECASE,
+)
+ROLE_VALUE_SPLIT_PATTERN = re.compile(r"\s*(?:,|/| 및 | 와 | 과 | 그리고 )\s*")
+ROLE_COUNT_TOKEN_PATTERN = re.compile(
+    r"^\s*(.+?)\s+(\d{1,2})\s*명(?:\s*씩)?(?:\s*(?:으로|로).*)?\s*$"
+)
+ROLE_TRAILING_PARTICLE_PATTERN = re.compile(r"(?:으로|로|은|는|이|가)$")
 
 
-def build_collected_data_guide() -> str:
-    return ", ".join(
-        f'"{key}" ({label})' for key, label in COLLECTED_DATA_FIELDS.items()
+def _clean_string(value: object) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def normalize_team_size(value: object) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, float):
+        if value.is_integer() and value > 0:
+            return int(value)
+        return None
+
+    cleaned = _clean_string(value)
+    if not cleaned:
+        return None
+
+    match = TEAM_SIZE_VALUE_PATTERN.fullmatch(cleaned)
+    if not match:
+        return None
+
+    parsed = int(match.group(1))
+    return parsed if parsed > 0 else None
+
+
+def _normalize_role_label(token: object) -> str:
+    cleaned = _clean_string(token)
+    if not cleaned:
+        return ""
+
+    cleaned = ROLE_VALUE_PREFIX_PATTERN.sub("", cleaned)
+    cleaned = ROLE_TRAILING_PARTICLE_PATTERN.sub("", cleaned).strip()
+    cleaned = cleaned.strip(" .,!?:;\"'()[]")
+    if not cleaned:
+        return ""
+
+    lowered = cleaned.lower()
+    if lowered == "pm":
+        return "PM"
+    if lowered == "po":
+        return "PO"
+    if lowered == "ai":
+        return "AI"
+    if lowered == "ios":
+        return "iOS"
+    return cleaned
+
+
+def _number_duplicate_roles(roles: list[str]) -> list[str]:
+    if not roles:
+        return []
+
+    counts: dict[str, int] = {}
+    for role in roles:
+        counts[role] = counts.get(role, 0) + 1
+
+    indexes: dict[str, int] = {}
+    normalized: list[str] = []
+    for role in roles:
+        if counts[role] == 1:
+            normalized.append(role)
+            continue
+
+        indexes[role] = indexes.get(role, 0) + 1
+        normalized.append(f"{role} {indexes[role]}")
+
+    return normalized
+
+
+def _split_role_tokens(text: str) -> list[str]:
+    stripped = ROLE_VALUE_PREFIX_PATTERN.sub("", text).strip()
+    if not stripped:
+        return []
+    return [part.strip() for part in ROLE_VALUE_SPLIT_PATTERN.split(stripped) if part.strip()]
+
+
+def _parse_explicit_role_counts(value: str) -> list[tuple[str, int]] | None:
+    tokens = _split_role_tokens(value)
+    if not tokens:
+        return None
+
+    parsed: list[tuple[str, int]] = []
+    for token in tokens:
+        match = ROLE_COUNT_TOKEN_PATTERN.fullmatch(token)
+        if not match:
+            return None
+
+        role = _normalize_role_label(match.group(1))
+        count = int(match.group(2))
+        if not role or count <= 0:
+            return None
+        parsed.append((role, count))
+
+    return parsed or None
+
+
+def normalize_roles(value: object) -> list[str] | None:
+    if value is None or isinstance(value, bool):
+        return None
+
+    if isinstance(value, (list, tuple, set)):
+        normalized = [_normalize_role_label(item) for item in value]
+        cleaned = [role for role in normalized if role]
+        return _number_duplicate_roles(cleaned) or None
+
+    if not isinstance(value, str):
+        return None
+
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+
+    counted_roles = _parse_explicit_role_counts(cleaned)
+    if counted_roles:
+        expanded_roles: list[str] = []
+        for role, count in counted_roles:
+            expanded_roles.extend([role] * count)
+        return _number_duplicate_roles(expanded_roles) or None
+
+    split_roles = [_normalize_role_label(token) for token in _split_role_tokens(cleaned)]
+    normalized = [role for role in split_roles if role]
+    if normalized:
+        return _number_duplicate_roles(normalized)
+
+    single_role = _normalize_role_label(cleaned)
+    return [single_role] if single_role else None
+
+
+def format_collected_value(key: str, value: object) -> str:
+    if key == "teamSize":
+        team_size = normalize_team_size(value)
+        return str(team_size) if team_size is not None else _clean_string(value)
+
+    if key == "roles":
+        roles = normalize_roles(value)
+        if roles:
+            return ", ".join(roles)
+        return _clean_string(value)
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if isinstance(value, float) and value.is_integer():
+            return str(int(value))
+        return str(value)
+
+    return _clean_string(value)
+
+
+def has_role_team_size_conflict(roles: object, team_size: object) -> bool:
+    normalized_roles = normalize_roles(roles)
+    normalized_team_size = normalize_team_size(team_size)
+    if not normalized_roles or normalized_team_size is None:
+        return False
+    return len(normalized_roles) > normalized_team_size
+
+
+def normalize_collected_value(
+    key: str,
+    value: object,
+    *,
+    team_size: object = None,
+) -> CollectedDataValue | None:
+    if key == "teamSize":
+        return normalize_team_size(value)
+
+    if key == "roles":
+        normalized_roles = normalize_roles(value)
+        if not normalized_roles:
+            return None
+        if has_role_team_size_conflict(normalized_roles, team_size):
+            return None
+        return normalized_roles
+
+    cleaned = _clean_string(value)
+    return cleaned or None
+
+
+def _clean(key: str, value: object) -> str:
+    normalized = normalize_collected_value(key, value)
+    if normalized is None:
+        return ""
+    return format_collected_value(key, normalized)
+
+
+def _effective_team_size(
+    current_data: Mapping[str, object] | None,
+    updated_data: Mapping[str, object] | None = None,
+) -> int | None:
+    updated_team_size = normalize_team_size((updated_data or {}).get("teamSize"))
+    if updated_team_size is not None:
+        return updated_team_size
+    return normalize_team_size((current_data or {}).get("teamSize"))
+
+
+def build_role_team_size_conflict_message(roles: object, team_size: object) -> str:
+    normalized_roles = normalize_roles(roles) or []
+    normalized_team_size = normalize_team_size(team_size)
+    if not normalized_roles or normalized_team_size is None:
+        return ""
+
+    return (
+        f"역할 인원 합계가 {len(normalized_roles)}명인데 현재 팀 인원은 "
+        f"{normalized_team_size}명입니다. 역할 구성이나 팀 인원을 다시 확인해 주세요."
     )
 
 
+def is_valid_collected_value(key: str, value: object, *, team_size: object = None) -> bool:
+    cleaned = _clean(key, value)
+    if not cleaned:
+        return False
+
+    normalized = cleaned.lower()
+    if "@mates" in normalized or "?" in cleaned:
+        return False
+    if any(keyword in normalized for keyword in NEGATIVE_VALUE_KEYWORDS):
+        return False
+    if any(keyword in normalized for keyword in REQUEST_LIKE_VALUE_KEYWORDS):
+        return False
+    if key in {"title", "goal"} and re.fullmatch(r"\d+(?:\.\d+)?", cleaned):
+        return False
+    if key == "roles" and has_role_team_size_conflict(value, team_size):
+        return False
+    return True
+
+
+def sanitize_collected_data(data: Mapping[str, object] | None) -> CollectedData:
+    sanitized: CollectedData = {}
+    team_size = normalize_team_size((data or {}).get("teamSize"))
+    if team_size is not None:
+        sanitized["teamSize"] = team_size
+
+    for key in COLLECTED_DATA_FIELDS:
+        if key == "teamSize":
+            continue
+
+        value = (data or {}).get(key)
+        if not is_valid_collected_value(key, value, team_size=team_size):
+            continue
+
+        normalized_value = normalize_collected_value(key, value, team_size=team_size)
+        if normalized_value is not None:
+            sanitized[key] = normalized_value
+
+    return sanitized
+
+
+def sanitize_candidate_updates(
+    updated_data: Mapping[str, object] | None,
+    *,
+    current_data: Mapping[str, object] | None = None,
+) -> CollectedData:
+    sanitized: CollectedData = {}
+    team_size = _effective_team_size(current_data, updated_data)
+    normalized_team_size = normalize_team_size((updated_data or {}).get("teamSize"))
+    if normalized_team_size is not None:
+        sanitized["teamSize"] = normalized_team_size
+
+    for key in COLLECTED_DATA_FIELDS:
+        if key == "teamSize":
+            continue
+
+        value = (updated_data or {}).get(key)
+        if not is_valid_collected_value(key, value, team_size=team_size):
+            continue
+
+        normalized_value = normalize_collected_value(key, value, team_size=team_size)
+        if normalized_value is not None:
+            sanitized[key] = normalized_value
+
+    return sanitized
+
+
+def missing_collected_fields(data: Mapping[str, object] | None) -> list[str]:
+    sanitized = sanitize_collected_data(data)
+    return [
+        key
+        for key in COLLECTED_DATA_FIELDS
+        if not is_valid_collected_value(
+            key,
+            sanitized.get(key),
+            team_size=sanitized.get("teamSize"),
+        )
+    ]
+
+
+def is_template_ready(data: Mapping[str, object] | None) -> bool:
+    return not missing_collected_fields(data)
+
+
+def has_title(data: Mapping[str, object] | None) -> bool:
+    sanitized = sanitize_collected_data(data)
+    return is_valid_collected_value("title", sanitized.get("title"))
+
+
+def has_any_collected_fact(data: Mapping[str, object] | None) -> bool:
+    return bool(sanitize_collected_data(data))
+
+
+def derive_phase_from_collected_data(
+    data: Mapping[str, object] | None,
+    *,
+    current_phase: str = "EXPLORE",
+) -> str:
+    sanitized = sanitize_collected_data(data)
+    derived = "EXPLORE"
+    if is_template_ready(sanitized):
+        derived = "READY"
+    elif has_title(sanitized):
+        derived = "GATHER"
+    elif sanitized:
+        derived = "TOPIC_SET"
+
+    if derived == "EXPLORE" and current_phase == "TOPIC_SET":
+        return "TOPIC_SET"
+    if PHASE_ORDER.get(derived, 0) >= PHASE_ORDER.get(current_phase, 0):
+        return derived
+    return current_phase
+
+
+def build_collected_data_guide() -> str:
+    return ", ".join(f'"{key}" ({label})' for key, label in COLLECTED_DATA_FIELDS.items())
+
+
 def build_collected_data_json_example() -> str:
-    lines = [f'            "{key}": "..."' for key in COLLECTED_DATA_FIELDS]
+    lines = [
+        '            "title": "..."',
+        '            "goal": "..."',
+        '            "teamSize": 4',
+        '            "roles": ["개발자", "기획자", "PM"]',
+        '            "dueDate": "..."',
+        '            "deliverables": "..."',
+    ]
     return "{\n" + ",\n".join(lines) + "\n        }"
 
 
 def merge_collected_data(
-    current_data: Dict[str, str], updated_data: Dict[str, str] | None
-) -> Dict[str, str]:
-    merged = dict(current_data or {})
+    current_data: Mapping[str, object],
+    updated_data: Mapping[str, object] | None,
+) -> CollectedData:
+    merged = sanitize_collected_data(current_data)
+    sanitized_updates = sanitize_candidate_updates(updated_data, current_data=current_data)
 
     for key in COLLECTED_DATA_FIELDS:
-        value = (updated_data or {}).get(key)
-        if isinstance(value, str) and value.strip():
-            merged[key] = value.strip()
+        value = sanitized_updates.get(key)
+        if value is not None:
+            merged[key] = value
 
     return merged

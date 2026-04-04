@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Literal, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, root_validator
 
+from app.ai.graph.collected_data import CollectedData
 from app.ai.services.template_generation import generate_dev_template, generate_plan_template
 from app.api.schemas.template import NotionTemplatePayload
 from app.core.request_normalization import (
@@ -22,7 +23,7 @@ class TemplateGenerateRequest(BaseModel):
     templateType: Literal["plan", "dev"] = "plan"
     currentStatus: str = "READY"
     content: str = ""
-    collectedData: Dict[str, str] = Field(default_factory=dict)
+    collectedData: CollectedData = Field(default_factory=dict)
     recentMessages: List[str] = Field(default_factory=list)
     selectedMessage: Optional[str] = None
     selectedAnswers: List[str] = Field(default_factory=list)

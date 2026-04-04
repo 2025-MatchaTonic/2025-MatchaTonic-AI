@@ -1,5 +1,7 @@
 from typing import Any, Dict, List, Literal, Optional, TypedDict
 
+from app.ai.graph.collected_data import CollectedData
+
 
 TurnPolicy = Literal[
     "ASK_ONLY",
@@ -17,7 +19,7 @@ class AgentState(TypedDict):
     turn_policy: TurnPolicy
     recent_messages: List[str]
     selected_message: Optional[str]
-    collected_data: Dict[str, str]
+    collected_data: CollectedData
     is_sufficient: bool
     ai_message: str
     next_phase: str

@@ -1,3 +1,4 @@
+from app.ai.graph.collected_data import format_collected_value
 from app.ai.graph.state import AgentState
 from app.ai.graph.text_support import clean_text, strip_mates_mention
 
@@ -5,8 +6,8 @@ from app.ai.graph.text_support import clean_text, strip_mates_mention
 def build_project_snapshot(data: dict) -> dict[str, str]:
     title = clean_text(data.get("title")) or "프로젝트 제목 미정"
     goal = clean_text(data.get("goal")) or "프로젝트 목표는 추가 논의가 필요합니다."
-    team_size = clean_text(data.get("teamSize")) or "팀 규모 미정"
-    roles = clean_text(data.get("roles")) or "역할 분담 추가 논의 필요"
+    team_size = format_collected_value("teamSize", data.get("teamSize")) or "팀 규모 미정"
+    roles = format_collected_value("roles", data.get("roles")) or "역할 분담 추가 논의 필요"
     due_date = clean_text(data.get("dueDate")) or "마감 일정 미정"
     deliverables = clean_text(data.get("deliverables")) or "산출물 범위 추가 논의 필요"
 
