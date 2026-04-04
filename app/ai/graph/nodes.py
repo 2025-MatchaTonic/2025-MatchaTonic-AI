@@ -530,7 +530,16 @@ def _normalize_topic_title(candidate: str) -> str:
 
 def _normalize_topic_title_with_llm(candidate: str, *, field_name: str) -> str:
     normalized = _normalize_topic_title(candidate)
-    if not normalized or not settings.OPENAI_API_KEY:
+    if not normalized:
+        return normalized
+    if _is_non_storable_freeform_message(normalized) or _is_guidance_signal(normalized):
+        logger.info(
+            "skip llm normalization for %s candidate because it is non-storable: %r",
+            field_name,
+            normalized,
+        )
+        return ""
+    if not settings.OPENAI_API_KEY:
         return normalized
 
     prompt = f"""
@@ -624,16 +633,17 @@ def _extract_title_updates_for_topic_set(
         return {}
     if _matches_topic_presence_button_message(user_message):
         return {}
-    if _is_non_storable_freeform_message(user_message):
-        return {}
-    if _is_summary_request(user_message) or _is_fill_remaining_request(user_message, current_data):
-        return {}
 
     direct_updates = _extract_direct_fact_updates(user_message)
     if "subject" in direct_updates and not has_subject:
         return {"subject": direct_updates["subject"]}
     if "title" in direct_updates:
         return {"title": direct_updates["title"]}
+
+    if _is_non_storable_freeform_message(user_message):
+        return {}
+    if _is_summary_request(user_message) or _is_fill_remaining_request(user_message, current_data):
+        return {}
 
     choice_title = _extract_choice_based_title(state)
     if choice_title and not has_subject:
@@ -1060,10 +1070,15 @@ def _should_offer_topic_guidance(
     *,
     direct_updates: dict[str, object] | None = None,
 ) -> bool:
-    topic_anchor = _get_topic_anchor(current_data)
+    direct_updates = direct_updates or {}
+    topic_anchor = _get_topic_anchor(current_data) or str(
+        direct_updates.get("subject") or direct_updates.get("title") or ""
+    ).strip()
     if not topic_anchor:
         return False
-    if direct_updates:
+    if direct_updates and not (
+        direct_updates.get("subject") or direct_updates.get("title")
+    ):
         return False
     if _is_valid_collected_value("goal", current_data.get("goal")):
         return False
@@ -1143,6 +1158,28 @@ def _looks_like_title_instruction(candidate: str) -> bool:
 def _normalize_direct_fact_value(value: str) -> str:
     normalized = DIRECT_FACT_ENDING_PATTERN.sub("", str(value or "").strip())
     return normalized.strip(" .,!?:;\"'")
+
+
+def _trim_subject_candidate_clause(value: str) -> str:
+    candidate = _clean_text(value)
+    if not candidate:
+        return ""
+
+    clause_patterns = (
+        re.compile(r"^(.+?)\s*(?:이고|인데|지만|이며)\s+(.+)$"),
+        re.compile(r"^(.+?)[,.!?\n]\s*(.+)$"),
+    )
+    for pattern in clause_patterns:
+        match = pattern.match(candidate)
+        if not match:
+            continue
+
+        head = match.group(1).strip(" '\"")
+        tail = match.group(2).strip()
+        if head and (_is_guidance_signal(tail) or _is_non_storable_freeform_message(tail)):
+            return head
+
+    return candidate
 
 
 def _is_summary_request(user_message: str) -> bool:
@@ -1473,7 +1510,8 @@ def _extract_direct_fact_updates(user_message: str) -> dict[str, object]:
     if not skip_topic_value_extraction:
         subject_match = SUBJECT_PATTERN.search(message)
         if subject_match:
-            subject = _normalize_direct_fact_value(subject_match.group(1))
+            subject = _trim_subject_candidate_clause(subject_match.group(1))
+            subject = _normalize_direct_fact_value(subject)
             subject = _normalize_topic_title_with_llm(subject, field_name="subject")
             if subject:
                 updates["subject"] = subject
@@ -1749,6 +1787,16 @@ def topic_exists_node(state: AgentState):
     )
     extracted_subject = accepted_updates.get("subject", "")
     if extracted_subject:
+        if turn_type == "request_refine_topic":
+            return {
+                "ai_message": (
+                    f"좋아요. 주제 방향은 '{extracted_subject}'로 정리해둘게요. "
+                    f"{_build_topic_refinement_message(merged_data)}"
+                ),
+                "collected_data": merged_data,
+                "is_sufficient": is_sufficient,
+                "next_phase": next_phase,
+            }
         return {
             "ai_message": (
                 f"좋아요. 주제 방향은 '{extracted_subject}'로 정리해둘게요. "
@@ -1760,6 +1808,16 @@ def topic_exists_node(state: AgentState):
         }
     extracted_title = accepted_updates.get("title", "")
     if extracted_title:
+        if turn_type == "request_refine_topic":
+            return {
+                "ai_message": (
+                    f"좋아요. 프로젝트 제목은 '{extracted_title}'로 정리해둘게요. "
+                    f"{_build_topic_refinement_message(merged_data)}"
+                ),
+                "collected_data": merged_data,
+                "is_sufficient": is_sufficient,
+                "next_phase": next_phase,
+            }
         return {
             "ai_message": (
                 f"좋아요. 프로젝트 제목은 '{extracted_title}'로 정리해둘게요. "
