@@ -83,6 +83,20 @@ class AIChatResponse(BaseModel):
     notionTemplatePayload: Optional[NotionTemplatePayload] = None
 
 
+def _summarize_authorization_header(value: str | None) -> str:
+    if not value:
+        return "missing"
+    cleaned = value.strip()
+    if not cleaned:
+        return "missing"
+    if cleaned.lower().startswith("bearer "):
+        token = cleaned[7:].strip()
+        if not token:
+            return "bearer-empty"
+        return f"bearer-present(len={len(token)},prefix={token[:8]})"
+    return f"present(prefix={cleaned[:12]})"
+
+
 def _derive_effective_phase(request: AIChatRequest) -> str:
     return derive_phase_from_collected_data(
         request.collectedData,
@@ -123,12 +137,15 @@ def _derive_turn_policy(request: AIChatRequest) -> TurnPolicy:
 async def process_chat(request: AIChatRequest, http_request: Request):
     try:
         effective_phase = _derive_effective_phase(request)
+        authorization_header = http_request.headers.get("Authorization")
         logger.info(
-            "chat request room=%s action=%s current_status=%s effective_phase=%s content=%r collected_data=%s recent_count=%d selected_message=%r",
+            "chat request room=%s project_id=%s action=%s current_status=%s effective_phase=%s auth=%s content=%r collected_data=%s recent_count=%d selected_message=%r",
+            request.roomId,
             request.roomId,
             request.actionType,
             request.currentStatus,
             effective_phase,
+            _summarize_authorization_header(authorization_header),
             request.content,
             request.collectedData,
             len(request.recentMessages),
@@ -165,7 +182,7 @@ async def process_chat(request: AIChatRequest, http_request: Request):
             sync_project_summary(
                 request.roomId,
                 response_collected_data,
-                authorization=http_request.headers.get("Authorization"),
+                authorization=authorization_header,
             )
         except SpringSummarySyncError as exc:
             if settings.SPRING_SUMMARY_SYNC_STRICT:
