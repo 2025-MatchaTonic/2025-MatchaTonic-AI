@@ -9,7 +9,16 @@ from pydantic import ValidationError
 
 from app.ai.graph.collected_data import (
     build_collected_data_json_example,
+    build_role_team_size_conflict_message,
+    derive_phase_from_collected_data,
+    format_collected_value,
+    has_role_team_size_conflict,
+    is_template_ready as _shared_is_template_ready,
+    is_valid_collected_value as _shared_is_valid_collected_value,
     merge_collected_data,
+    missing_collected_fields as _shared_missing_collected_fields,
+    sanitize_candidate_updates as _shared_sanitize_candidate_updates,
+    sanitize_collected_data as _shared_sanitize_collected_data,
 )
 from app.ai.graph.llm_clients import (
     conversation_llm,
@@ -240,7 +249,7 @@ FILL_REMAINING_SCOPE_KEYWORDS = (
     "이걸로",
 )
 TITLE_EXPLICIT_PATTERN = re.compile(
-    r"^\s*(?:프로젝트\s*주제|프로젝트명|주제|제목)\s*(?:은|는|:)?\s*",
+    r"^\s*(?:프로젝트\s*주제|프로젝트명|주제|제목|이름)\s*(?:은|는|:)?\s*",
     re.IGNORECASE,
 )
 TEAM_SIZE_PATTERN = re.compile(r"(?:팀\s*인원|팀원|인원)\D{0,8}(\d{1,2})\s*명?")
@@ -450,6 +459,32 @@ def _normalize_topic_title(candidate: str) -> str:
     return title
 
 
+def _postprocess_explicit_title_value(candidate: str) -> str:
+    title = _normalize_topic_title(candidate)
+    if not title:
+        return ""
+
+    explicit_tail_patterns = (
+        r"\s*로\s*할래$",
+        r"\s*로\s*할게$",
+        r"\s*로\s*하자$",
+        r"\s*로\s*할까$",
+        r"\s*로\s*정할래$",
+        r"\s*로\s*정하자$",
+        r"\s*로\s*정할게$",
+        r"\s*이름으로\s*할래$",
+        r"\s*주제로\s*할래$",
+        r"\s*이야$",
+        r"\s*야$",
+    )
+    for pattern in explicit_tail_patterns:
+        stripped = re.sub(pattern, "", title, flags=re.IGNORECASE).strip(" .,!?:;\"'")
+        if stripped and len(stripped) >= 2:
+            title = stripped
+            break
+    return title
+
+
 def _extract_title_updates_for_topic_set(
     state: AgentState, current_data: dict[str, str] | None = None
 ) -> dict[str, str]:
@@ -459,6 +494,8 @@ def _extract_title_updates_for_topic_set(
 
     user_message = _effective_user_message(state)
     if not user_message:
+        return {}
+    if _is_summary_request(user_message) or _is_fill_remaining_request(user_message, current_data):
         return {}
 
     direct_updates = _extract_direct_fact_updates(user_message)
@@ -719,22 +756,11 @@ def _is_meaningful_fact(value: object) -> bool:
 
 
 def _is_valid_collected_value(key: str, value: object) -> bool:
-    cleaned = _clean_text(value)
-    if not _is_meaningful_fact(cleaned):
-        return False
-
-    if key in {"title", "goal"} and re.fullmatch(r"\d+(?:\.\d+)?", cleaned):
-        return False
-
-    return True
+    return _shared_is_valid_collected_value(key, value)
 
 
 def _prune_collected_data(data: dict[str, str]) -> dict[str, str]:
-    return {
-        key: _clean_text(value)
-        for key, value in (data or {}).items()
-        if _is_valid_collected_value(key, value)
-    }
+    return _shared_sanitize_collected_data(data)
 
 
 def _detect_gather_focus(text: str) -> str | None:
@@ -764,24 +790,30 @@ def _detect_requested_gather_focus(text: str) -> str | None:
     return matched_focus if matched_index >= 0 else None
 
 
+def _interpret_turn_type(state: AgentState, current_data: dict[str, str] | None = None) -> str:
+    current_data = _prune_collected_data(current_data or state.get("collected_data") or {})
+    user_message = _effective_user_message(state)
+
+    if _is_summary_request(user_message):
+        return "request_summary"
+    if _is_fill_remaining_request(user_message, current_data):
+        return "request_fill_missing"
+    if _extract_title_updates_for_topic_set(state, current_data):
+        return "provide_topic"
+    if _extract_direct_fact_updates(user_message):
+        return "provide_fact"
+    if _is_next_step_request(user_message) or _is_help_request(user_message) or "템플릿" in _clean_text(user_message):
+        return "request_next_step"
+    return "general"
+
+
 def _infer_latest_user_intent(state: AgentState) -> str:
     user_message = _effective_user_message(state)
     current_data = _prune_collected_data(state.get("collected_data") or {})
 
     if _is_greeting_message(user_message):
         return "greeting"
-    if _is_fill_remaining_request(user_message, current_data):
-        return "fill_remaining"
-
-    requested_focus = _detect_requested_gather_focus(user_message)
-    if requested_focus:
-        return f"direct_request:{requested_focus}"
-
-    if _is_help_request(user_message):
-        return "help_request"
-    if _extract_title_updates_for_topic_set(state, current_data):
-        return "set_topic"
-    return "general"
+    return _interpret_turn_type(state, current_data)
 
 
 def _infer_conversation_focus(state: AgentState) -> str | None:
@@ -847,7 +879,24 @@ def _looks_like_title_instruction(candidate: str) -> bool:
     normalized = str(candidate or "").strip().lower()
     if not normalized:
         return True
-    return any(keyword in normalized for keyword in TITLE_INSTRUCTION_KEYWORDS)
+    meta_request_keywords = (
+        "\uc694\uc57d",
+        "\uc815\ub9ac\ud574\uc918",
+        "\uc815\ub9ac\ud574 \uc918",
+        "\ucc44\uc6cc\uc918",
+        "\ucc44\uc6cc \uc918",
+        "\ubbf8\uc815\uc778 \ud56d\ubaa9",
+        "\uc81c\ub300\ub85c \uc815\uc758\ub418\uc9c0 \uc54a\uc740 \ubd80\ubd84",
+        "\ub2e4 \ucc44\uc6cc\uc918",
+        "\ub0a8\uc740 \ud56d\ubaa9",
+        "\uc9c0\uae08 \ubaa8\uc778 \uc815\ubcf4",
+        "\uc138\uc158 \uc694\uc57d",
+        "fill",
+        "summary",
+    )
+    return any(keyword in normalized for keyword in TITLE_INSTRUCTION_KEYWORDS) or any(
+        keyword in normalized for keyword in meta_request_keywords
+    )
 
 
 def _normalize_direct_fact_value(value: str) -> str:
@@ -862,7 +911,26 @@ def _is_summary_request(user_message: str) -> bool:
     return any(keyword in normalized for keyword in SUMMARY_REQUEST_KEYWORDS)
 
 
+def _extract_corrected_team_size_from_message(message: str) -> str:
+    correction_patterns = (
+        r"(\d{1,2})\s*명\s*(?:이|은|는)?\s*아니라\s*(\d{1,2})\s*명",
+        r"아니[^0-9]{0,12}(?:팀원|팀 인원|인원)?[^0-9]{0,12}(\d{1,2})\s*명",
+    )
+    for pattern in correction_patterns:
+        match = re.search(pattern, message)
+        if not match:
+            continue
+        if match.lastindex and match.lastindex >= 2:
+            return match.group(match.lastindex).strip()
+        return match.group(1).strip()
+    return ""
+
+
 def _extract_team_size_from_message(message: str) -> str:
+    corrected_team_size = _extract_corrected_team_size_from_message(message)
+    if corrected_team_size:
+        return corrected_team_size
+
     explicit_match = TEAM_SIZE_PATTERN.search(message)
     if explicit_match:
         return explicit_match.group(1).strip()
@@ -886,6 +954,14 @@ def _extract_team_size_from_message(message: str) -> str:
     return ""
 
 
+def _is_next_step_request(user_message: str) -> bool:
+    normalized = _clean_text(_strip_mates_mention(user_message))
+    if not normalized:
+        return False
+    keywords = ("다음", "그다음", "뭐 정", "무엇을 정", "뭐 하면", "다음엔", "next")
+    return any(keyword in normalized for keyword in keywords)
+
+
 def _looks_like_role_token(token: str) -> bool:
     lowered = token.lower()
     if not token or len(token) > 20:
@@ -900,6 +976,7 @@ def _normalize_role_token(token: str) -> str:
 
     cleaned = ROLE_PREFIX_PATTERN.sub("", cleaned)
     cleaned = ROLE_TRAILING_SPLIT_PATTERN.split(cleaned, maxsplit=1)[0].strip()
+    cleaned = re.sub(r"(?:으로|로)$", "", cleaned).strip()
     cleaned = cleaned.strip(" .,!?:;\"'()[]")
     if not cleaned:
         return ""
@@ -920,6 +997,8 @@ def _extract_roles_from_message(message: str) -> str:
     role_match = ROLE_PATTERN.search(message)
     candidate = role_match.group(1) if role_match else message
     candidate = ROLE_TRAILING_SPLIT_PATTERN.split(candidate, maxsplit=1)[0]
+    candidate = re.split(r"[.?!]\s*|다음엔|다음에|그다음", candidate, maxsplit=1)[0]
+    candidate = re.split(r"\s+정도(?:로)?\b", candidate, maxsplit=1)[0]
     candidate = candidate.split("\n", 1)[0].strip()
 
     roles: list[str] = []
@@ -933,7 +1012,7 @@ def _extract_roles_from_message(message: str) -> str:
     return ", ".join(roles)
 
 
-def _build_collected_data_summary(current_data: dict[str, str]) -> str:
+def _build_collected_data_summary(current_data: dict[str, object]) -> str:
     normalized = _prune_collected_data(current_data)
     labels = {
         "title": "제목",
@@ -947,13 +1026,15 @@ def _build_collected_data_summary(current_data: dict[str, str]) -> str:
 
     confirmed_parts = []
     for key in ordered_keys:
-        if not _is_meaningful_fact(normalized.get(key)):
+        if not _is_valid_collected_value(key, normalized.get(key)):
             continue
-        value = normalized[key]
+        value = format_collected_value(key, normalized[key])
         if key == "teamSize":
             value = f"{value}명"
         confirmed_parts.append(f"{labels[key]} {value}")
-    missing_parts = [labels[key] for key in ordered_keys if not _is_meaningful_fact(normalized.get(key))]
+    missing_parts = [
+        labels[key] for key in ordered_keys if not _is_valid_collected_value(key, normalized.get(key))
+    ]
 
     if confirmed_parts and missing_parts:
         return (
@@ -968,15 +1049,90 @@ def _build_collected_data_summary(current_data: dict[str, str]) -> str:
     return "아직 확정된 정보는 없습니다. 제목, 목표, 팀 인원, 역할 중 하나부터 정리하면 됩니다."
 
 
-def _build_next_missing_field_prompt(current_data: dict[str, str]) -> str:
+def _build_next_missing_field_prompt(current_data: dict[str, object]) -> str:
     normalized = _prune_collected_data(current_data)
     for key in ("title", "goal", "dueDate", "deliverables", "roles", "teamSize"):
-        if _is_meaningful_fact(normalized.get(key)):
+        if _is_valid_collected_value(key, normalized.get(key)):
             continue
         if key == "title":
             return "다음으로 프로젝트 제목을 한 줄로 정해볼까요?"
         return GATHER_FIELD_GUIDE[key]["question"]
     return ""
+
+
+def _build_fact_confirmation_message(
+    merged_data: dict[str, object], accepted_updates: dict[str, object]
+) -> str:
+    confirmations: list[str] = []
+    if "title" in accepted_updates and merged_data.get("title"):
+        confirmations.append(f"제목은 '{merged_data['title']}'")
+    if "goal" in accepted_updates and merged_data.get("goal"):
+        confirmations.append(f"목표는 '{merged_data['goal']}'")
+    if "teamSize" in accepted_updates and merged_data.get("teamSize"):
+        confirmations.append(
+            f"팀 인원은 {format_collected_value('teamSize', merged_data['teamSize'])}명"
+        )
+    if "roles" in accepted_updates and merged_data.get("roles"):
+        confirmations.append(f"역할은 {format_collected_value('roles', merged_data['roles'])}")
+    if "dueDate" in accepted_updates and merged_data.get("dueDate"):
+        confirmations.append(f"마감일은 {merged_data['dueDate']}")
+    if "deliverables" in accepted_updates and merged_data.get("deliverables"):
+        confirmations.append(f"산출물은 {merged_data['deliverables']}")
+
+    if not confirmations:
+        return _build_collected_data_summary(merged_data)
+
+    message = "좋아요. " + ", ".join(confirmations) + " 정리할게요."
+    follow_up = _build_next_missing_field_prompt(merged_data)
+    if follow_up:
+        message += f" {follow_up}"
+    return message
+
+
+def _finalize_committed_response(
+    *,
+    turn_type: str,
+    merged_data: dict[str, object],
+    accepted_updates: dict[str, object],
+    ai_message: str,
+    is_sufficient: bool,
+) -> str:
+    if turn_type == "request_summary":
+        return _build_collected_data_summary(merged_data)
+    if turn_type == "request_fill_missing":
+        if is_sufficient:
+            return _build_collected_data_summary(merged_data)
+        follow_up = _build_next_missing_field_prompt(merged_data)
+        if follow_up:
+            return follow_up
+        return _build_collected_data_summary(merged_data)
+    if turn_type == "request_next_step":
+        if is_sufficient:
+            return _build_collected_data_summary(merged_data)
+        follow_up = _build_next_missing_field_prompt(merged_data)
+        if follow_up:
+            return follow_up
+        return _build_collected_data_summary(merged_data)
+    if turn_type in {"provide_fact", "provide_topic"} and accepted_updates:
+        return _build_fact_confirmation_message(merged_data, accepted_updates)
+    if not is_sufficient and _looks_like_template_ready_claim(ai_message):
+        follow_up = _build_next_missing_field_prompt(merged_data)
+        summary = _build_collected_data_summary(merged_data)
+        return f"{summary} {follow_up}".strip() if follow_up else summary
+    return ai_message
+
+
+def _find_role_team_size_conflict(
+    current_data: dict[str, object],
+    candidate_updates: dict[str, object],
+) -> str:
+    effective_team_size = candidate_updates.get("teamSize", current_data.get("teamSize"))
+    if not has_role_team_size_conflict(candidate_updates.get("roles"), effective_team_size):
+        return ""
+    return build_role_team_size_conflict_message(
+        candidate_updates.get("roles"),
+        effective_team_size,
+    )
 
 
 def _looks_like_template_ready_claim(message: str) -> bool:
@@ -1028,7 +1184,7 @@ def _is_fill_remaining_request(user_message: str, current_data: dict[str, str]) 
         return False
 
     missing_fields = [
-        key for key in GATHER_FIELD_GUIDE if not _is_meaningful_fact(current_data.get(key))
+        key for key in GATHER_FIELD_GUIDE if not _is_valid_collected_value(key, current_data.get(key))
     ]
     if not missing_fields:
         return False
@@ -1047,14 +1203,27 @@ def _is_fill_remaining_request(user_message: str, current_data: dict[str, str]) 
     return False
 
 
-def _extract_direct_fact_updates(user_message: str) -> dict[str, str]:
+def _extract_explicit_title_value(message: str) -> str:
+    if not TITLE_EXPLICIT_PATTERN.match(message):
+        return ""
+
+    explicit_candidate = re.sub(TITLE_EXPLICIT_PATTERN, "", message, count=1).strip()
+    if not explicit_candidate:
+        return ""
+    return _postprocess_explicit_title_value(explicit_candidate)
+
+
+def _extract_direct_fact_updates(user_message: str) -> dict[str, object]:
     message = _clean_text(_strip_mates_mention(user_message))
     if not message:
         return {}
 
-    updates: dict[str, str] = {}
+    updates: dict[str, object] = {}
 
-    if TITLE_EXPLICIT_PATTERN.match(message):
+    explicit_title = _extract_explicit_title_value(message)
+    if explicit_title:
+        updates["title"] = explicit_title
+    elif TITLE_EXPLICIT_PATTERN.match(message):
         topic_candidate = _normalize_topic_title(_extract_topic_candidate(message))
         if topic_candidate and not _looks_like_title_instruction(topic_candidate):
             updates["title"] = topic_candidate
@@ -1133,26 +1302,28 @@ def _extract_choice_based_title(state: AgentState) -> str:
     return ""
 
 
-def _sanitize_gather_updates(updated_data: dict[str, str]) -> dict[str, str]:
-    sanitized: dict[str, str] = {}
+def _sanitize_gather_updates(updated_data: dict[str, object]) -> dict[str, object]:
+    sanitized: dict[str, object] = {}
     for key, value in updated_data.items():
-        if key != "teamSize" and _looks_like_choice_token(value):
+        if isinstance(value, str) and key != "teamSize" and _looks_like_choice_token(value):
             continue
-        if key in {"title", "goal"} and _looks_like_multi_option_block(value):
+        if isinstance(value, str) and key in {"title", "goal"} and _looks_like_multi_option_block(value):
             continue
-        if key == "title":
+        if key == "title" and isinstance(value, str):
             value = _normalize_topic_title(value)
-        if _is_valid_collected_value(key, value):
+        if isinstance(value, str):
             sanitized[key] = _clean_text(value)
-    return sanitized
+        else:
+            sanitized[key] = value
+    return _shared_sanitize_candidate_updates(sanitized)
 
 
 def _filter_gather_updates(
     user_message: str,
-    updated_data: dict[str, str],
+    updated_data: dict[str, object],
     *,
     focus_type: str | None,
-) -> dict[str, str]:
+) -> dict[str, object]:
     if _is_help_request(user_message):
         return {}
 
@@ -1162,13 +1333,12 @@ def _filter_gather_updates(
     return sanitized
 
 
-def _count_ready_fields(current_data: dict[str, str]) -> int:
-    return sum(1 for key in GATHER_FIELD_GUIDE if _is_valid_collected_value(key, current_data.get(key)))
+def _count_ready_fields(current_data: dict[str, object]) -> int:
+    return len(GATHER_FIELD_GUIDE) - len(_shared_missing_collected_fields(current_data))
 
 
 def _is_template_ready(current_data: dict[str, str]) -> bool:
-    normalized = _prune_collected_data(current_data)
-    return all(_is_valid_collected_value(key, normalized.get(key)) for key in GATHER_FIELD_GUIDE)
+    return _shared_is_template_ready(current_data)
 
 
 def _build_topic_exists_fallback_message() -> str:
@@ -1181,23 +1351,53 @@ def explore_problem_node(state: AgentState):
     user_message = _effective_user_message(state)
     turn_policy = _get_turn_policy(state)
     latest_intent = _infer_latest_user_intent(state)
+    raw_current_data = dict(state.get("collected_data") or {})
+    current_data = _prune_collected_data(raw_current_data)
+    next_phase = derive_phase_from_collected_data(
+        raw_current_data,
+        current_phase=str(state.get("current_phase") or "EXPLORE"),
+    )
+    is_sufficient = _is_template_ready(current_data)
 
     if _is_initial_button_selection(state):
         return {
             "ai_message": FAST_EXPLORE_REPLY,
+            "collected_data": raw_current_data,
+            "is_sufficient": is_sufficient,
             "next_phase": "EXPLORE",
         }
 
     if latest_intent == "greeting":
         return {
             "ai_message": _apply_turn_policy_to_message(state, _answer_only_fallback(state, "")),
-            "next_phase": "EXPLORE",
+            "collected_data": raw_current_data,
+            "is_sufficient": is_sufficient,
+            "next_phase": next_phase,
         }
 
     if _is_trivial_message(user_message) and not state.get("recent_messages"):
         return {
             "ai_message": _apply_turn_policy_to_message(state, _answer_only_fallback(state, "")),
-            "next_phase": "EXPLORE",
+            "collected_data": raw_current_data,
+            "is_sufficient": is_sufficient,
+            "next_phase": next_phase,
+        }
+
+    if latest_intent in {"request_summary", "request_fill_missing", "request_next_step"}:
+        return {
+            "ai_message": _apply_turn_policy_to_message(
+                state,
+                _finalize_committed_response(
+                    turn_type=latest_intent,
+                    merged_data=current_data,
+                    accepted_updates={},
+                    ai_message="",
+                    is_sufficient=is_sufficient,
+                ),
+            ),
+            "collected_data": raw_current_data,
+            "is_sufficient": is_sufficient,
+            "next_phase": next_phase,
         }
 
     rag_context = _fetch_rag_context(
@@ -1244,6 +1444,8 @@ def explore_problem_node(state: AgentState):
 
     return {
         "ai_message": _apply_turn_policy_to_message(state, ai_message),
+        "collected_data": raw_current_data,
+        "is_sufficient": is_sufficient,
         "next_phase": "EXPLORE",  # 계속 탐색 단계 유지
     }
 
@@ -1255,26 +1457,61 @@ def topic_exists_node(state: AgentState):
     if _is_initial_button_selection(state):
         return {
             "ai_message": FAST_TOPIC_EXISTS_REPLY,
-            "collected_data": _prune_collected_data(state.get("collected_data") or {}),
+            "collected_data": dict(state.get("collected_data") or {}),
             "is_sufficient": False,
             "next_phase": "TOPIC_SET",
         }
 
     user_message = _effective_user_message(state)
-    current_data = _prune_collected_data(state.get("collected_data") or {})
-    latest_intent = _infer_latest_user_intent(state)
-    title_updates = _extract_title_updates_for_topic_set(state, current_data)
-    extracted_title = title_updates.get("title", "")
+    raw_current_data = dict(state.get("collected_data") or {})
+    current_data = _prune_collected_data(raw_current_data)
+    turn_type = _interpret_turn_type(state, current_data)
+    candidate_updates = _extract_title_updates_for_topic_set(state, current_data)
+    merged_data = merge_collected_data(current_data, candidate_updates)
+    accepted_updates = {
+        key: value for key, value in merged_data.items() if current_data.get(key) != value
+    }
+    next_phase = derive_phase_from_collected_data(merged_data, current_phase="TOPIC_SET")
+    is_sufficient = _is_template_ready(merged_data)
+    logger.info(
+        "topic_exists turn_type=%s user_message=%r before=%s candidates=%s after=%s next_phase=%s is_sufficient=%s",
+        turn_type,
+        user_message,
+        current_data,
+        candidate_updates,
+        merged_data,
+        next_phase,
+        is_sufficient,
+    )
+    extracted_title = accepted_updates.get("title", "")
     if extracted_title:
-        merged_data = merge_collected_data(current_data, title_updates)
         return {
             "ai_message": (
                 f"좋아요. 주제는 '{extracted_title}'로 정리해둘게요. "
                 "이 주제로 어떤 문제를 풀고 싶은지, 또는 어떤 결과물을 만들고 싶은지 한두 줄로 말해 주세요."
             ),
             "collected_data": merged_data,
-            "is_sufficient": _is_template_ready(merged_data),
-            "next_phase": "GATHER",
+            "is_sufficient": is_sufficient,
+            "next_phase": next_phase,
+        }
+    if turn_type in {"request_summary", "request_fill_missing", "request_next_step"}:
+        return {
+            "ai_message": _apply_turn_policy_to_message(
+                state,
+                _finalize_committed_response(
+                    turn_type=turn_type,
+                    merged_data=current_data,
+                    accepted_updates={},
+                    ai_message="",
+                    is_sufficient=_is_template_ready(current_data),
+                ),
+            ),
+            "collected_data": raw_current_data,
+            "is_sufficient": _is_template_ready(current_data),
+            "next_phase": derive_phase_from_collected_data(
+                raw_current_data,
+                current_phase="TOPIC_SET",
+            ),
         }
     if not _is_meaningful_fact(current_data.get("title")) and user_message:
         return {
@@ -1282,7 +1519,7 @@ def topic_exists_node(state: AgentState):
                 "주제 후보를 이해하려면 한 줄로 더 구체적으로 적어주셔야 합니다. "
                 "예를 들면 '대학생 팀플 일정 관리 앱'처럼 적어 주세요."
             ),
-            "collected_data": current_data,
+            "collected_data": raw_current_data,
             "is_sufficient": False,
             "next_phase": "TOPIC_SET",
         }
@@ -1307,7 +1544,7 @@ def topic_exists_node(state: AgentState):
         {PLAIN_LANGUAGE_RULES}
 
         [Latest user intent]
-        {latest_intent}
+        {turn_type}
 
         [Recent conversation]
         {recent_context}
@@ -1326,7 +1563,9 @@ def topic_exists_node(state: AgentState):
 
     return {
         "ai_message": _apply_turn_policy_to_message(state, ai_message),
-        "next_phase": "TOPIC_SET",
+        "collected_data": merged_data,
+        "is_sufficient": is_sufficient,
+        "next_phase": next_phase,
     }
 
 
@@ -1337,28 +1576,144 @@ def gather_information_node(state: AgentState):
     user_message = _effective_user_message(state)
     turn_policy = _get_turn_policy(state)
     current_phase = str(state.get("current_phase") or "")
-    current_data = _prune_collected_data(state.get("collected_data") or {})
+    raw_current_data = dict(state.get("collected_data") or {})
+    current_data = _prune_collected_data(raw_current_data)
     prefilled_data = dict(current_data)
     was_ready = _is_template_ready(current_data)
-    latest_intent = _infer_latest_user_intent(state)
+    turn_type = _interpret_turn_type(state, current_data)
+    requested_next_step = _is_next_step_request(user_message)
     focus_type = _infer_conversation_focus(state)
     direct_updates = {
         key: value
         for key, value in _extract_direct_fact_updates(user_message).items()
         if key != "title"
     }
+    direct_conflict_message = _find_role_team_size_conflict(prefilled_data, direct_updates)
     merged_preview = merge_collected_data(prefilled_data, direct_updates)
     if state.get("current_phase") == "TOPIC_SET" and _is_meaningful_fact(prefilled_data.get("title")):
         focus_type = focus_type or "goal"
-    if _is_summary_request(user_message):
-        preview_is_sufficient = _is_template_ready(merged_preview)
+    logger.info(
+        "gather turn_type=%s user_message=%r before=%s direct_candidates=%s",
+        turn_type,
+        user_message,
+        prefilled_data,
+        direct_updates,
+    )
+    if turn_type == "request_summary":
+        next_phase = derive_phase_from_collected_data(prefilled_data, current_phase=current_phase)
+        is_sufficient = _is_template_ready(prefilled_data)
+        logger.info(
+            "gather summary before=%s next_phase=%s is_sufficient=%s",
+            prefilled_data,
+            next_phase,
+            is_sufficient,
+        )
         return {
             "ai_message": _apply_turn_policy_to_message(
-                state, _build_collected_data_summary(merged_preview)
+                state,
+                _finalize_committed_response(
+                    turn_type=turn_type,
+                    merged_data=prefilled_data,
+                    accepted_updates={},
+                    ai_message="",
+                    is_sufficient=is_sufficient,
+                ),
+            ),
+            "collected_data": raw_current_data,
+            "is_sufficient": is_sufficient,
+            "next_phase": next_phase,
+        }
+    if turn_type == "request_fill_missing" and not direct_updates:
+        next_phase = derive_phase_from_collected_data(prefilled_data, current_phase=current_phase)
+        is_sufficient = _is_template_ready(prefilled_data)
+        logger.info(
+            "gather fill_missing before=%s next_phase=%s is_sufficient=%s",
+            prefilled_data,
+            next_phase,
+            is_sufficient,
+        )
+        return {
+            "ai_message": _apply_turn_policy_to_message(
+                state,
+                _finalize_committed_response(
+                    turn_type=turn_type,
+                    merged_data=prefilled_data,
+                    accepted_updates={},
+                    ai_message="",
+                    is_sufficient=is_sufficient,
+                ),
+            ),
+            "collected_data": raw_current_data,
+            "is_sufficient": is_sufficient,
+            "next_phase": next_phase,
+        }
+    if turn_type == "request_next_step" and not direct_updates:
+        next_phase = derive_phase_from_collected_data(prefilled_data, current_phase=current_phase)
+        is_sufficient = _is_template_ready(prefilled_data)
+        logger.info(
+            "gather next_step before=%s next_phase=%s is_sufficient=%s",
+            prefilled_data,
+            next_phase,
+            is_sufficient,
+        )
+        return {
+            "ai_message": _apply_turn_policy_to_message(
+                state,
+                _finalize_committed_response(
+                    turn_type=turn_type,
+                    merged_data=prefilled_data,
+                    accepted_updates={},
+                    ai_message="",
+                    is_sufficient=is_sufficient,
+                ),
+            ),
+            "collected_data": raw_current_data,
+            "is_sufficient": is_sufficient,
+            "next_phase": next_phase,
+        }
+    if direct_conflict_message:
+        next_phase = derive_phase_from_collected_data(merged_preview, current_phase=current_phase)
+        is_sufficient = _is_template_ready(merged_preview)
+        logger.info(
+            "gather role/team mismatch before=%s attempted=%s after=%s",
+            prefilled_data,
+            direct_updates,
+            merged_preview,
+        )
+        follow_up = _build_next_missing_field_prompt(merged_preview)
+        ai_message = direct_conflict_message
+        if follow_up:
+            ai_message = f"{ai_message} {follow_up}"
+        return {
+            "ai_message": _apply_turn_policy_to_message(state, ai_message),
+            "collected_data": merged_preview,
+            "is_sufficient": is_sufficient,
+            "next_phase": next_phase,
+        }
+    if direct_updates and (turn_type == "provide_fact" or requested_next_step or turn_type == "request_fill_missing"):
+        next_phase = derive_phase_from_collected_data(merged_preview, current_phase=current_phase)
+        is_sufficient = _is_template_ready(merged_preview)
+        logger.info(
+            "gather committed direct updates before=%s after=%s next_phase=%s is_sufficient=%s",
+            prefilled_data,
+            merged_preview,
+            next_phase,
+            is_sufficient,
+        )
+        return {
+            "ai_message": _apply_turn_policy_to_message(
+                state,
+                _finalize_committed_response(
+                    turn_type="provide_fact",
+                    merged_data=merged_preview,
+                    accepted_updates=direct_updates,
+                    ai_message="",
+                    is_sufficient=is_sufficient,
+                ),
             ),
             "collected_data": merged_preview,
-            "is_sufficient": preview_is_sufficient,
-            "next_phase": "READY" if preview_is_sufficient else "GATHER",
+            "is_sufficient": is_sufficient,
+            "next_phase": next_phase,
         }
     focus_instruction = _build_gather_focus_instruction(focus_type)
     missing_field_summary = _build_missing_field_summary(prefilled_data)
@@ -1407,7 +1762,7 @@ def gather_information_node(state: AgentState):
     {focus_type or "none"}
 
     [Latest user intent]
-    {latest_intent}
+    {turn_type}
 
     [Fill remaining request]
     {fill_remaining_request}
@@ -1431,11 +1786,12 @@ def gather_information_node(state: AgentState):
         response_format={"type": "json_object"},
     )
     if response is None:
+        next_phase = derive_phase_from_collected_data(prefilled_data, current_phase=current_phase)
         return {
             "ai_message": _apply_turn_policy_to_message(state, _answer_only_fallback(state, "")),
             "collected_data": prefilled_data,
             "is_sufficient": was_ready,
-            "next_phase": "READY" if was_ready else "GATHER",
+            "next_phase": next_phase,
         }
 
     try:
@@ -1447,11 +1803,12 @@ def gather_information_node(state: AgentState):
             exc,
             getattr(response, "content", ""),
         )
+        next_phase = derive_phase_from_collected_data(prefilled_data, current_phase=current_phase)
         return {
             "ai_message": _apply_turn_policy_to_message(state, _answer_only_fallback(state, "")),
             "collected_data": prefilled_data,
             "is_sufficient": was_ready,
-            "next_phase": "READY" if was_ready else "GATHER",
+            "next_phase": next_phase,
         }
 
     filtered_updates = _filter_gather_updates(
@@ -1460,21 +1817,34 @@ def gather_information_node(state: AgentState):
         focus_type=focus_type,
     )
     filtered_updates.pop("title", None)
-    merged_data = merge_collected_data(prefilled_data, filtered_updates)
-    merged_data = merge_collected_data(merged_data, direct_updates)
-    if filtered_updates or direct_updates:
-        logger.info(
-            "collected_data updates llm=%s direct=%s merged=%s",
-            filtered_updates,
-            direct_updates,
-            merged_data,
-        )
+    candidate_updates = dict(filtered_updates)
+    candidate_updates.update(direct_updates)
+    candidate_conflict_message = _find_role_team_size_conflict(prefilled_data, candidate_updates)
+    merged_data = merge_collected_data(prefilled_data, candidate_updates)
+    accepted_updates = {
+        key: value for key, value in merged_data.items() if prefilled_data.get(key) != value
+    }
+    next_phase = derive_phase_from_collected_data(merged_data, current_phase=current_phase)
     is_sufficient = _is_template_ready(merged_data)
-    ai_msg = str(result.ai_message or "").strip()
-
-    if not is_sufficient and _looks_like_template_ready_claim(ai_msg):
+    logger.info(
+        "gather llm_candidates=%s accepted_updates=%s before=%s after=%s next_phase=%s is_sufficient=%s",
+        filtered_updates,
+        accepted_updates,
+        prefilled_data,
+        merged_data,
+        next_phase,
+        is_sufficient,
+    )
+    ai_msg = _finalize_committed_response(
+        turn_type=turn_type,
+        merged_data=merged_data,
+        accepted_updates=accepted_updates,
+        ai_message=str(result.ai_message or "").strip(),
+        is_sufficient=is_sufficient,
+    )
+    if candidate_conflict_message:
         follow_up = _build_next_missing_field_prompt(merged_data)
-        ai_msg = _build_collected_data_summary(merged_data)
+        ai_msg = candidate_conflict_message
         if follow_up:
             ai_msg = f"{ai_msg} {follow_up}"
 
@@ -1489,8 +1859,6 @@ def gather_information_node(state: AgentState):
             prompt_message = "이제 템플릿을 만들 수 있을 만큼 정보가 모였어요. 템플릿 만드시겠습니까?"
         ai_msg = f"{ai_msg}\n\n{prompt_message}".strip() if ai_msg else prompt_message
     ai_msg = _apply_turn_policy_to_message(state, ai_msg)
-
-    next_phase = "READY" if is_sufficient else "GATHER"
 
     return {
         "ai_message": ai_msg,

@@ -53,7 +53,9 @@ async def validate_runtime_configuration():
         logger.warning("OPENAI_API_KEY is missing. LLM-backed endpoints will fail.")
 
     if not settings.PINECONE_API_KEY:
-        logger.warning("PINECONE_API_KEY is missing. RAG will run without Pinecone context.")
+        logger.warning(
+            "PINECONE_API_KEY is missing. RAG will run without Pinecone context."
+        )
 
     logger.info(
         "AI server startup validated. model=%s cors_origins=%s",
@@ -65,3 +67,7 @@ async def validate_runtime_configuration():
 @app.get("/")
 async def root():
     return {"message": "AI PM Server is running!"}
+
+
+# local 실행 명령
+# uvicorn main:app --host 0.0.0.0 --port 8000

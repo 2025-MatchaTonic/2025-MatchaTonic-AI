@@ -1,4 +1,5 @@
 from langgraph.graph import StateGraph, END
+from app.ai.graph.collected_data import derive_phase_from_collected_data
 from app.ai.graph.state import AgentState
 from app.ai.graph.nodes import (
     _extract_title_updates_for_topic_set,
@@ -43,7 +44,10 @@ def _should_promote_explore_to_topic_set(state: AgentState) -> bool:
 
 def route_logic(state: AgentState):
     action = state["action_type"]
-    phase = state["current_phase"]
+    phase = derive_phase_from_collected_data(
+        state.get("collected_data") or {},
+        current_phase=state["current_phase"],
+    )
 
     if action == "BTN_NO":
         return "explore_node"

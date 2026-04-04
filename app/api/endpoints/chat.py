@@ -10,6 +10,7 @@ from app.ai.graph.text_support import (
     strip_mates_mention as _strip_mates_mention,
     truncate_message as _truncate_content,
 )
+from app.ai.graph.collected_data import CollectedData, derive_phase_from_collected_data
 from app.ai.graph.state import TurnPolicy
 from app.ai.graph.workflow import ai_app
 from app.api.schemas.template import NotionTemplatePayload
@@ -30,7 +31,7 @@ class AIChatRequest(BaseModel):
     content: str = ""
     actionType: str = "CHAT"
     currentStatus: str = "EXPLORE"
-    collectedData: Dict[str, str] = Field(default_factory=dict)
+    collectedData: CollectedData = Field(default_factory=dict)
     recentMessages: List[str] = Field(default_factory=list)
     selectedMessage: Optional[str] = None
     selectedAnswers: List[str] = Field(default_factory=list)
@@ -75,43 +76,15 @@ class AIChatResponse(BaseModel):
     suggestedQuestions: List[str]
     currentStatus: str
     isSufficient: bool
-    collectedData: Dict[str, str]
+    collectedData: CollectedData
     notionTemplatePayload: Optional[NotionTemplatePayload] = None
 
 
-def _has_meaningful_value(value: Any) -> bool:
-    return bool(str(value or "").strip())
-
-
-def _has_valid_collected_value(key: str, value: Any) -> bool:
-    cleaned = str(value or "").strip()
-    if not cleaned:
-        return False
-    if key in {"title", "goal"} and cleaned.replace(".", "", 1).isdigit():
-        return False
-    return True
-
-
 def _derive_effective_phase(request: AIChatRequest) -> str:
-    phase = request.currentStatus
-    data = request.collectedData or {}
-    has_title = _has_valid_collected_value("title", data.get("title"))
-    ready_field_count = sum(
-        1
-        for key in ("title", "goal", "teamSize", "roles", "dueDate", "deliverables")
-        if _has_valid_collected_value(key, data.get(key))
+    return derive_phase_from_collected_data(
+        request.collectedData,
+        current_phase=request.currentStatus,
     )
-    all_required_fields_ready = ready_field_count == 6
-
-    if phase in {"EXPLORE", "TOPIC_SET", "GATHER"} and all_required_fields_ready:
-        return "READY"
-    if phase in {"EXPLORE", "TOPIC_SET"} and has_title:
-        return "GATHER"
-    if phase == "EXPLORE" and any(
-        _has_valid_collected_value(key, value) for key, value in data.items()
-    ):
-        return "TOPIC_SET"
-    return phase
 
 
 def _derive_turn_policy(request: AIChatRequest) -> TurnPolicy:
@@ -170,7 +143,7 @@ async def process_chat(request: AIChatRequest):
 
         result = await asyncio.to_thread(ai_app.invoke, initial_state)
         response_phase = result.get("next_phase", effective_phase)
-        response_collected_data = result.get("collected_data", {})
+        response_collected_data = result.get("collected_data", request.collectedData)
         logger.info(
             "chat response room=%s next_phase=%s is_sufficient=%s collected_data=%s ai_message=%r",
             request.roomId,
