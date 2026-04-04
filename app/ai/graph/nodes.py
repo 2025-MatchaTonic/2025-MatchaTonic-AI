@@ -528,6 +528,62 @@ def _normalize_topic_title(candidate: str) -> str:
     return title
 
 
+def _normalize_topic_title_with_llm(candidate: str, *, field_name: str) -> str:
+    normalized = _normalize_topic_title(candidate)
+    if not normalized or not settings.OPENAI_API_KEY:
+        return normalized
+
+    prompt = f"""
+    You normalize one short Korean project {field_name} candidate extracted from a user chat message.
+
+    Rules:
+    - Fix only obvious typos, spacing, and minor wording noise.
+    - Preserve the original meaning. Do not invent a different idea.
+    - Keep it short and natural for a project {field_name}.
+    - If the input is already natural, return it unchanged.
+    - If it is not a storable project {field_name}, return an empty string.
+
+    Input: {normalized}
+
+    Output JSON:
+    {{
+      "normalized": "..."
+    }}
+    """
+
+    response = _invoke_llm(
+        structured_llm,
+        prompt,
+        label=f"normalize_{field_name}_candidate llm",
+        response_format={"type": "json_object"},
+    )
+    if response is None:
+        return normalized
+
+    try:
+        raw_result = json.loads(response.content)
+    except JSONDecodeError:
+        logger.warning(
+            "failed to parse normalized %s candidate JSON: raw_output=%s",
+            field_name,
+            getattr(response, "content", ""),
+        )
+        return normalized
+
+    refined = _normalize_topic_title(str(raw_result.get("normalized", "")).strip())
+    if not refined:
+        return normalized
+
+    if refined != normalized:
+        logger.info(
+            "refined %s candidate with llm before=%r after=%r",
+            field_name,
+            normalized,
+            refined,
+        )
+    return refined
+
+
 def _postprocess_explicit_title_value(candidate: str) -> str:
     title = _normalize_topic_title(candidate)
     if not title:
@@ -586,7 +642,10 @@ def _extract_title_updates_for_topic_set(
         return {"title": choice_title}
 
     if _is_capture_title_turn(state) or state.get("current_phase") in {"EXPLORE", "TOPIC_SET"}:
-        candidate = _normalize_topic_title(_extract_topic_candidate(user_message))
+        candidate = _normalize_topic_title_with_llm(
+            _extract_topic_candidate(user_message),
+            field_name="subject" if not has_subject else "title",
+        )
         if candidate:
             if not has_subject:
                 return {"subject": candidate}
@@ -1412,20 +1471,26 @@ def _extract_direct_fact_updates(user_message: str) -> dict[str, object]:
     )
 
     if not skip_topic_value_extraction:
-        explicit_title = _extract_explicit_title_value(message)
-        if explicit_title:
-            updates["title"] = explicit_title
-        elif TITLE_EXPLICIT_PATTERN.match(message):
-            topic_candidate = _normalize_topic_title(_extract_topic_candidate(message))
-            if topic_candidate and not _looks_like_title_instruction(topic_candidate):
-                updates["title"] = topic_candidate
-
         subject_match = SUBJECT_PATTERN.search(message)
         if subject_match:
             subject = _normalize_direct_fact_value(subject_match.group(1))
-            subject = _normalize_topic_title(subject)
+            subject = _normalize_topic_title_with_llm(subject, field_name="subject")
             if subject:
                 updates["subject"] = subject
+        else:
+            explicit_title = _extract_explicit_title_value(message)
+            if explicit_title:
+                updates["title"] = _normalize_topic_title_with_llm(
+                    explicit_title,
+                    field_name="title",
+                )
+            elif TITLE_EXPLICIT_PATTERN.match(message):
+                topic_candidate = _normalize_topic_title_with_llm(
+                    _extract_topic_candidate(message),
+                    field_name="title",
+                )
+                if topic_candidate and not _looks_like_title_instruction(topic_candidate):
+                    updates["title"] = topic_candidate
 
     team_size = _extract_team_size_from_message(message)
     if team_size:

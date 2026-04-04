@@ -3,8 +3,7 @@ from typing import Any, Dict, List
 from app.ai.graph.collected_data import (
     CollectedData,
     has_role_team_size_conflict,
-    normalize_collected_value,
-    normalize_team_size,
+    sanitize_collected_data,
 )
 
 
@@ -101,27 +100,13 @@ def normalize_collected_data(value: Any) -> CollectedData:
         canonical_key = COLLECTED_DATA_ALIASES.get(alias_key.lower(), alias_key)
         canonicalized[canonical_key] = raw_item
 
-    normalized: CollectedData = {}
-    team_size = normalize_team_size(canonicalized.get("teamSize"))
-    if team_size is not None:
-        normalized["teamSize"] = team_size
+    normalized = sanitize_collected_data(canonicalized)
+    team_size = normalized.get("teamSize")
 
-    for key, raw_item in canonicalized.items():
-        if key == "teamSize":
-            continue
-
-        normalized_value = normalize_collected_value(key, raw_item, team_size=team_size)
-        if normalized_value is not None:
-            normalized[key] = normalized_value
-            continue
-
-        if key == "roles" and raw_item is not None:
-            if has_role_team_size_conflict(raw_item, team_size):
-                if isinstance(raw_item, str) and raw_item.strip():
-                    normalized[key] = raw_item.strip()
-                continue
-
-        if isinstance(raw_item, str) and raw_item.strip():
-            normalized[key] = raw_item.strip()
+    if "roles" not in normalized:
+        raw_roles = canonicalized.get("roles")
+        if raw_roles is not None and has_role_team_size_conflict(raw_roles, team_size):
+            if isinstance(raw_roles, str) and raw_roles.strip():
+                normalized["roles"] = raw_roles.strip()
 
     return normalized
