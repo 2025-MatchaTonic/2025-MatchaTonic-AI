@@ -290,6 +290,7 @@ DELIVERABLES_PATTERN = re.compile(
     re.IGNORECASE,
 )
 CHOICE_INDEX_PATTERN = re.compile(r"^\s*([1-9])\s*(?:번)?\s*$")
+CHOICE_PREFIX_PATTERN = re.compile(r"^\s*([1-9])\s*번(?:\s*.*)?$")
 NUMBERED_OPTION_LINE_PATTERN = re.compile(r"^\s*(\d{1,2})[)\.\-:]\s*(.+?)\s*$")
 NUMBERED_OPTION_INLINE_PATTERN = re.compile(
     r"(\d{1,2})[)\.\-:]\s*(.+?)(?=\s+\d{1,2}[)\.\-:]|$)"
@@ -308,6 +309,11 @@ KOREAN_DUE_DATE_CANDIDATE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(최종발표\s*전)"),
 )
 PROBLEM_AREA_PATTERN = re.compile(r"(.+?)(?:하는\s*문제|문제|쪽|관점|방향)(?:로|을|를)?(?:\s|$)")
+TARGET_FACILITY_PROMPT_PATTERN = re.compile(r"어떤\s+시설을\s+대상으로\s+하나요")
+PROBLEM_AREA_CONTEXT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"좋아요\.\s*(.+?)의\s+(.+?)\s+문제로\s+좁혀볼게요"),
+    re.compile(r"좋아요\.\s*(.+?)에서\s+'(.+?)'\s+방향으로\s+좁혀볼게요"),
+)
 FAST_RAG_PHASES = {"EXPLORE", "TOPIC_SET", "GATHER"}
 RAG_CACHE_MAX_ITEMS = 128
 RAG_CONTEXT_CACHE: dict[tuple[str, str, tuple[str, ...], tuple[str, ...], int], str] = {}
@@ -1254,6 +1260,81 @@ def _extract_due_date_candidate_from_message(message: str) -> str:
     return ""
 
 
+def _recent_message_blocks(state: AgentState) -> list[str]:
+    text_blocks: list[str] = []
+
+    selected_raw = MATES_MENTION_PATTERN.sub(" ", str(state.get("selected_message") or ""))
+    selected = _clean_text(selected_raw)
+    if selected:
+        text_blocks.append(selected)
+
+    recent_messages = [
+        _clean_text(MATES_MENTION_PATTERN.sub(" ", str(msg or "")))
+        for msg in state.get("recent_messages", [])
+        if _clean_text(MATES_MENTION_PATTERN.sub(" ", str(msg or "")))
+    ]
+    text_blocks.extend(reversed(recent_messages[-6:]))
+    return text_blocks
+
+
+def _get_recent_problem_area_from_context(state: AgentState) -> str:
+    for block in _recent_message_blocks(state):
+        for pattern in PROBLEM_AREA_CONTEXT_PATTERNS:
+            match = pattern.search(block)
+            if not match:
+                continue
+            return _normalize_direct_fact_value(match.group(2))
+    return ""
+
+
+def _is_awaiting_target_facility(state: AgentState) -> bool:
+    return any(TARGET_FACILITY_PROMPT_PATTERN.search(block) for block in _recent_message_blocks(state))
+
+
+def _extract_target_facility_candidate(
+    state: AgentState,
+    current_data: dict[str, object] | None = None,
+) -> str:
+    current_data = current_data or {}
+    if not _get_topic_anchor(current_data):
+        return ""
+    if not _is_awaiting_target_facility(state):
+        return ""
+
+    user_message = _effective_user_message(state)
+    normalized = _clean_text(_strip_mates_mention(user_message))
+    if not normalized:
+        return ""
+    if _is_request_like_value(normalized) or _is_undecided_value(normalized):
+        return ""
+    if _is_meta_conversation_message(normalized) or _extract_due_date_candidate_from_message(normalized):
+        return ""
+    if _extract_choice_index(normalized) is not None:
+        return ""
+
+    candidate = normalized
+    facility_patterns = (
+        re.compile(r"^(.+?)\s*(?:을|를)\s*대상(?:으로)?(?:\s*(?:한다고|할게|하고\s*싶어|으로\s*할게))?$"),
+        re.compile(r"^(.+?)\s*대상(?:으로)?(?:\s*(?:한다고|할게|하고\s*싶어))?$"),
+    )
+    for pattern in facility_patterns:
+        match = pattern.match(candidate)
+        if match:
+            candidate = match.group(1).strip()
+            break
+
+    candidate = _normalize_direct_fact_value(candidate).strip(" '\"")
+    if not candidate:
+        return ""
+    if candidate == _get_topic_anchor(current_data):
+        return ""
+    if _is_non_storable_freeform_message(candidate):
+        return ""
+    if _looks_like_title_instruction(candidate):
+        return ""
+    return candidate
+
+
 def _extract_problem_area_candidate(
     state: AgentState,
     current_data: dict[str, object] | None = None,
@@ -1271,6 +1352,8 @@ def _extract_problem_area_candidate(
     user_message = _effective_user_message(state)
     normalized = _clean_text(_strip_mates_mention(user_message))
     if not normalized:
+        return ""
+    if _extract_target_facility_candidate(state, current_data):
         return ""
 
     choice_candidate = _extract_choice_based_title(state)
@@ -1309,6 +1392,19 @@ def _build_problem_area_follow_up(topic_anchor: str, problem_area: str) -> str:
     return (
         f"좋아요. {topic_anchor}에서 '{problem_area}' 방향으로 좁혀볼게요. "
         "이 문제를 가장 먼저 겪는 대상이나 상황을 한 줄로 말해 주세요."
+    )
+
+
+def _build_target_facility_follow_up(topic_anchor: str, problem_area: str, target_facility: str) -> str:
+    if problem_area:
+        return (
+            f"좋아요. {topic_anchor} 중 {target_facility}를 대상으로 보고, "
+            f"'{problem_area}' 문제를 더 구체화해볼게요. 이용자가 가장 불편한 순간은 언제인가요? "
+            "예: 빈자리 확인, 예약 절차, 운영시간 찾기"
+        )
+    return (
+        f"좋아요. {topic_anchor} 중 {target_facility}를 대상으로 볼게요. "
+        "이 시설에서 가장 먼저 해결하고 싶은 불편을 한 줄로 적어 주세요."
     )
 
 
@@ -1646,7 +1742,23 @@ def _trim_option_description(candidate: str) -> str:
 
 
 def _looks_like_choice_token(value: str) -> bool:
-    return bool(CHOICE_INDEX_PATTERN.match(str(value or "").strip()))
+    return _extract_choice_index(value) is not None
+
+
+def _extract_choice_index(value: object) -> int | None:
+    cleaned = _clean_text(_strip_mates_mention(value))
+    if not cleaned:
+        return None
+
+    exact_match = CHOICE_INDEX_PATTERN.match(cleaned)
+    if exact_match:
+        return int(exact_match.group(1))
+
+    prefix_match = CHOICE_PREFIX_PATTERN.match(cleaned)
+    if prefix_match:
+        return int(prefix_match.group(1))
+
+    return None
 
 
 def _looks_like_multi_option_block(value: str) -> bool:
@@ -1773,24 +1885,10 @@ def _extract_direct_fact_updates(user_message: str) -> dict[str, object]:
 
 def _extract_choice_based_title(state: AgentState) -> str:
     current_message = _effective_user_message(state)
-    choice_match = CHOICE_INDEX_PATTERN.match(current_message)
-    if not choice_match:
+    choice_index = _extract_choice_index(current_message)
+    if choice_index is None:
         return ""
-
-    choice_index = int(choice_match.group(1))
-    text_blocks: list[str] = []
-
-    selected_raw = MATES_MENTION_PATTERN.sub(" ", str(state.get("selected_message") or ""))
-    selected = _clean_text(selected_raw)
-    if selected:
-        text_blocks.append(selected)
-
-    recent_messages = [
-        _clean_text(MATES_MENTION_PATTERN.sub(" ", str(msg or "")))
-        for msg in state.get("recent_messages", [])
-        if _clean_text(MATES_MENTION_PATTERN.sub(" ", str(msg or "")))
-    ]
-    text_blocks.extend(reversed(recent_messages[-6:]))
+    text_blocks: list[str] = _recent_message_blocks(state)
 
     for block in text_blocks:
         matched_line_option = False
@@ -2172,17 +2270,45 @@ def gather_information_node(state: AgentState):
         for key, value in _extract_direct_fact_updates(user_message).items()
         if key in {"subject", "title", "goal", "teamSize", "roles", "dueDate", "deliverables"}
     }
+    target_facility_candidate = _extract_target_facility_candidate(state, prefilled_data)
+    recent_problem_area = _get_recent_problem_area_from_context(state)
     direct_conflict_message = _find_role_team_size_conflict(prefilled_data, direct_updates)
     merged_preview = merge_collected_data(prefilled_data, direct_updates)
     if state.get("current_phase") == "TOPIC_SET" and _get_topic_anchor(prefilled_data):
         focus_type = focus_type or "goal"
     logger.info(
-        "gather turn_type=%s user_message=%r before=%s direct_candidates=%s",
+        "gather turn_type=%s user_message=%r before=%s direct_candidates=%s target_facility=%r recent_problem_area=%r",
         turn_type,
         user_message,
         prefilled_data,
         direct_updates,
+        target_facility_candidate,
+        recent_problem_area,
     )
+    if target_facility_candidate:
+        next_phase = "GATHER"
+        is_sufficient = _is_template_ready(prefilled_data)
+        logger.info(
+            "gather target_facility topic=%r problem_area=%r target_facility=%r before=%s next_phase=%s",
+            _get_topic_anchor(prefilled_data),
+            recent_problem_area,
+            target_facility_candidate,
+            prefilled_data,
+            next_phase,
+        )
+        return {
+            "ai_message": _apply_turn_policy_to_message(
+                state,
+                _build_target_facility_follow_up(
+                    _get_topic_anchor(prefilled_data),
+                    recent_problem_area,
+                    target_facility_candidate,
+                ),
+            ),
+            "collected_data": raw_current_data,
+            "is_sufficient": is_sufficient,
+            "next_phase": next_phase,
+        }
     if turn_type == "request_summary":
         next_phase = derive_phase_from_collected_data(prefilled_data, current_phase=current_phase)
         is_sufficient = _is_template_ready(prefilled_data)

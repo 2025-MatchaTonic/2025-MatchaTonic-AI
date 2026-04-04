@@ -317,6 +317,44 @@ def test_problem_area_message_preserves_existing_subject():
     assert "접근성 강화" in result["ai_message"]
 
 
+def test_problem_area_choice_with_suffix_uses_option_label():
+    state = _make_topic_state(
+        message="1번문제 해결하는걸로하자",
+        collected_data={"subject": "공공시설"},
+    )
+    state["recent_messages"] = [
+        "좋아요. '공공시설'까지는 잡혔고 아직 구체 문제는 미정이에요. 같이 좁혀볼게요.\n"
+        "1. 혼잡도 확인\n"
+        "2. 예약/대기 관리\n"
+        "3. 운영시간·위치 안내\n"
+        "4. 불편 신고·접근성 정보\n"
+        "5. 아직 모르겠어요. 추천이 더 필요해요\n"
+        "번호로 답하거나 더 끌리는 방향을 한 줄로 적어 주세요."
+    ]
+
+    result = gather_information_node(state)
+
+    assert "혼잡도 확인" in result["ai_message"]
+    assert "1번 문제" not in result["ai_message"]
+
+
+def test_target_facility_reply_advances_after_problem_area_follow_up():
+    state = _make_topic_state(
+        message="도서관을 대상으로 한다고",
+        collected_data={"subject": "공공시설"},
+    )
+    state["recent_messages"] = [
+        "좋아요. 공공시설의 혼잡도 확인 문제로 좁혀볼게요. 어떤 시설을 대상으로 하나요? 예: 도서관, 공원, 주민센터, 버스터미널"
+    ]
+
+    result = gather_information_node(state)
+
+    assert result["next_phase"] == "GATHER"
+    assert "도서관" in result["ai_message"]
+    assert "혼잡도 확인" in result["ai_message"]
+    assert "어떤 시설을 대상으로 하나요" not in result["ai_message"]
+
+
 def test_topic_exists_node_commits_subject_and_returns_refinement_for_mixed_message():
     with patch("app.ai.graph.nodes.settings.OPENAI_API_KEY", "test-key"), patch(
         "app.ai.graph.nodes._invoke_llm",
