@@ -1407,21 +1407,25 @@ def _extract_direct_fact_updates(user_message: str) -> dict[str, object]:
         return {}
 
     updates: dict[str, object] = {}
+    skip_topic_value_extraction = _matches_topic_presence_button_message(message) or (
+        _is_non_storable_freeform_message(message) and not TITLE_EXPLICIT_PATTERN.match(message)
+    )
 
-    explicit_title = _extract_explicit_title_value(message)
-    if explicit_title:
-        updates["title"] = explicit_title
-    elif TITLE_EXPLICIT_PATTERN.match(message):
-        topic_candidate = _normalize_topic_title(_extract_topic_candidate(message))
-        if topic_candidate and not _looks_like_title_instruction(topic_candidate):
-            updates["title"] = topic_candidate
+    if not skip_topic_value_extraction:
+        explicit_title = _extract_explicit_title_value(message)
+        if explicit_title:
+            updates["title"] = explicit_title
+        elif TITLE_EXPLICIT_PATTERN.match(message):
+            topic_candidate = _normalize_topic_title(_extract_topic_candidate(message))
+            if topic_candidate and not _looks_like_title_instruction(topic_candidate):
+                updates["title"] = topic_candidate
 
-    subject_match = SUBJECT_PATTERN.search(message)
-    if subject_match:
-        subject = _normalize_direct_fact_value(subject_match.group(1))
-        subject = _normalize_topic_title(subject)
-        if subject:
-            updates["subject"] = subject
+        subject_match = SUBJECT_PATTERN.search(message)
+        if subject_match:
+            subject = _normalize_direct_fact_value(subject_match.group(1))
+            subject = _normalize_topic_title(subject)
+            if subject:
+                updates["subject"] = subject
 
     team_size = _extract_team_size_from_message(message)
     if team_size:
