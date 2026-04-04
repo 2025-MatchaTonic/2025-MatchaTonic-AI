@@ -6,8 +6,9 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.api.endpoints.chat import AIChatRequest, _derive_turn_policy
-from app.ai.graph.collected_data import merge_collected_data
+from app.ai.graph.collected_data import build_collected_data_json_example, merge_collected_data
 from app.ai.graph.nodes import (
+    _coerce_gather_llm_result,
     _extract_direct_fact_updates,
     _extract_title_updates_for_topic_set,
     gather_information_node,
@@ -92,6 +93,14 @@ def test_request_normalization_drops_identifier_like_room_title():
     assert normalized["goal"] == "예약 불편 해결"
 
 
+def test_collected_data_json_example_is_partial_update_shape():
+    example = build_collected_data_json_example()
+
+    assert '"subject"' in example
+    assert '"roles"' not in example
+    assert '"teamSize"' not in example
+
+
 def test_ai_chat_request_discards_identifier_like_room_title():
     request = AIChatRequest(
         roomId=1030,
@@ -132,28 +141,43 @@ def test_summary_request_preserves_committed_state_shape():
 
 
 def test_mixed_next_step_fact_update_keeps_normalized_types():
-    result = gather_information_node(
-        _make_state(
-            message="다음엔 팀원은 4명이고 역할은 개발자, 기획자, PM으로 할게",
-            collected_data={"title": "공공화장실 실시간 혼잡 안내"},
+    with patch(
+        "app.ai.graph.nodes._extract_direct_fact_updates",
+        return_value={"teamSize": 4, "roles": "개발자, 기획자, PM"},
+    ), patch(
+        "app.ai.graph.nodes._interpret_turn_type",
+        return_value="provide_fact",
+    ):
+        result = gather_information_node(
+            _make_state(
+                message="다음엔 팀원은 4명이고 역할은 개발자, 기획자, PM으로 할게",
+                collected_data={"title": "공공화장실 실시간 혼잡 안내"},
+            )
         )
-    )
 
     assert result["collected_data"]["teamSize"] == 4
     assert result["collected_data"]["roles"] == ["개발자", "기획자", "PM"]
 
 
 def test_correction_utterance_keeps_team_size_as_int():
-    result = gather_information_node(
-        _make_state(
-            message="아니 4명이 아니라 5명이야",
-            collected_data={
-                "title": "공공화장실 실시간 혼잡 안내",
-                "teamSize": 4,
-                "roles": ["개발자", "기획자", "PM"],
-            },
+    with patch(
+        "app.ai.graph.nodes._extract_direct_fact_updates",
+        return_value={"teamSize": 5},
+    ), patch(
+        "app.ai.graph.nodes._interpret_turn_type",
+        return_value="provide_fact",
+    ):
+        result = gather_information_node(
+            _make_state(
+                message="아니 4명이 아니라 5명이야",
+                collected_data={
+                    "title": "공공화장실 실시간 혼잡 안내",
+                    "teamSize": 4,
+                    "roles": ["개발자", "기획자", "PM"],
+                },
+            )
         )
-    )
+    
 
     assert result["collected_data"]["teamSize"] == 5
     assert isinstance(result["collected_data"]["teamSize"], int)
@@ -205,6 +229,10 @@ def test_help_request_is_not_extracted_as_title():
     )
 
     assert _extract_title_updates_for_topic_set(state) == {}
+
+
+def test_request_like_goal_value_is_not_persisted():
+    assert _extract_direct_fact_updates("목표는 추천해달라고") == {}
 
 
 def test_topic_candidate_typo_is_corrected_with_llm():
@@ -276,6 +304,19 @@ def test_help_request_with_existing_topic_returns_refinement_options():
     assert "예약/대기 관리" in result["ai_message"]
 
 
+def test_problem_area_message_preserves_existing_subject():
+    result = gather_information_node(
+        _make_state(
+            message="접근성 강화하는 문제",
+            collected_data={"subject": "공공시설"},
+        )
+    )
+
+    assert result["collected_data"] == {"subject": "공공시설"}
+    assert "공공시설" in result["ai_message"]
+    assert "접근성 강화" in result["ai_message"]
+
+
 def test_topic_exists_node_commits_subject_and_returns_refinement_for_mixed_message():
     with patch("app.ai.graph.nodes.settings.OPENAI_API_KEY", "test-key"), patch(
         "app.ai.graph.nodes._invoke_llm",
@@ -293,6 +334,31 @@ def test_topic_exists_node_commits_subject_and_returns_refinement_for_mixed_mess
     assert "공공시설 예약 효율화" in result["ai_message"]
     assert "같이 좁혀볼게요" in result["ai_message"]
     assert "예약/대기 관리" in result["ai_message"]
+
+
+def test_due_date_candidate_is_extracted_before_llm_flow():
+    assert _extract_direct_fact_updates("26년 말로 최종 마감하고 싶어") == {
+        "dueDate": "2026년 말"
+    }
+
+
+def test_coerce_gather_llm_result_salvages_invalid_field_types():
+    result = _coerce_gather_llm_result(
+        {
+            "intent": "ask_summary",
+            "ai_message": "주제를 기록했습니다.",
+            "updated_data": {
+                "subject": "공공시설 접근성 강화",
+                "roles": [],
+                "teamSize": None,
+                "dueDate": "...",
+            },
+            "is_sufficient": False,
+        }
+    )
+
+    assert result["ai_message"] == "주제를 기록했습니다."
+    assert result["updated_data"] == {"subject": "공공시설 접근성 강화"}
 
 
 def test_chat_turn_policy_treats_topic_presence_button_label_as_ask_only():
