@@ -76,6 +76,30 @@ NEGATIVE_VALUE_KEYWORDS: tuple[str, ...] = (
     "no idea",
 )
 
+PLACEHOLDER_VALUE_KEYWORDS: tuple[str, ...] = (
+    "...",
+    "…",
+    "..",
+    "-",
+    "--",
+    "n/a",
+    "na",
+    "null",
+    "none",
+    "미정",
+    "미정임",
+    "아직 없음",
+    "아직없음",
+    "없음",
+    "tbd",
+    "unknown",
+)
+
+META_CONVERSATION_VALUE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^\s*(?:아니|아니요|그게 아니라|다시|잠깐)\b"),
+    re.compile(r"^\s*(?:왜|뭔 말|무슨 말|이게 무슨)\b"),
+)
+
 IDENTIFIER_LIKE_NOISE_PATTERN = re.compile(r"^(?=.*\d{4,})(?=.*[ㄱ-ㅎㅏ-ㅣ])[A-Za-z0-9ㄱ-ㅎㅏ-ㅣ_-]+$")
 TEAM_SIZE_VALUE_PATTERN = re.compile(r"^\s*(\d{1,2})(?:\s*명)?\s*$")
 ROLE_VALUE_PREFIX_PATTERN = re.compile(
@@ -91,6 +115,45 @@ ROLE_TRAILING_PARTICLE_PATTERN = re.compile(r"(?:으로|로|은|는|이|가)$")
 
 def _clean_string(value: object) -> str:
     return value.strip() if isinstance(value, str) else ""
+
+
+def is_placeholder_value(value: object) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, (list, tuple, set)):
+        return len(value) == 0 or all(is_placeholder_value(item) for item in value)
+
+    cleaned = _clean_string(value)
+    if not cleaned:
+        return True
+
+    normalized = cleaned.lower()
+    return normalized in PLACEHOLDER_VALUE_KEYWORDS
+
+
+def is_request_like_value(value: object) -> bool:
+    cleaned = _clean_string(value)
+    if not cleaned:
+        return False
+    normalized = cleaned.lower()
+    return any(keyword in normalized for keyword in REQUEST_LIKE_VALUE_KEYWORDS)
+
+
+def is_undecided_value(value: object) -> bool:
+    cleaned = _clean_string(value)
+    if not cleaned:
+        return False
+    normalized = cleaned.lower()
+    if any(keyword in normalized for keyword in NEGATIVE_VALUE_KEYWORDS):
+        return True
+    return any(pattern.match(cleaned) for pattern in NON_COMMITTAL_VALUE_PATTERNS)
+
+
+def is_meta_conversation(value: object) -> bool:
+    cleaned = _clean_string(value)
+    if not cleaned:
+        return False
+    return any(pattern.match(cleaned) for pattern in META_CONVERSATION_VALUE_PATTERNS)
 
 
 def _looks_like_identifier_noise(value: object) -> bool:
@@ -121,11 +184,9 @@ def looks_like_non_committal_value(value: object) -> bool:
     if not cleaned:
         return False
 
-    normalized = cleaned.lower()
-    if any(keyword in normalized for keyword in REQUEST_LIKE_VALUE_KEYWORDS):
-        return True
-
-    return any(pattern.match(cleaned) for pattern in NON_COMMITTAL_VALUE_PATTERNS)
+    return is_request_like_value(cleaned) or is_undecided_value(cleaned) or is_meta_conversation(
+        cleaned
+    )
 
 
 def normalize_team_size(value: object) -> int | None:
@@ -286,6 +347,9 @@ def normalize_collected_value(
     *,
     team_size: object = None,
 ) -> CollectedDataValue | None:
+    if is_placeholder_value(value):
+        return None
+
     if key == "teamSize":
         return normalize_team_size(value)
 
@@ -338,6 +402,8 @@ def is_valid_collected_value(key: str, value: object, *, team_size: object = Non
     normalized = cleaned.lower()
     if "@mates" in normalized or "?" in cleaned:
         return False
+    if is_placeholder_value(cleaned):
+        return False
     if any(keyword in normalized for keyword in NEGATIVE_VALUE_KEYWORDS):
         return False
     if looks_like_non_committal_value(cleaned):
@@ -349,6 +415,51 @@ def is_valid_collected_value(key: str, value: object, *, team_size: object = Non
     if key == "roles" and has_role_team_size_conflict(value, team_size):
         return False
     return True
+
+
+def normalize_scalar_field(value: object) -> str | None:
+    if is_placeholder_value(value):
+        return None
+    cleaned = _clean_string(value)
+    return cleaned or None
+
+
+def normalize_roles_field(value: object) -> list[str] | None:
+    if is_placeholder_value(value):
+        return None
+    return normalize_roles(value)
+
+
+def sanitize_llm_updated_data(raw_updated_data: object) -> CollectedData:
+    if not isinstance(raw_updated_data, Mapping):
+        return {}
+
+    sanitized: CollectedData = {}
+    normalized_team_size = normalize_team_size(raw_updated_data.get("teamSize"))
+    if normalized_team_size is not None:
+        sanitized["teamSize"] = normalized_team_size
+
+    for key in COLLECTED_DATA_FIELDS:
+        if key == "teamSize":
+            continue
+
+        value = raw_updated_data.get(key)
+        if key == "roles":
+            normalized_value = normalize_roles_field(value)
+        else:
+            normalized_value = normalize_collected_value(
+                key,
+                normalize_scalar_field(value),
+                team_size=normalized_team_size,
+            )
+
+        if normalized_value is None:
+            continue
+        if not is_valid_collected_value(key, normalized_value, team_size=normalized_team_size):
+            continue
+        sanitized[key] = normalized_value
+
+    return sanitized
 
 
 def sanitize_collected_data(data: Mapping[str, object] | None) -> CollectedData:
@@ -473,12 +584,6 @@ def build_collected_data_guide() -> str:
 def build_collected_data_json_example() -> str:
     lines = [
         '            "subject": "..."',
-        '            "title": "..."',
-        '            "goal": "..."',
-        '            "teamSize": 4',
-        '            "roles": ["개발자", "기획자", "PM"]',
-        '            "dueDate": "..."',
-        '            "deliverables": "..."',
     ]
     return "{\n" + ",\n".join(lines) + "\n        }"
 

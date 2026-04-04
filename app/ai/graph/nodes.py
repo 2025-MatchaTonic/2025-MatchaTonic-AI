@@ -2,10 +2,9 @@
 import json
 import logging
 import re
+from datetime import date
 from json import JSONDecodeError
 from time import perf_counter
-
-from pydantic import ValidationError
 
 from app.ai.graph.collected_data import (
     build_collected_data_json_example,
@@ -15,9 +14,14 @@ from app.ai.graph.collected_data import (
     has_role_team_size_conflict,
     is_template_ready as _shared_is_template_ready,
     is_valid_collected_value as _shared_is_valid_collected_value,
+    is_meta_conversation,
+    is_placeholder_value,
+    is_request_like_value,
+    is_undecided_value,
     looks_like_non_committal_value,
     merge_collected_data,
     missing_collected_fields as _shared_missing_collected_fields,
+    sanitize_llm_updated_data,
     sanitize_candidate_updates as _shared_sanitize_candidate_updates,
     sanitize_collected_data as _shared_sanitize_collected_data,
 )
@@ -35,7 +39,6 @@ from app.ai.graph.text_support import (
     strip_mates_mention as _strip_mates_mention,
     truncate_message as _truncate_ai_message,
 )
-from app.ai.schemas.llm_outputs import GatherLLMResponse
 from app.core.config import settings
 from app.rag.retriever import get_rag_context
 
@@ -294,6 +297,17 @@ NUMBERED_OPTION_INLINE_PATTERN = re.compile(
 DIRECT_FACT_ENDING_PATTERN = re.compile(
     r"\s*(?:입니다|이에요|예요|이야|야|요)\s*$"
 )
+KOREAN_DUE_DATE_CANDIDATE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(\d{2,4}년\s*(?:초|중|말))"),
+    re.compile(r"(내년\s*(?:초|중|말))"),
+    re.compile(r"(올해\s*(?:초|중|말))"),
+    re.compile(r"(다음\s*달\s*(?:초|중|말))"),
+    re.compile(r"(\d{1,2}월\s*말(?:쯤)?)"),
+    re.compile(r"(이번\s*학기\s*말)"),
+    re.compile(r"(중간발표\s*전)"),
+    re.compile(r"(최종발표\s*전)"),
+)
+PROBLEM_AREA_PATTERN = re.compile(r"(.+?)(?:하는\s*문제|문제|쪽|관점|방향)(?:로|을|를)?(?:\s|$)")
 FAST_RAG_PHASES = {"EXPLORE", "TOPIC_SET", "GATHER"}
 RAG_CACHE_MAX_ITEMS = 128
 RAG_CONTEXT_CACHE: dict[tuple[str, str, tuple[str, ...], tuple[str, ...], int], str] = {}
@@ -532,6 +546,10 @@ def _normalize_topic_title_with_llm(candidate: str, *, field_name: str) -> str:
     normalized = _normalize_topic_title(candidate)
     if not normalized:
         return normalized
+    if _looks_like_choice_token(normalized) or is_placeholder_value(normalized):
+        return ""
+    if _extract_due_date_candidate_from_message(normalized):
+        return ""
     if _is_non_storable_freeform_message(normalized) or _is_guidance_signal(normalized):
         logger.info(
             "skip llm normalization for %s candidate because it is non-storable: %r",
@@ -646,6 +664,8 @@ def _extract_title_updates_for_topic_set(
         return {}
 
     choice_title = _extract_choice_based_title(state)
+    if has_subject and _extract_problem_area_candidate(state, current_data, direct_updates=direct_updates):
+        choice_title = ""
     if choice_title and not has_subject:
         return {"subject": choice_title}
     if choice_title:
@@ -955,13 +975,40 @@ def _interpret_turn_type(state: AgentState, current_data: dict[str, str] | None 
     current_data = _prune_collected_data(current_data or state.get("collected_data") or {})
     user_message = _effective_user_message(state)
     direct_updates = _extract_direct_fact_updates(user_message)
+    problem_area_candidate = _extract_problem_area_candidate(
+        state,
+        current_data,
+        direct_updates=direct_updates,
+    )
+    due_date_candidate = str(direct_updates.get("dueDate") or "").strip()
+    request_like = _is_request_like_value(user_message)
+    undecided = _is_undecided_value(user_message)
+    meta_request = _is_meta_conversation_message(user_message)
 
+    logger.info(
+        "turn_type_detection message=%r request_like=%s undecided=%s meta=%s direct_candidates=%s problem_area=%r due_date=%r current_data=%s",
+        user_message,
+        request_like,
+        undecided,
+        meta_request,
+        direct_updates,
+        problem_area_candidate,
+        due_date_candidate,
+        current_data,
+    )
+
+    if meta_request:
+        return "meta_request"
     if _is_summary_request(user_message):
         return "request_summary"
     if _is_fill_remaining_request(user_message, current_data):
         return "request_fill_missing"
+    if due_date_candidate:
+        return "provide_due_date_candidate"
+    if problem_area_candidate:
+        return "provide_problem_area"
     if _should_offer_topic_guidance(current_data, user_message, direct_updates=direct_updates):
-        return "request_refine_topic"
+        return "request_guided_exploration"
     if _extract_title_updates_for_topic_set(state, current_data):
         return "provide_topic"
     if direct_updates:
@@ -1039,6 +1086,16 @@ def _is_help_request(user_message: str) -> bool:
     return any(keyword in normalized for keyword in HELP_REQUEST_KEYWORDS)
 
 
+def _is_request_like_value(user_message: str) -> bool:
+    normalized = _clean_text(user_message)
+    return bool(normalized) and is_request_like_value(normalized)
+
+
+def _is_undecided_value(user_message: str) -> bool:
+    normalized = _clean_text(user_message)
+    return bool(normalized) and is_undecided_value(normalized)
+
+
 def _is_guidance_signal(user_message: str) -> bool:
     normalized = _clean_text(user_message)
     if not normalized:
@@ -1050,7 +1107,9 @@ def _is_meta_conversation_message(user_message: str) -> bool:
     normalized = _clean_text(user_message)
     if not normalized:
         return False
-    return any(pattern.match(normalized) for pattern in META_CONVERSATION_PATTERNS)
+    return is_meta_conversation(normalized) or any(
+        pattern.match(normalized) for pattern in META_CONVERSATION_PATTERNS
+    )
 
 
 def _is_non_storable_freeform_message(user_message: str) -> bool:
@@ -1058,7 +1117,9 @@ def _is_non_storable_freeform_message(user_message: str) -> bool:
     if not normalized:
         return False
     return (
-        looks_like_non_committal_value(normalized)
+        _is_request_like_value(normalized)
+        or _is_undecided_value(normalized)
+        or looks_like_non_committal_value(normalized)
         or _is_guidance_signal(normalized)
         or _is_meta_conversation_message(normalized)
     )
@@ -1082,7 +1143,12 @@ def _should_offer_topic_guidance(
         return False
     if _is_valid_collected_value("goal", current_data.get("goal")):
         return False
-    if not _is_guidance_signal(user_message):
+    if not (
+        _is_guidance_signal(user_message)
+        or _is_undecided_value(user_message)
+        or _is_request_like_value(user_message)
+        or any(keyword in _clean_text(user_message) for keyword in ("모르", "추천", "같이 정", "같이 좁혀"))
+    ):
         return False
     return True
 
@@ -1122,7 +1188,7 @@ def _topic_refinement_options(title: str) -> list[str]:
 
 def _build_topic_refinement_message(current_data: dict[str, object]) -> str:
     topic_anchor = _get_topic_anchor(current_data)
-    options = _topic_refinement_options(topic_anchor)
+    options = [*_topic_refinement_options(topic_anchor), "아직 모르겠어요. 추천이 더 필요해요"]
     option_lines = "\n".join(f"{index}. {option}" for index, option in enumerate(options, start=1))
     return (
         f"좋아요. '{topic_anchor}'까지는 잡혔고 아직 구체 문제는 미정이에요. 같이 좁혀볼게요.\n"
@@ -1158,6 +1224,92 @@ def _looks_like_title_instruction(candidate: str) -> bool:
 def _normalize_direct_fact_value(value: str) -> str:
     normalized = DIRECT_FACT_ENDING_PATTERN.sub("", str(value or "").strip())
     return normalized.strip(" .,!?:;\"'")
+
+
+def _normalize_due_date_candidate(value: str) -> str:
+    candidate = _clean_text(value).replace("/", "-").replace(".", "-")
+    if not candidate:
+        return ""
+    candidate = re.sub(r"\s*쯤$", "", candidate).strip()
+    short_year_match = re.fullmatch(r"(\d{2})년\s*(초|중|말)", candidate)
+    if short_year_match:
+        year = int(short_year_match.group(1))
+        candidate = f"{2000 + year}년 {short_year_match.group(2)}"
+    return candidate
+
+
+def _extract_due_date_candidate_from_message(message: str) -> str:
+    normalized = _clean_text(message)
+    if not normalized:
+        return ""
+
+    explicit_match = DUE_DATE_PATTERN.search(normalized)
+    if explicit_match:
+        return _normalize_due_date_candidate(explicit_match.group(1))
+
+    for pattern in KOREAN_DUE_DATE_CANDIDATE_PATTERNS:
+        match = pattern.search(normalized)
+        if match:
+            return _normalize_due_date_candidate(match.group(1))
+    return ""
+
+
+def _extract_problem_area_candidate(
+    state: AgentState,
+    current_data: dict[str, object] | None = None,
+    *,
+    direct_updates: dict[str, object] | None = None,
+) -> str:
+    current_data = current_data or {}
+    direct_updates = direct_updates or {}
+    topic_anchor = _get_topic_anchor(current_data) or str(
+        direct_updates.get("subject") or direct_updates.get("title") or ""
+    ).strip()
+    if not topic_anchor:
+        return ""
+
+    user_message = _effective_user_message(state)
+    normalized = _clean_text(_strip_mates_mention(user_message))
+    if not normalized:
+        return ""
+
+    choice_candidate = _extract_choice_based_title(state)
+    if choice_candidate:
+        recent_context = "\n".join(str(msg or "") for msg in state.get("recent_messages", [])[-4:])
+        selected_message = str(state.get("selected_message") or "")
+        if "같이 좁혀볼게요" in recent_context or "같이 좁혀볼게요" in selected_message:
+            return choice_candidate
+
+    trimmed = _trim_subject_candidate_clause(normalized)
+    if trimmed == normalized and not _is_guidance_signal(normalized):
+        match = PROBLEM_AREA_PATTERN.search(normalized)
+        if match:
+            trimmed = match.group(1).strip()
+
+    trimmed = _normalize_direct_fact_value(trimmed)
+    if not trimmed:
+        return ""
+    if trimmed == topic_anchor:
+        return ""
+    if _is_non_storable_freeform_message(trimmed):
+        return ""
+    if _looks_like_title_instruction(trimmed):
+        return ""
+    if _extract_due_date_candidate_from_message(trimmed):
+        return ""
+    return trimmed
+
+
+def _build_problem_area_follow_up(topic_anchor: str, problem_area: str) -> str:
+    if any(keyword in _clean_text(topic_anchor) for keyword in ("공공시설", "시설", "도서관", "공원", "주민센터", "버스터미널")):
+        return (
+            f"좋아요. {topic_anchor}의 {problem_area} 문제로 좁혀볼게요. "
+            "어떤 시설을 대상으로 하나요? 예: 도서관, 공원, 주민센터, 버스터미널"
+        )
+    return (
+        f"좋아요. {topic_anchor}에서 '{problem_area}' 방향으로 좁혀볼게요. "
+        "이 문제를 가장 먼저 겪는 대상이나 상황을 한 줄로 말해 주세요."
+    )
 
 
 def _trim_subject_candidate_clause(value: str) -> str:
@@ -1201,6 +1353,9 @@ def _extract_corrected_team_size_from_message(message: str) -> str:
         if match.lastindex and match.lastindex >= 2:
             return match.group(match.lastindex).strip()
         return match.group(1).strip()
+    fallback_counts = re.findall(r"(\d{1,2})\s*명", message)
+    if "아니" in message and fallback_counts:
+        return fallback_counts[-1].strip()
     return ""
 
 
@@ -1212,6 +1367,10 @@ def _extract_team_size_from_message(message: str) -> str:
     explicit_match = TEAM_SIZE_PATTERN.search(message)
     if explicit_match:
         return explicit_match.group(1).strip()
+
+    explicit_fallback = re.search(r"(?:팀원|팀 인원|인원)\s*(?:은|는|이)?\s*(\d{1,2})\s*명", message)
+    if explicit_fallback:
+        return explicit_fallback.group(1).strip()
 
     generic_matches = list(TEAM_SIZE_GENERIC_PATTERN.finditer(message))
     if not generic_matches:
@@ -1273,6 +1432,8 @@ def _normalize_role_token(token: str) -> str:
 
 def _extract_roles_from_message(message: str) -> str:
     role_match = ROLE_PATTERN.search(message)
+    if not role_match:
+        role_match = re.search(r"(?:역할|롤)\s*(?:은|는|:)?\s*(.+)$", message, flags=re.IGNORECASE)
     candidate = role_match.group(1) if role_match else message
     candidate = ROLE_TRAILING_SPLIT_PATTERN.split(candidate, maxsplit=1)[0]
     candidate = re.split(r"[.?!]\s*|다음엔|다음에|그다음", candidate, maxsplit=1)[0]
@@ -1286,6 +1447,14 @@ def _extract_roles_from_message(message: str) -> str:
             continue
         if normalized not in roles:
             roles.append(normalized)
+
+    if not roles and role_match:
+        fallback_tokens = [
+            token.strip(" .,!?:;\"'()[]")
+            for token in re.split(r"\s*(?:,|/|그리고)\s*", role_match.group(1))
+            if token.strip()
+        ]
+        roles = [token for token in fallback_tokens if _looks_like_role_token(token)]
 
     return ", ".join(roles)
 
@@ -1388,7 +1557,7 @@ def _finalize_committed_response(
         if follow_up:
             return follow_up
         return _build_collected_data_summary(merged_data)
-    if turn_type == "request_refine_topic":
+    if turn_type in {"request_refine_topic", "request_guided_exploration"}:
         return _build_topic_refinement_message(merged_data)
     if turn_type == "request_next_step":
         if is_sufficient:
@@ -1428,6 +1597,41 @@ def _looks_like_template_ready_claim(message: str) -> bool:
     return any(keyword in normalized for keyword in template_keywords) and any(
         keyword in normalized for keyword in ready_keywords
     )
+
+
+def _coerce_gather_llm_result(raw_result: object) -> dict[str, object]:
+    if not isinstance(raw_result, dict):
+        return {
+            "intent": "general",
+            "ai_message": "",
+            "updated_data": {},
+            "is_sufficient": False,
+        }
+
+    raw_intent = str(raw_result.get("intent") or "general").strip()
+    if raw_intent not in {
+        "answer_fact",
+        "ask_advice",
+        "ask_idea",
+        "ask_summary",
+        "uncertain",
+        "frustrated",
+        "general",
+    }:
+        raw_intent = "general"
+
+    sanitized_updates = sanitize_llm_updated_data(raw_result.get("updated_data"))
+    logger.info(
+        "gather llm raw_updated_data=%s sanitized_updated_data=%s",
+        raw_result.get("updated_data"),
+        sanitized_updates,
+    )
+    return {
+        "intent": raw_intent,
+        "ai_message": str(raw_result.get("ai_message") or "").strip(),
+        "updated_data": sanitized_updates,
+        "is_sufficient": bool(raw_result.get("is_sufficient", False)),
+    }
 
 
 def _trim_option_description(candidate: str) -> str:
@@ -1538,19 +1742,31 @@ def _extract_direct_fact_updates(user_message: str) -> dict[str, object]:
     if roles:
         updates["roles"] = roles
 
-    due_date_match = DUE_DATE_PATTERN.search(message)
-    if due_date_match:
-        updates["dueDate"] = (
-            due_date_match.group(1).strip().replace("/", "-").replace(".", "-")
-        )
+    due_date_candidate = _extract_due_date_candidate_from_message(message)
+    if due_date_candidate:
+        updates["dueDate"] = due_date_candidate
 
     goal_match = GOAL_PATTERN.search(message)
     if goal_match:
-        updates["goal"] = _normalize_direct_fact_value(goal_match.group(1))
+        goal_candidate = _normalize_direct_fact_value(goal_match.group(1))
+        if goal_candidate and not _is_non_storable_freeform_message(goal_candidate):
+            updates["goal"] = goal_candidate
 
     deliverables_match = DELIVERABLES_PATTERN.search(message)
     if deliverables_match:
-        updates["deliverables"] = _normalize_direct_fact_value(deliverables_match.group(1))
+        deliverables_candidate = _normalize_direct_fact_value(deliverables_match.group(1))
+        if deliverables_candidate and not _is_non_storable_freeform_message(deliverables_candidate):
+            updates["deliverables"] = deliverables_candidate
+
+    logger.info(
+        "direct_fact_candidates message=%r request_like=%s undecided=%s meta=%s due_date_candidate=%r raw_updates=%s",
+        message,
+        _is_request_like_value(message),
+        _is_undecided_value(message),
+        _is_meta_conversation_message(message),
+        due_date_candidate,
+        updates,
+    )
 
     return _sanitize_gather_updates(updates)
 
@@ -1787,7 +2003,10 @@ def topic_exists_node(state: AgentState):
     )
     extracted_subject = accepted_updates.get("subject", "")
     if extracted_subject:
-        if turn_type == "request_refine_topic":
+        if turn_type in {"request_refine_topic", "request_guided_exploration"} or any(
+            checker(user_message)
+            for checker in (_is_guidance_signal, _is_undecided_value, _is_request_like_value)
+        ):
             return {
                 "ai_message": (
                     f"좋아요. 주제 방향은 '{extracted_subject}'로 정리해둘게요. "
@@ -1808,7 +2027,10 @@ def topic_exists_node(state: AgentState):
         }
     extracted_title = accepted_updates.get("title", "")
     if extracted_title:
-        if turn_type == "request_refine_topic":
+        if turn_type in {"request_refine_topic", "request_guided_exploration"} or any(
+            checker(user_message)
+            for checker in (_is_guidance_signal, _is_undecided_value, _is_request_like_value)
+        ):
             return {
                 "ai_message": (
                     f"좋아요. 프로젝트 제목은 '{extracted_title}'로 정리해둘게요. "
@@ -1827,12 +2049,41 @@ def topic_exists_node(state: AgentState):
             "is_sufficient": is_sufficient,
             "next_phase": next_phase,
         }
-    if turn_type in {"request_summary", "request_fill_missing", "request_next_step", "request_refine_topic"}:
+    problem_area_candidate = _extract_problem_area_candidate(
+        state,
+        merged_data or current_data,
+        direct_updates=candidate_updates,
+    )
+    if turn_type == "provide_problem_area" and problem_area_candidate:
+        topic_anchor = _get_topic_anchor(merged_data or current_data)
+        logger.info(
+            "topic_exists problem_area topic=%r problem_area=%r before=%s after=%s",
+            topic_anchor,
+            problem_area_candidate,
+            current_data,
+            merged_data,
+        )
+        return {
+            "ai_message": _build_problem_area_follow_up(topic_anchor, problem_area_candidate),
+            "collected_data": merged_data,
+            "is_sufficient": is_sufficient,
+            "next_phase": next_phase,
+        }
+    if turn_type in {
+        "request_summary",
+        "request_fill_missing",
+        "request_next_step",
+        "request_refine_topic",
+        "request_guided_exploration",
+        "meta_request",
+    }:
         return {
             "ai_message": _apply_turn_policy_to_message(
                 state,
                 _finalize_committed_response(
-                    turn_type=turn_type,
+                    turn_type="request_refine_topic"
+                    if turn_type == "request_guided_exploration"
+                    else turn_type,
                     merged_data=current_data,
                     accepted_updates={},
                     ai_message="",
@@ -1980,7 +2231,7 @@ def gather_information_node(state: AgentState):
             "is_sufficient": is_sufficient,
             "next_phase": next_phase,
         }
-    if turn_type == "request_refine_topic" and not direct_updates:
+    if turn_type in {"request_refine_topic", "request_guided_exploration"} and not direct_updates:
         next_phase = derive_phase_from_collected_data(prefilled_data, current_phase=current_phase)
         is_sufficient = _is_template_ready(prefilled_data)
         logger.info(
@@ -2004,6 +2255,34 @@ def gather_information_node(state: AgentState):
             "is_sufficient": is_sufficient,
             "next_phase": next_phase,
         }
+    if turn_type == "provide_problem_area":
+        problem_area_candidate = _extract_problem_area_candidate(
+            state,
+            prefilled_data,
+            direct_updates=direct_updates,
+        )
+        if problem_area_candidate:
+            next_phase = derive_phase_from_collected_data(prefilled_data, current_phase=current_phase)
+            is_sufficient = _is_template_ready(prefilled_data)
+            logger.info(
+                "gather problem_area topic=%r problem_area=%r before=%s next_phase=%s",
+                _get_topic_anchor(prefilled_data),
+                problem_area_candidate,
+                prefilled_data,
+                next_phase,
+            )
+            return {
+                "ai_message": _apply_turn_policy_to_message(
+                    state,
+                    _build_problem_area_follow_up(
+                        _get_topic_anchor(prefilled_data),
+                        problem_area_candidate,
+                    ),
+                ),
+                "collected_data": raw_current_data,
+                "is_sufficient": is_sufficient,
+                "next_phase": next_phase,
+            }
     if turn_type == "request_next_step" and not direct_updates:
         next_phase = derive_phase_from_collected_data(prefilled_data, current_phase=current_phase)
         is_sufficient = _is_template_ready(prefilled_data)
@@ -2028,6 +2307,15 @@ def gather_information_node(state: AgentState):
             "is_sufficient": is_sufficient,
             "next_phase": next_phase,
         }
+    if turn_type == "meta_request" and not direct_updates:
+        next_phase = derive_phase_from_collected_data(prefilled_data, current_phase=current_phase)
+        is_sufficient = _is_template_ready(prefilled_data)
+        return {
+            "ai_message": _apply_turn_policy_to_message(state, _answer_only_fallback(state, "")),
+            "collected_data": raw_current_data,
+            "is_sufficient": is_sufficient,
+            "next_phase": next_phase,
+        }
     if direct_conflict_message:
         next_phase = derive_phase_from_collected_data(merged_preview, current_phase=current_phase)
         is_sufficient = _is_template_ready(merged_preview)
@@ -2047,7 +2335,11 @@ def gather_information_node(state: AgentState):
             "is_sufficient": is_sufficient,
             "next_phase": next_phase,
         }
-    if direct_updates and (turn_type == "provide_fact" or requested_next_step or turn_type == "request_fill_missing"):
+    if direct_updates and (
+        turn_type in {"provide_fact", "provide_due_date_candidate"}
+        or requested_next_step
+        or turn_type == "request_fill_missing"
+    ):
         next_phase = derive_phase_from_collected_data(merged_preview, current_phase=current_phase)
         is_sufficient = _is_template_ready(merged_preview)
         logger.info(
@@ -2094,6 +2386,9 @@ def gather_information_node(state: AgentState):
     - ai_message must be practical and within 220 characters.
     - Ask at most one short follow-up question only if needed.
     - updated_data stores confirmed facts only.
+    - updated_data must be a partial object. Include only keys confirmed in this turn.
+    - If nothing was newly confirmed, return updated_data as {{}}.
+    - Never fill unknown fields with placeholders such as "...", empty arrays, sample values, or guesses.
     - Never store guesses, questions, complaints, or temporary ideas.
     - Do not say the project is ready for template generation unless all collected data fields are filled with valid values.
     - If fill_remaining_request is true, you may fill empty fields with practical defaults grounded in the topic and recent context. Do not overwrite confirmed values unless the user clearly changes them.
@@ -2153,8 +2448,8 @@ def gather_information_node(state: AgentState):
 
     try:
         raw_result = json.loads(response.content)
-        result = GatherLLMResponse.model_validate(raw_result)
-    except (JSONDecodeError, ValidationError) as exc:
+        result = _coerce_gather_llm_result(raw_result)
+    except JSONDecodeError as exc:
         logger.exception(
             "failed to parse gather_information_node JSON: %s raw_output=%s",
             exc,
@@ -2170,7 +2465,7 @@ def gather_information_node(state: AgentState):
 
     filtered_updates = _filter_gather_updates(
         user_message,
-        result.normalized_updated_data(),
+        result["updated_data"],
         focus_type=focus_type,
     )
     filtered_updates.pop("subject", None)
@@ -2197,7 +2492,7 @@ def gather_information_node(state: AgentState):
         turn_type=turn_type,
         merged_data=merged_data,
         accepted_updates=accepted_updates,
-        ai_message=str(result.ai_message or "").strip(),
+        ai_message=str(result.get("ai_message") or "").strip(),
         is_sufficient=is_sufficient,
     )
     if candidate_conflict_message:
