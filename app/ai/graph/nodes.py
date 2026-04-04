@@ -15,6 +15,7 @@ from app.ai.graph.collected_data import (
     has_role_team_size_conflict,
     is_template_ready as _shared_is_template_ready,
     is_valid_collected_value as _shared_is_valid_collected_value,
+    looks_like_non_committal_value,
     merge_collected_data,
     missing_collected_fields as _shared_missing_collected_fields,
     sanitize_candidate_updates as _shared_sanitize_candidate_updates,
@@ -135,6 +136,10 @@ INITIAL_BUTTON_TOKENS = {
     "주제없음",
 }
 GATHER_FIELD_GUIDE = {
+    "subject": {
+        "label": "프로젝트 주제",
+        "question": "어떤 분야나 문제 영역을 다루는 프로젝트인지 한 줄로 정리하면 무엇인가요?",
+    },
     "title": {
         "label": "프로젝트 제목",
         "question": "프로젝트 제목을 한 줄로 어떻게 정리하면 될까요?",
@@ -177,7 +182,8 @@ UNSUPPORTED_GATHER_TOPICS = {
     },
 }
 GATHER_FOCUS_KEYWORDS = {
-    "title": ("제목", "프로젝트명", "주제"),
+    "subject": ("주제", "분야", "문제 영역", "큰 방향"),
+    "title": ("제목", "프로젝트명", "서비스명", "이름"),
     "goal": ("목표", "무엇을 만들", "최종적으로 만들", "해결하려는 문제"),
     "teamSize": ("몇 명", "팀원", "인원", "팀 규모"),
     "roles": ("역할", "역할 분담", "담당", "누가 맡"),
@@ -198,6 +204,21 @@ HELP_REQUEST_KEYWORDS = (
     "알려",
     "모르겠",
     "도와",
+)
+GUIDANCE_SIGNAL_PATTERNS = (
+    re.compile(r"잘\s*모르겠", re.IGNORECASE),
+    re.compile(r"모르겠", re.IGNORECASE),
+    re.compile(r"도와\s*(?:줘|주세요|주라)?", re.IGNORECASE),
+    re.compile(r"추천해\s*(?:줘|주세요|주라)?", re.IGNORECASE),
+    re.compile(r"정해\s*(?:줘|주세요|주라)?", re.IGNORECASE),
+    re.compile(r"같이\s*(?:정하|골라|좁혀)", re.IGNORECASE),
+    re.compile(r"고민\s*중", re.IGNORECASE),
+    re.compile(r"감이\s*안", re.IGNORECASE),
+    re.compile(r"(?:뭘|뭐를|무엇을|어떤\s*걸?)\s*(?:해야|만들어야|하고\s*싶은지)", re.IGNORECASE),
+)
+META_CONVERSATION_PATTERNS = (
+    re.compile(r"^\s*(?:아니|아니야|아뇨)\b", re.IGNORECASE),
+    re.compile(r"^\s*(?:그게\s+아니라|다시|잠깐)\b", re.IGNORECASE),
 )
 TITLE_INSTRUCTION_KEYWORDS = (
     "넣어",
@@ -260,6 +281,7 @@ DUE_DATE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 GOAL_PATTERN = re.compile(r"(?:목표|goal)\s*(?:은|는|:)?\s*(.+)$", re.IGNORECASE)
+SUBJECT_PATTERN = re.compile(r"(?:주제|subject|topic)\s*(?:은|는|:)?\s*(.+)$", re.IGNORECASE)
 DELIVERABLES_PATTERN = re.compile(
     r"(?:산출물|결과물|제출물|deliverable[s]?)\s*(?:은|는|:)?\s*(.+)$",
     re.IGNORECASE,
@@ -394,7 +416,7 @@ def _is_initial_button_selection(state: AgentState) -> bool:
         current_data = _prune_collected_data(state.get("collected_data") or {})
         if (
             state.get("current_phase") in {"EXPLORE", "TOPIC_SET"}
-            and not _is_meaningful_fact(current_data.get("title"))
+            and not _get_topic_anchor(current_data)
         ):
             return _matches_topic_presence_button_message(message_candidate)
         return False
@@ -459,6 +481,8 @@ def _normalize_topic_title(candidate: str) -> str:
     title = _clean_text(candidate)
     if not title:
         return ""
+    if looks_like_non_committal_value(title):
+        return ""
 
     title = re.sub(
         r"^\s*(?:프로젝트\s*주제|프로젝트명|주제|제목|아이디어)\s*(?:은|는|:)?\s*",
@@ -497,6 +521,8 @@ def _normalize_topic_title(candidate: str) -> str:
         return ""
     if len(title) > 40:
         return ""
+    if looks_like_non_committal_value(title):
+        return ""
     if _looks_like_title_instruction(title):
         return ""
     return title
@@ -532,7 +558,9 @@ def _extract_title_updates_for_topic_set(
     state: AgentState, current_data: dict[str, str] | None = None
 ) -> dict[str, str]:
     current_data = _prune_collected_data(current_data or state.get("collected_data") or {})
-    if _is_meaningful_fact(current_data.get("title")):
+    has_subject = _is_meaningful_fact(current_data.get("subject"))
+    has_title = _is_meaningful_fact(current_data.get("title"))
+    if has_subject and has_title:
         return {}
 
     user_message = _effective_user_message(state)
@@ -540,21 +568,30 @@ def _extract_title_updates_for_topic_set(
         return {}
     if _matches_topic_presence_button_message(user_message):
         return {}
+    if _is_non_storable_freeform_message(user_message):
+        return {}
     if _is_summary_request(user_message) or _is_fill_remaining_request(user_message, current_data):
         return {}
 
     direct_updates = _extract_direct_fact_updates(user_message)
+    if "subject" in direct_updates and not has_subject:
+        return {"subject": direct_updates["subject"]}
     if "title" in direct_updates:
         return {"title": direct_updates["title"]}
 
     choice_title = _extract_choice_based_title(state)
+    if choice_title and not has_subject:
+        return {"subject": choice_title}
     if choice_title:
         return {"title": choice_title}
 
     if _is_capture_title_turn(state) or state.get("current_phase") in {"EXPLORE", "TOPIC_SET"}:
         candidate = _normalize_topic_title(_extract_topic_candidate(user_message))
         if candidate:
-            return {"title": candidate}
+            if not has_subject:
+                return {"subject": candidate}
+            if not has_title:
+                return {"title": candidate}
 
     return {}
 
@@ -584,15 +621,15 @@ def _answer_only_fallback(state: AgentState, message: str) -> str:
 
     user_message = _effective_user_message(state)
     current_data = _prune_collected_data(state.get("collected_data") or {})
-    title = _clean_text(current_data.get("title"))
+    topic_anchor = _get_topic_anchor(current_data)
     requested_focus = _detect_requested_gather_focus(user_message) or _infer_conversation_focus(
         state
     )
 
     if _is_greeting_message(user_message):
-        if title:
+        if topic_anchor:
             return (
-                f"\uc548\ub155\ud558\uc138\uc694. '{title}' \uae30\uc900\uc73c\ub85c "
+                f"\uc548\ub155\ud558\uc138\uc694. '{topic_anchor}' \uae30\uc900\uc73c\ub85c "
                 "\ubaa9\ud45c, \uc5ed\ud560, \uc77c\uc815 \uc911 \ud544\uc694\ud55c \uac83\ubd80\ud130 "
                 "\ubc14\ub85c \uc815\ub9ac\ud574\ub4dc\ub9b4\uac8c\uc694."
             )
@@ -602,18 +639,18 @@ def _answer_only_fallback(state: AgentState, message: str) -> str:
             "\ubc14\ub85c \uc774\uc5b4\uac00\uaca0\uc2b5\ub2c8\ub2e4."
         )
 
-    if title and requested_focus == "goal":
-        return f"'{title}' \uae30\uc900\uc73c\ub85c \ud504\ub85c\uc81d\ud2b8 \ubaa9\ud45c\ubd80\ud130 \uc815\ub9ac\ud574\ubcfc\uac8c\uc694."
-    if title and requested_focus == "roles":
-        return f"'{title}' \uae30\uc900\uc73c\ub85c \ud300 \uc5ed\ud560 \ubd84\ub2f4\ubd80\ud130 \uc815\ub9ac\ud574\ubcfc\uac8c\uc694."
-    if title and requested_focus == "teamSize":
-        return f"'{title}' \uae30\uc900\uc73c\ub85c \ud300 \uc778\uc6d0 \uad6c\uc131\ubd80\ud130 \uc815\ub9ac\ud574\ubcfc\uac8c\uc694."
-    if title and requested_focus == "dueDate":
-        return f"'{title}' \uae30\uc900\uc73c\ub85c \ub9c8\uac10 \uc77c\uc815\ubd80\ud130 \uc815\ub9ac\ud574\ubcfc\uac8c\uc694."
-    if title and requested_focus == "deliverables":
-        return f"'{title}' \uae30\uc900\uc73c\ub85c \uc0b0\ucd9c\ubb3c\ubd80\ud130 \uc815\ub9ac\ud574\ubcfc\uac8c\uc694."
-    if title:
-        return f"'{title}' \uae30\uc900\uc73c\ub85c \ub2e4\uc74c \ud56d\ubaa9\uc744 \uc774\uc5b4\uc11c \uc815\ub9ac\ud574\ubcfc\uac8c\uc694."
+    if topic_anchor and requested_focus == "goal":
+        return f"'{topic_anchor}' \uae30\uc900\uc73c\ub85c \ud504\ub85c\uc81d\ud2b8 \ubaa9\ud45c\ubd80\ud130 \uc815\ub9ac\ud574\ubcfc\uac8c\uc694."
+    if topic_anchor and requested_focus == "roles":
+        return f"'{topic_anchor}' \uae30\uc900\uc73c\ub85c \ud300 \uc5ed\ud560 \ubd84\ub2f4\ubd80\ud130 \uc815\ub9ac\ud574\ubcfc\uac8c\uc694."
+    if topic_anchor and requested_focus == "teamSize":
+        return f"'{topic_anchor}' \uae30\uc900\uc73c\ub85c \ud300 \uc778\uc6d0 \uad6c\uc131\ubd80\ud130 \uc815\ub9ac\ud574\ubcfc\uac8c\uc694."
+    if topic_anchor and requested_focus == "dueDate":
+        return f"'{topic_anchor}' \uae30\uc900\uc73c\ub85c \ub9c8\uac10 \uc77c\uc815\ubd80\ud130 \uc815\ub9ac\ud574\ubcfc\uac8c\uc694."
+    if topic_anchor and requested_focus == "deliverables":
+        return f"'{topic_anchor}' \uae30\uc900\uc73c\ub85c \uc0b0\ucd9c\ubb3c\ubd80\ud130 \uc815\ub9ac\ud574\ubcfc\uac8c\uc694."
+    if topic_anchor:
+        return f"'{topic_anchor}' \uae30\uc900\uc73c\ub85c \ub2e4\uc74c \ud56d\ubaa9\uc744 \uc774\uc5b4\uc11c \uc815\ub9ac\ud574\ubcfc\uac8c\uc694."
 
     phase = state.get("current_phase", "GATHER")
     if phase == "EXPLORE":
@@ -644,7 +681,17 @@ def _should_skip_rag(state: AgentState) -> bool:
 
 def _is_topic_not_set(state: AgentState) -> bool:
     current_data = _prune_collected_data(state.get("collected_data") or {})
-    return not _is_meaningful_fact(current_data.get("title"))
+    return not (
+        _is_meaningful_fact(current_data.get("subject"))
+        or _is_meaningful_fact(current_data.get("title"))
+    )
+
+
+def _get_topic_anchor(current_data: dict[str, object]) -> str:
+    subject = _clean_text(current_data.get("subject"))
+    if subject:
+        return subject
+    return _clean_text(current_data.get("title"))
 
 
 def _should_use_rag(state: AgentState, phase: str, query: str) -> bool:
@@ -838,14 +885,17 @@ def _detect_requested_gather_focus(text: str) -> str | None:
 def _interpret_turn_type(state: AgentState, current_data: dict[str, str] | None = None) -> str:
     current_data = _prune_collected_data(current_data or state.get("collected_data") or {})
     user_message = _effective_user_message(state)
+    direct_updates = _extract_direct_fact_updates(user_message)
 
     if _is_summary_request(user_message):
         return "request_summary"
     if _is_fill_remaining_request(user_message, current_data):
         return "request_fill_missing"
+    if _should_offer_topic_guidance(current_data, user_message, direct_updates=direct_updates):
+        return "request_refine_topic"
     if _extract_title_updates_for_topic_set(state, current_data):
         return "provide_topic"
-    if _extract_direct_fact_updates(user_message):
+    if direct_updates:
         return "provide_fact"
     if _is_next_step_request(user_message) or _is_help_request(user_message) or "템플릿" in _clean_text(user_message):
         return "request_next_step"
@@ -918,6 +968,93 @@ def _build_gather_focus_instruction(focus_type: str | None) -> str:
 def _is_help_request(user_message: str) -> bool:
     normalized = _clean_text(user_message)
     return any(keyword in normalized for keyword in HELP_REQUEST_KEYWORDS)
+
+
+def _is_guidance_signal(user_message: str) -> bool:
+    normalized = _clean_text(user_message)
+    if not normalized:
+        return False
+    return any(pattern.search(normalized) for pattern in GUIDANCE_SIGNAL_PATTERNS)
+
+
+def _is_meta_conversation_message(user_message: str) -> bool:
+    normalized = _clean_text(user_message)
+    if not normalized:
+        return False
+    return any(pattern.match(normalized) for pattern in META_CONVERSATION_PATTERNS)
+
+
+def _is_non_storable_freeform_message(user_message: str) -> bool:
+    normalized = _clean_text(user_message)
+    if not normalized:
+        return False
+    return (
+        looks_like_non_committal_value(normalized)
+        or _is_guidance_signal(normalized)
+        or _is_meta_conversation_message(normalized)
+    )
+
+
+def _should_offer_topic_guidance(
+    current_data: dict[str, object],
+    user_message: str,
+    *,
+    direct_updates: dict[str, object] | None = None,
+) -> bool:
+    topic_anchor = _get_topic_anchor(current_data)
+    if not topic_anchor:
+        return False
+    if direct_updates:
+        return False
+    if _is_valid_collected_value("goal", current_data.get("goal")):
+        return False
+    if not _is_guidance_signal(user_message):
+        return False
+    return True
+
+
+def _topic_refinement_options(title: str) -> list[str]:
+    normalized = _clean_text(title).lower()
+
+    if any(keyword in normalized for keyword in ("공공시설", "시설 이용", "체육시설", "도서관", "공원")):
+        return [
+            "혼잡도 확인",
+            "예약/대기 관리",
+            "운영시간·위치 안내",
+            "불편 신고·접근성 정보",
+        ]
+    if any(keyword in normalized for keyword in ("일정", "스케줄", "팀플", "협업", "과제")):
+        return [
+            "일정 조율",
+            "역할 분담",
+            "마감 리마인드",
+            "진행 상황 공유",
+        ]
+    if any(keyword in normalized for keyword in ("환경", "에너지", "재활용", "탄소")):
+        return [
+            "사용량 시각화",
+            "절감 행동 유도",
+            "분리배출 안내",
+            "이상 징후 알림",
+        ]
+
+    return [
+        "정보 찾기 쉽게 하기",
+        "예약·신청 흐름 줄이기",
+        "불편 접수 빠르게 하기",
+        "개인 맞춤 안내 제공",
+    ]
+
+
+def _build_topic_refinement_message(current_data: dict[str, object]) -> str:
+    topic_anchor = _get_topic_anchor(current_data)
+    options = _topic_refinement_options(topic_anchor)
+    option_lines = "\n".join(f"{index}. {option}" for index, option in enumerate(options, start=1))
+    return (
+        f"좋아요. '{topic_anchor}'까지는 잡혔고 아직 구체 문제는 미정이에요. 같이 좁혀볼게요.\n"
+        f"{option_lines}\n"
+        "번호로 답하거나 더 끌리는 방향을 한 줄로 적어 주세요."
+    )
 
 
 def _looks_like_title_instruction(candidate: str) -> bool:
@@ -1060,6 +1197,7 @@ def _extract_roles_from_message(message: str) -> str:
 def _build_collected_data_summary(current_data: dict[str, object]) -> str:
     normalized = _prune_collected_data(current_data)
     labels = {
+        "subject": "주제",
         "title": "제목",
         "goal": "목표",
         "teamSize": "팀 인원",
@@ -1067,7 +1205,7 @@ def _build_collected_data_summary(current_data: dict[str, object]) -> str:
         "dueDate": "마감일",
         "deliverables": "산출물",
     }
-    ordered_keys = ["title", "goal", "teamSize", "roles", "dueDate", "deliverables"]
+    ordered_keys = ["subject", "title", "goal", "teamSize", "roles", "dueDate", "deliverables"]
 
     confirmed_parts = []
     for key in ordered_keys:
@@ -1077,9 +1215,8 @@ def _build_collected_data_summary(current_data: dict[str, object]) -> str:
         if key == "teamSize":
             value = f"{value}명"
         confirmed_parts.append(f"{labels[key]} {value}")
-    missing_parts = [
-        labels[key] for key in ordered_keys if not _is_valid_collected_value(key, normalized.get(key))
-    ]
+    missing_keys = set(_shared_missing_collected_fields(normalized))
+    missing_parts = [labels[key] for key in ordered_keys if key in missing_keys]
 
     if confirmed_parts and missing_parts:
         return (
@@ -1091,14 +1228,16 @@ def _build_collected_data_summary(current_data: dict[str, object]) -> str:
         )
     if confirmed_parts:
         return "현재까지 확정된 정보는 " + ", ".join(confirmed_parts) + "입니다."
-    return "아직 확정된 정보는 없습니다. 제목, 목표, 팀 인원, 역할 중 하나부터 정리하면 됩니다."
+    return "아직 확정된 정보는 없습니다. 주제, 목표, 팀 인원, 역할 중 하나부터 정리하면 됩니다."
 
 
 def _build_next_missing_field_prompt(current_data: dict[str, object]) -> str:
     normalized = _prune_collected_data(current_data)
-    for key in ("title", "goal", "dueDate", "deliverables", "roles", "teamSize"):
+    for key in ("subject", "goal", "dueDate", "deliverables", "roles", "teamSize", "title"):
         if _is_valid_collected_value(key, normalized.get(key)):
             continue
+        if key == "subject":
+            return "먼저 어떤 분야나 문제를 다루는 프로젝트인지 한 줄로 정해볼까요?"
         if key == "title":
             return "다음으로 프로젝트 제목을 한 줄로 정해볼까요?"
         return GATHER_FIELD_GUIDE[key]["question"]
@@ -1109,6 +1248,8 @@ def _build_fact_confirmation_message(
     merged_data: dict[str, object], accepted_updates: dict[str, object]
 ) -> str:
     confirmations: list[str] = []
+    if "subject" in accepted_updates and merged_data.get("subject"):
+        confirmations.append(f"주제는 '{merged_data['subject']}'")
     if "title" in accepted_updates and merged_data.get("title"):
         confirmations.append(f"제목은 '{merged_data['title']}'")
     if "goal" in accepted_updates and merged_data.get("goal"):
@@ -1151,6 +1292,8 @@ def _finalize_committed_response(
         if follow_up:
             return follow_up
         return _build_collected_data_summary(merged_data)
+    if turn_type == "request_refine_topic":
+        return _build_topic_refinement_message(merged_data)
     if turn_type == "request_next_step":
         if is_sufficient:
             return _build_collected_data_summary(merged_data)
@@ -1273,6 +1416,13 @@ def _extract_direct_fact_updates(user_message: str) -> dict[str, object]:
         if topic_candidate and not _looks_like_title_instruction(topic_candidate):
             updates["title"] = topic_candidate
 
+    subject_match = SUBJECT_PATTERN.search(message)
+    if subject_match:
+        subject = _normalize_direct_fact_value(subject_match.group(1))
+        subject = _normalize_topic_title(subject)
+        if subject:
+            updates["subject"] = subject
+
     team_size = _extract_team_size_from_message(message)
     if team_size:
         updates["teamSize"] = team_size
@@ -1352,9 +1502,9 @@ def _sanitize_gather_updates(updated_data: dict[str, object]) -> dict[str, objec
     for key, value in updated_data.items():
         if isinstance(value, str) and key != "teamSize" and _looks_like_choice_token(value):
             continue
-        if isinstance(value, str) and key in {"title", "goal"} and _looks_like_multi_option_block(value):
+        if isinstance(value, str) and key in {"subject", "title", "goal"} and _looks_like_multi_option_block(value):
             continue
-        if key == "title" and isinstance(value, str):
+        if key in {"subject", "title"} and isinstance(value, str):
             value = _normalize_topic_title(value)
         if isinstance(value, str):
             sanitized[key] = _clean_text(value)
@@ -1369,7 +1519,7 @@ def _filter_gather_updates(
     *,
     focus_type: str | None,
 ) -> dict[str, object]:
-    if _is_help_request(user_message):
+    if _is_guidance_signal(user_message):
         return {}
 
     sanitized = _sanitize_gather_updates(updated_data)
@@ -1528,18 +1678,29 @@ def topic_exists_node(state: AgentState):
         next_phase,
         is_sufficient,
     )
-    extracted_title = accepted_updates.get("title", "")
-    if extracted_title:
+    extracted_subject = accepted_updates.get("subject", "")
+    if extracted_subject:
         return {
             "ai_message": (
-                f"좋아요. 주제는 '{extracted_title}'로 정리해둘게요. "
+                f"좋아요. 주제 방향은 '{extracted_subject}'로 정리해둘게요. "
                 "이 주제로 어떤 문제를 풀고 싶은지, 또는 어떤 결과물을 만들고 싶은지 한두 줄로 말해 주세요."
             ),
             "collected_data": merged_data,
             "is_sufficient": is_sufficient,
             "next_phase": next_phase,
         }
-    if turn_type in {"request_summary", "request_fill_missing", "request_next_step"}:
+    extracted_title = accepted_updates.get("title", "")
+    if extracted_title:
+        return {
+            "ai_message": (
+                f"좋아요. 프로젝트 제목은 '{extracted_title}'로 정리해둘게요. "
+                "이제 이 프로젝트가 해결하려는 문제나 만들 결과물을 한두 줄로 말해 주세요."
+            ),
+            "collected_data": merged_data,
+            "is_sufficient": is_sufficient,
+            "next_phase": next_phase,
+        }
+    if turn_type in {"request_summary", "request_fill_missing", "request_next_step", "request_refine_topic"}:
         return {
             "ai_message": _apply_turn_policy_to_message(
                 state,
@@ -1558,7 +1719,7 @@ def topic_exists_node(state: AgentState):
                 current_phase="TOPIC_SET",
             ),
         }
-    if not _is_meaningful_fact(current_data.get("title")) and user_message:
+    if not _get_topic_anchor(current_data) and user_message:
         return {
             "ai_message": (
                 "주제 후보를 이해하려면 한 줄로 더 구체적으로 적어주셔야 합니다. "
@@ -1631,11 +1792,11 @@ def gather_information_node(state: AgentState):
     direct_updates = {
         key: value
         for key, value in _extract_direct_fact_updates(user_message).items()
-        if key != "title"
+        if key in {"subject", "title", "goal", "teamSize", "roles", "dueDate", "deliverables"}
     }
     direct_conflict_message = _find_role_team_size_conflict(prefilled_data, direct_updates)
     merged_preview = merge_collected_data(prefilled_data, direct_updates)
-    if state.get("current_phase") == "TOPIC_SET" and _is_meaningful_fact(prefilled_data.get("title")):
+    if state.get("current_phase") == "TOPIC_SET" and _get_topic_anchor(prefilled_data):
         focus_type = focus_type or "goal"
     logger.info(
         "gather turn_type=%s user_message=%r before=%s direct_candidates=%s",
@@ -1673,6 +1834,30 @@ def gather_information_node(state: AgentState):
         is_sufficient = _is_template_ready(prefilled_data)
         logger.info(
             "gather fill_missing before=%s next_phase=%s is_sufficient=%s",
+            prefilled_data,
+            next_phase,
+            is_sufficient,
+        )
+        return {
+            "ai_message": _apply_turn_policy_to_message(
+                state,
+                _finalize_committed_response(
+                    turn_type=turn_type,
+                    merged_data=prefilled_data,
+                    accepted_updates={},
+                    ai_message="",
+                    is_sufficient=is_sufficient,
+                ),
+            ),
+            "collected_data": raw_current_data,
+            "is_sufficient": is_sufficient,
+            "next_phase": next_phase,
+        }
+    if turn_type == "request_refine_topic" and not direct_updates:
+        next_phase = derive_phase_from_collected_data(prefilled_data, current_phase=current_phase)
+        is_sufficient = _is_template_ready(prefilled_data)
+        logger.info(
+            "gather refine_topic before=%s next_phase=%s is_sufficient=%s",
             prefilled_data,
             next_phase,
             is_sufficient,
@@ -1861,6 +2046,7 @@ def gather_information_node(state: AgentState):
         result.normalized_updated_data(),
         focus_type=focus_type,
     )
+    filtered_updates.pop("subject", None)
     filtered_updates.pop("title", None)
     candidate_updates = dict(filtered_updates)
     candidate_updates.update(direct_updates)

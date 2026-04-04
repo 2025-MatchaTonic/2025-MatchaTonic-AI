@@ -4,7 +4,8 @@ from app.ai.graph.text_support import clean_text, strip_mates_mention
 
 
 def build_project_snapshot(data: dict) -> dict[str, str]:
-    title = clean_text(data.get("title")) or "프로젝트 제목 미정"
+    subject = clean_text(data.get("subject")) or "프로젝트 주제 미정"
+    title = clean_text(data.get("title")) or subject
     goal = clean_text(data.get("goal")) or "프로젝트 목표는 추가 논의가 필요합니다."
     team_size = format_collected_value("teamSize", data.get("teamSize")) or "팀 규모 미정"
     roles = format_collected_value("roles", data.get("roles")) or "역할 분담 추가 논의 필요"
@@ -12,6 +13,7 @@ def build_project_snapshot(data: dict) -> dict[str, str]:
     deliverables = clean_text(data.get("deliverables")) or "산출물 범위 추가 논의 필요"
 
     return {
+        "subject": subject,
         "title": title,
         "goal": goal,
         "team_size": team_size,
@@ -337,6 +339,7 @@ def build_recent_context(state: AgentState) -> str:
 def build_template_input_summary(state: AgentState) -> str:
     snapshot = build_project_snapshot(state.get("collected_data") or {})
     return (
+        f"- 주제: {snapshot['subject']}\n"
         f"- 제목: {snapshot['title']}\n"
         f"- 목표: {snapshot['goal']}\n"
         f"- 팀 규모: {snapshot['team_size']}\n"

@@ -3,6 +3,7 @@ from typing import Dict, Mapping, TypeAlias
 
 
 COLLECTED_DATA_FIELDS: Dict[str, str] = {
+    "subject": "프로젝트 주제",
     "title": "프로젝트 제목",
     "goal": "프로젝트 목표",
     "teamSize": "팀 인원",
@@ -46,6 +47,20 @@ REQUEST_LIKE_VALUE_KEYWORDS: tuple[str, ...] = (
     "summary",
 )
 
+NON_COMMITTAL_VALUE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^\s*(?:아니|아니야|아뇨)\s*(?:도와(?:줘|주세요)|추천해(?:줘|주세요)|정해(?:줘|주세요))?\s*$"),
+    re.compile(r"^\s*(?:그게\s+아니라|다시|잠깐)\s*$"),
+    re.compile(r"^\s*(?:잘\s*)?모르겠(?:어|어요|네|다)?\s*$"),
+    re.compile(r"^\s*(?:잘\s*)?모르겠.*(?:도와|추천해|정해|같이)\S*\s*$"),
+    re.compile(r"^\s*.*잘\s*모르겠.*(?:도와|추천해|정해|같이)\S*\s*$"),
+    re.compile(r"^\s*도와(?:줘|주세요|주라)\s*$"),
+    re.compile(r"^\s*추천해(?:줘|주세요|주라)\s*$"),
+    re.compile(r"^\s*정해(?:줘|주세요|주라)\s*$"),
+    re.compile(r"^\s*같이\s*(?:정하|해보)\S*\s*$"),
+    re.compile(r"^\s*아직\s*(?:고민\s*중|못\s*정했|미정)\S*\s*$"),
+    re.compile(r"^\s*(?:뭘|뭐를|무엇을|어떤\s*걸?)\s*(?:해야|만들어야|하고\s*싶은지)\s*잘\s*모르겠.*\s*$"),
+)
+
 NEGATIVE_VALUE_KEYWORDS: tuple[str, ...] = (
     "모르겠",
     "모름",
@@ -75,6 +90,18 @@ ROLE_TRAILING_PARTICLE_PATTERN = re.compile(r"(?:으로|로|은|는|이|가)$")
 
 def _clean_string(value: object) -> str:
     return value.strip() if isinstance(value, str) else ""
+
+
+def looks_like_non_committal_value(value: object) -> bool:
+    cleaned = _clean_string(value)
+    if not cleaned:
+        return False
+
+    normalized = cleaned.lower()
+    if any(keyword in normalized for keyword in REQUEST_LIKE_VALUE_KEYWORDS):
+        return True
+
+    return any(pattern.match(cleaned) for pattern in NON_COMMITTAL_VALUE_PATTERNS)
 
 
 def normalize_team_size(value: object) -> int | None:
@@ -289,7 +316,7 @@ def is_valid_collected_value(key: str, value: object, *, team_size: object = Non
         return False
     if any(keyword in normalized for keyword in NEGATIVE_VALUE_KEYWORDS):
         return False
-    if any(keyword in normalized for keyword in REQUEST_LIKE_VALUE_KEYWORDS):
+    if looks_like_non_committal_value(cleaned):
         return False
     if key in {"title", "goal"} and re.fullmatch(r"\d+(?:\.\d+)?", cleaned):
         return False
@@ -347,15 +374,25 @@ def sanitize_candidate_updates(
 
 def missing_collected_fields(data: Mapping[str, object] | None) -> list[str]:
     sanitized = sanitize_collected_data(data)
-    return [
-        key
-        for key in COLLECTED_DATA_FIELDS
+    missing: list[str] = []
+
+    if not (
+        is_valid_collected_value("subject", sanitized.get("subject"))
+        or is_valid_collected_value("title", sanitized.get("title"))
+    ):
+        missing.append("subject")
+
+    for key in COLLECTED_DATA_FIELDS:
+        if key in {"subject", "title"}:
+            continue
         if not is_valid_collected_value(
             key,
             sanitized.get(key),
             team_size=sanitized.get("teamSize"),
-        )
-    ]
+        ):
+            missing.append(key)
+
+    return missing
 
 
 def is_template_ready(data: Mapping[str, object] | None) -> bool:
@@ -365,6 +402,11 @@ def is_template_ready(data: Mapping[str, object] | None) -> bool:
 def has_title(data: Mapping[str, object] | None) -> bool:
     sanitized = sanitize_collected_data(data)
     return is_valid_collected_value("title", sanitized.get("title"))
+
+
+def has_subject(data: Mapping[str, object] | None) -> bool:
+    sanitized = sanitize_collected_data(data)
+    return is_valid_collected_value("subject", sanitized.get("subject"))
 
 
 def has_any_collected_fact(data: Mapping[str, object] | None) -> bool:
@@ -380,9 +422,15 @@ def derive_phase_from_collected_data(
     derived = "EXPLORE"
     if is_template_ready(sanitized):
         derived = "READY"
-    elif has_title(sanitized):
+    elif has_title(sanitized) or (
+        has_subject(sanitized)
+        and any(
+            is_valid_collected_value(key, sanitized.get(key), team_size=sanitized.get("teamSize"))
+            for key in ("goal", "teamSize", "roles", "dueDate", "deliverables")
+        )
+    ):
         derived = "GATHER"
-    elif sanitized:
+    elif has_subject(sanitized) or sanitized:
         derived = "TOPIC_SET"
 
     if derived == "EXPLORE" and current_phase == "TOPIC_SET":
@@ -398,6 +446,7 @@ def build_collected_data_guide() -> str:
 
 def build_collected_data_json_example() -> str:
     lines = [
+        '            "subject": "..."',
         '            "title": "..."',
         '            "goal": "..."',
         '            "teamSize": 4',

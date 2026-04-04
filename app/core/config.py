@@ -29,6 +29,14 @@ def _csv_env(name: str, default: list[str]) -> list[str]:
     return items or default
 
 
+def _str_env(name: str, default: str = "") -> str:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    cleaned = raw.strip()
+    return cleaned or default
+
+
 class Settings:
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
     OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini-2025-08-07")
@@ -50,6 +58,18 @@ class Settings:
     RAG_CHAT_MAX_CONTEXT_CHARS = _int_env("RAG_CHAT_MAX_CONTEXT_CHARS", 1200)
     RAG_QUERY_MIN_CHARS = _int_env("RAG_QUERY_MIN_CHARS", 8)
     AI_RESPONSE_MAX_CHARS = _int_env("AI_RESPONSE_MAX_CHARS", 300)
+    SPRING_API_BASE_URL = _str_env("SPRING_API_BASE_URL")
+    SPRING_SUMMARY_PATH_TEMPLATE = _str_env(
+        "SPRING_SUMMARY_PATH_TEMPLATE",
+        "/api/projects/{project_id}/summary",
+    )
+    SPRING_TIMEOUT_SECONDS = _int_env("SPRING_TIMEOUT_SECONDS", 10)
+    SPRING_AUTH_BEARER_TOKEN = _str_env("SPRING_AUTH_BEARER_TOKEN")
+    SPRING_SUMMARY_SYNC_ENABLED = _bool_env(
+        "SPRING_SUMMARY_SYNC_ENABLED",
+        bool(SPRING_API_BASE_URL),
+    )
+    SPRING_SUMMARY_SYNC_STRICT = _bool_env("SPRING_SUMMARY_SYNC_STRICT", True)
 
 
 settings = Settings()

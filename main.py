@@ -58,9 +58,11 @@ async def validate_runtime_configuration():
         )
 
     logger.info(
-        "AI server startup validated. model=%s cors_origins=%s",
+        "AI server startup validated. model=%s cors_origins=%s spring_sync_enabled=%s spring_base_url=%s",
         settings.OPENAI_MODEL,
         ",".join(cors_allow_origins),
+        settings.SPRING_SUMMARY_SYNC_ENABLED,
+        settings.SPRING_API_BASE_URL or "(disabled)",
     )
 
 
