@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, root_validator
 
+from app.ai.graph.nodes import _matches_topic_presence_button_message
 from app.ai.graph.text_support import (
     strip_mates_mention as _strip_mates_mention,
     truncate_message as _truncate_content,
@@ -105,6 +106,8 @@ def _derive_turn_policy(request: AIChatRequest) -> TurnPolicy:
     if phase == "TOPIC_SET" and not current_title and not effective_message:
         return "ASK_ONLY"
     if phase == "TOPIC_SET" and not current_title and effective_message:
+        if _matches_topic_presence_button_message(effective_message):
+            return "ASK_ONLY"
         return "CAPTURE_TITLE"
     if phase in {"EXPLORE", "TOPIC_SET", "GATHER", "READY"}:
         return "ANSWER_THEN_ASK"
