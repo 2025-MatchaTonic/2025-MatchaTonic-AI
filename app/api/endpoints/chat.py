@@ -3,7 +3,7 @@ import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, root_validator
 
 from app.ai.graph.nodes import _matches_topic_presence_button_message
@@ -15,7 +15,6 @@ from app.ai.graph.collected_data import CollectedData, derive_phase_from_collect
 from app.ai.graph.state import TurnPolicy
 from app.ai.graph.workflow import ai_app
 from app.api.schemas.template import NotionTemplatePayload
-from app.core.config import settings
 from app.core.request_normalization import (
     normalize_action_type,
     normalize_collected_data,
@@ -23,7 +22,6 @@ from app.core.request_normalization import (
     normalize_phase,
     normalize_string_list,
 )
-from app.core.spring_summary import SpringSummarySyncError, sync_project_summary
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -83,20 +81,6 @@ class AIChatResponse(BaseModel):
     notionTemplatePayload: Optional[NotionTemplatePayload] = None
 
 
-def _summarize_authorization_header(value: str | None) -> str:
-    if not value:
-        return "missing"
-    cleaned = value.strip()
-    if not cleaned:
-        return "missing"
-    if cleaned.lower().startswith("bearer "):
-        token = cleaned[7:].strip()
-        if not token:
-            return "bearer-empty"
-        return f"bearer-present(len={len(token)},prefix={token[:8]})"
-    return f"present(prefix={cleaned[:12]})"
-
-
 def _derive_effective_phase(request: AIChatRequest) -> str:
     return derive_phase_from_collected_data(
         request.collectedData,
@@ -134,18 +118,16 @@ def _derive_turn_policy(request: AIChatRequest) -> TurnPolicy:
 
 
 @router.post("/", response_model=AIChatResponse)
-async def process_chat(request: AIChatRequest, http_request: Request):
+async def process_chat(request: AIChatRequest):
     try:
         effective_phase = _derive_effective_phase(request)
-        authorization_header = http_request.headers.get("Authorization")
         logger.info(
-            "chat request room=%s project_id=%s action=%s current_status=%s effective_phase=%s auth=%s content=%r collected_data=%s recent_count=%d selected_message=%r",
+            "chat request room=%s project_id=%s action=%s current_status=%s effective_phase=%s content=%r collected_data=%s recent_count=%d selected_message=%r",
             request.roomId,
             request.roomId,
             request.actionType,
             request.currentStatus,
             effective_phase,
-            _summarize_authorization_header(authorization_header),
             request.content,
             request.collectedData,
             len(request.recentMessages),
@@ -178,20 +160,6 @@ async def process_chat(request: AIChatRequest, http_request: Request):
             result.get("ai_message", ""),
         )
 
-        try:
-            sync_project_summary(
-                request.roomId,
-                response_collected_data,
-                authorization=authorization_header,
-            )
-        except SpringSummarySyncError as exc:
-            if settings.SPRING_SUMMARY_SYNC_STRICT:
-                raise HTTPException(
-                    status_code=502,
-                    detail="Spring summary sync failed.",
-                ) from exc
-            logger.exception("Spring summary sync failed but strict mode is off: %s", exc)
-
         return AIChatResponse(
             content=_truncate_content(result.get("ai_message", "")),
             suggestedQuestions=[],
@@ -200,9 +168,6 @@ async def process_chat(request: AIChatRequest, http_request: Request):
             collectedData=response_collected_data,
             notionTemplatePayload=result.get("template_payload"),
         )
-
-    except HTTPException:
-        raise
     except Exception as exc:
         logger.exception("AI chat processing failed: %s", exc)
         raise HTTPException(status_code=500, detail="AI 처리 중 오류 발생")
