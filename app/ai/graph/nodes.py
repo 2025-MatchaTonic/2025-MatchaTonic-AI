@@ -1000,6 +1000,7 @@ def _interpret_turn_type(
     direct_updates = dict(direct_updates or _extract_direct_fact_updates(user_message))
     current_subject = str(current_data.get("subject") or "").strip()
     broad_subject = subject_needs_problem_definition(current_subject)
+    target_facility_candidate = _extract_target_facility_candidate(state, current_data)
     problem_area_candidate = _extract_problem_area_candidate(
         state,
         current_data,
@@ -1011,12 +1012,13 @@ def _interpret_turn_type(
     meta_request = _is_meta_conversation_message(user_message)
 
     logger.info(
-        "turn_type_detection message=%r request_like=%s undecided=%s meta=%s direct_candidates=%s problem_area=%r due_date=%r broad_subject=%s current_data=%s",
+        "turn_type_detection message=%r request_like=%s undecided=%s meta=%s direct_candidates=%s target_facility=%r problem_area=%r due_date=%r broad_subject=%s current_data=%s",
         user_message,
         request_like,
         undecided,
         meta_request,
         direct_updates,
+        target_facility_candidate,
         problem_area_candidate,
         due_date_candidate,
         broad_subject,
@@ -1031,6 +1033,8 @@ def _interpret_turn_type(
         return "request_fill_missing"
     if due_date_candidate:
         return "provide_due_date_candidate"
+    if target_facility_candidate:
+        return "provide_target_facility"
     if problem_area_candidate and (current_phase := str(state.get("current_phase") or "")) == "PROBLEM_DEFINE":
         return "provide_problem_area"
     if problem_area_candidate and broad_subject:
@@ -1330,12 +1334,19 @@ def _recent_message_blocks(state: AgentState) -> list[str]:
 
 
 def _get_recent_problem_area_from_context(state: AgentState) -> str:
-    for block in _recent_message_blocks(state):
-        for pattern in PROBLEM_AREA_CONTEXT_PATTERNS:
-            match = pattern.search(block)
-            if not match:
-                continue
-            return _normalize_direct_fact_value(match.group(2))
+    recent_messages = [
+        _clean_text(MATES_MENTION_PATTERN.sub(" ", str(msg or "")))
+        for msg in state.get("recent_messages", [])
+        if _clean_text(MATES_MENTION_PATTERN.sub(" ", str(msg or "")))
+    ]
+    if not recent_messages:
+        return ""
+    latest_block = recent_messages[-1]
+    for pattern in PROBLEM_AREA_CONTEXT_PATTERNS:
+        match = pattern.search(latest_block)
+        if not match:
+            continue
+        return _normalize_direct_fact_value(match.group(2))
     return ""
 
 
@@ -1435,6 +1446,9 @@ def _extract_problem_area_candidate(
     trimmed = _normalize_direct_fact_value(trimmed)
     if not trimmed:
         return ""
+    compact = re.sub(r"\s+", "", trimmed)
+    if len(compact) <= 10 and TARGET_FACILITY_NOUN_PATTERN.search(trimmed):
+        return ""
     if trimmed == topic_anchor:
         return ""
     if _is_non_storable_freeform_message(trimmed):
@@ -1461,8 +1475,8 @@ def _build_problem_area_follow_up(topic_anchor: str, problem_area: str) -> str:
 def _build_target_facility_follow_up(topic_anchor: str, problem_area: str, target_facility: str) -> str:
     if problem_area:
         return (
-            f"좋아요. {topic_anchor} 중 {target_facility}를 대상으로 보고, "
-            f"'{problem_area}' 문제를 더 구체화해볼게요. 이용자가 가장 불편한 순간은 언제인가요? "
+            f"좋아요. {topic_anchor}의 {problem_area} 문제를 {target_facility} 기준으로 볼게요. "
+            "이용자가 가장 불편한 순간은 언제인가요? "
             "예: 빈자리 확인, 예약 절차, 운영시간 찾기"
         )
     return (
@@ -2398,7 +2412,7 @@ def gather_information_node(state: AgentState):
         target_facility_candidate,
         recent_problem_area,
     )
-    if target_facility_candidate:
+    if turn_type == "provide_target_facility" and target_facility_candidate:
         next_phase = "GATHER"
         is_sufficient = _is_template_ready(prefilled_data)
         logger.info(
