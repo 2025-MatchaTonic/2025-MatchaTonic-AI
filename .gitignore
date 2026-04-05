@@ -7,4 +7,4 @@ __pycache__/
 .Python
 docs/
 scripts/
-tests/test_spring_summary_sync.py
+tests/
