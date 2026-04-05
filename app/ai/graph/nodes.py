@@ -316,6 +316,9 @@ KOREAN_DUE_DATE_CANDIDATE_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 PROBLEM_AREA_PATTERN = re.compile(r"(.+?)(?:하는\s*문제|문제|쪽|관점|방향)(?:로|을|를)?(?:\s|$)")
 TARGET_FACILITY_PROMPT_PATTERN = re.compile(r"어떤\s+시설을\s+대상으로\s+하나요")
+TARGET_FACILITY_NOUN_PATTERN = re.compile(
+    r"(도서관|공원|주민센터|버스터미널|체육관|체육시설|복지관|주차장|공공화장실|박물관|미술관|학교|강의실|병원|보건소)"
+)
 PROBLEM_AREA_CONTEXT_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"좋아요\.\s*(.+?)의\s+(.+?)\s+문제로\s+좁혀볼게요"),
     re.compile(r"좋아요\.\s*(.+?)에서\s+'(.+?)'\s+방향으로\s+좁혀볼게요"),
@@ -1337,7 +1340,11 @@ def _get_recent_problem_area_from_context(state: AgentState) -> str:
 
 
 def _is_awaiting_target_facility(state: AgentState) -> bool:
-    return any(TARGET_FACILITY_PROMPT_PATTERN.search(block) for block in _recent_message_blocks(state))
+    blocks = _recent_message_blocks(state)
+    if not blocks:
+        return False
+    latest_block = blocks[0]
+    return bool(TARGET_FACILITY_PROMPT_PATTERN.search(latest_block))
 
 
 def _extract_target_facility_candidate(
@@ -1374,6 +1381,13 @@ def _extract_target_facility_candidate(
 
     candidate = _normalize_direct_fact_value(candidate).strip(" '\"")
     if not candidate:
+        return ""
+    compact = re.sub(r"\s+", "", candidate)
+    if len(compact) > 12:
+        return ""
+    if any(token in candidate for token in ("문제", "관리", "개선", "효율", "혼잡", "예약", "접근성", "안내")):
+        return ""
+    if not TARGET_FACILITY_NOUN_PATTERN.search(candidate):
         return ""
     if candidate == _get_topic_anchor(current_data):
         return ""

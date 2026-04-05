@@ -17,9 +17,7 @@ from app.ai.services.template_generation import generate_dev_template, generate_
 
 def _has_title(state: AgentState) -> bool:
     current_data = _prune_collected_data(state.get("collected_data") or {})
-    return _is_meaningful_fact(current_data.get("subject")) or _is_meaningful_fact(
-        current_data.get("title")
-    )
+    return _is_meaningful_fact(current_data.get("title"))
 
 
 def _has_any_collected_fact(state: AgentState) -> bool:
