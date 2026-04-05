@@ -629,6 +629,21 @@ def derive_phase_from_collected_data(
 
     if derived == "EXPLORE" and current_phase == "TOPIC_SET":
         return "TOPIC_SET"
+    if (
+        derived == "PROBLEM_DEFINE"
+        and current_phase in {"GATHER", "READY"}
+        and has_subject(sanitized)
+        and not has_title(sanitized)
+        and not any(
+            is_valid_collected_value(
+                key,
+                sanitized.get(key),
+                team_size=sanitized.get("teamSize"),
+            )
+            for key in ("goal", "teamSize", "roles", "dueDate", "deliverables")
+        )
+    ):
+        return "PROBLEM_DEFINE"
     if PHASE_ORDER.get(derived, 0) >= PHASE_ORDER.get(current_phase, 0):
         return derived
     return current_phase
