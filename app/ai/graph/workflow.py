@@ -72,6 +72,8 @@ def route_logic(state: AgentState):
             if _has_title(state):
                 return "gather_node"
             return "topic_exists_node"
+        if phase == "PROBLEM_DEFINE":
+            return "gather_node"
         if phase in ["GATHER", "READY"]:
             return "gather_node"
 
