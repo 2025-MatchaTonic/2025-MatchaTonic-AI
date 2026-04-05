@@ -119,6 +119,8 @@ def _derive_turn_policy(request: AIChatRequest) -> TurnPolicy:
         return "ANSWER_ONLY"
     if action != "CHAT":
         return "ANSWER_ONLY"
+    if effective_message and _matches_topic_presence_button_message(effective_message):
+        return "ASK_ONLY"
 
     if phase == "TOPIC_SET" and not current_topic and not effective_message:
         return "ASK_ONLY"

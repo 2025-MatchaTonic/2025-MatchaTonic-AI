@@ -414,6 +414,27 @@ def _matches_topic_presence_button_message(message: object) -> bool:
     )
 
 
+def _is_topic_presence_negative_message(message: object) -> bool:
+    normalized = _normalize_button_token(message)
+    if normalized in {"아니오", "아니요", "노", "n", "no"}:
+        return True
+
+    cleaned = _clean_text(message).lower()
+    if not cleaned:
+        return False
+
+    return any(
+        phrase in cleaned
+        for phrase in (
+            "주제가 없습니다",
+            "주제 없습니다",
+            "정해진 주제가 없습니다",
+            "아직 주제가 없습니다",
+            "주제는 아직 없습니다",
+        )
+    )
+
+
 def _matches_initial_button_message(action: str, message: object) -> bool:
     normalized = _normalize_button_token(message)
     if not normalized:
@@ -442,13 +463,7 @@ def _is_initial_button_selection(state: AgentState) -> bool:
     )
 
     if action == "CHAT":
-        current_data = _prune_collected_data(state.get("collected_data") or {})
-        if (
-            state.get("current_phase") in {"EXPLORE", "TOPIC_SET"}
-            and not _get_topic_anchor(current_data)
-        ):
-            return _matches_topic_presence_button_message(message_candidate)
-        return False
+        return _matches_topic_presence_button_message(message_candidate)
 
     if action not in {"BTN_NO", "BTN_YES", "BTN_GO_DEF"}:
         return False
@@ -457,6 +472,31 @@ def _is_initial_button_selection(state: AgentState) -> bool:
         return True
 
     return _matches_initial_button_message(action, message_candidate)
+
+
+def _build_initial_button_reset_response(state: AgentState) -> dict[str, object]:
+    message_candidate = _clean_text(state.get("user_message")) or _clean_text(
+        state.get("selected_message")
+    )
+    is_negative = state.get("action_type") == "BTN_NO" or _is_topic_presence_negative_message(
+        message_candidate
+    )
+    next_phase = "EXPLORE" if is_negative else "TOPIC_SET"
+    ai_message = FAST_EXPLORE_REPLY if is_negative else FAST_TOPIC_EXISTS_REPLY
+    logger.info(
+        "initial_button_reset action=%s current_phase=%s message=%r stale_collected_data=%s next_phase=%s",
+        state.get("action_type"),
+        state.get("current_phase"),
+        message_candidate,
+        state.get("collected_data") or {},
+        next_phase,
+    )
+    return {
+        "ai_message": _apply_turn_policy_to_message(state, ai_message),
+        "collected_data": {},
+        "is_sufficient": False,
+        "next_phase": next_phase,
+    }
 
 
 def _get_turn_policy(state: AgentState) -> TurnPolicy:
@@ -1427,6 +1467,8 @@ def _extract_problem_area_candidate(
     normalized = _clean_text(_strip_mates_mention(user_message))
     if not normalized:
         return ""
+    if _matches_topic_presence_button_message(normalized):
+        return ""
     if _extract_target_facility_candidate(state, current_data):
         return ""
 
@@ -2065,12 +2107,7 @@ def explore_problem_node(state: AgentState):
     is_sufficient = _is_template_ready(current_data)
 
     if _is_initial_button_selection(state):
-        return {
-            "ai_message": FAST_EXPLORE_REPLY,
-            "collected_data": raw_current_data,
-            "is_sufficient": is_sufficient,
-            "next_phase": "EXPLORE",
-        }
+        return _build_initial_button_reset_response(state)
 
     if latest_intent == "greeting":
         return {
@@ -2160,12 +2197,7 @@ def explore_problem_node(state: AgentState):
 # ----------------------------------------------------
 def topic_exists_node(state: AgentState):
     if _is_initial_button_selection(state):
-        return {
-            "ai_message": FAST_TOPIC_EXISTS_REPLY,
-            "collected_data": dict(state.get("collected_data") or {}),
-            "is_sufficient": False,
-            "next_phase": "TOPIC_SET",
-        }
+        return _build_initial_button_reset_response(state)
 
     user_message = _effective_user_message(state)
     raw_current_data = dict(state.get("collected_data") or {})
@@ -2382,6 +2414,9 @@ def topic_exists_node(state: AgentState):
 # 2. 아이디어가 있을 때 (YES 선택) : 정보 수집 노드 (자연스러운 HMW)
 # ----------------------------------------------------
 def gather_information_node(state: AgentState):
+    if _is_initial_button_selection(state):
+        return _build_initial_button_reset_response(state)
+
     user_message = _effective_user_message(state)
     turn_policy = _get_turn_policy(state)
     current_phase = str(state.get("current_phase") or "")
