@@ -17,9 +17,36 @@ CollectedData: TypeAlias = Dict[str, CollectedDataValue]
 PHASE_ORDER = {
     "EXPLORE": 0,
     "TOPIC_SET": 1,
-    "GATHER": 2,
-    "READY": 3,
+    "PROBLEM_DEFINE": 2,
+    "GATHER": 3,
+    "READY": 4,
 }
+
+SUBJECT_CONCRETE_KEYWORDS: tuple[str, ...] = (
+    "서비스",
+    "시스템",
+    "플랫폼",
+    "앱",
+    "웹",
+    "예약",
+    "혼잡",
+    "접근성",
+    "개선",
+    "관리",
+    "안내",
+    "분석",
+    "추천",
+    "예측",
+    "효율화",
+    "정보",
+    "해결",
+)
+SUBJECT_CONCRETE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r".+를\s+위한\s+.+"),
+    re.compile(r".+문제\s*해결"),
+    re.compile(r".+개선"),
+    re.compile(r".+안내\s*(?:서비스|시스템|앱|웹)?"),
+)
 
 REQUEST_LIKE_VALUE_KEYWORDS: tuple[str, ...] = (
     "요약해줘",
@@ -546,6 +573,26 @@ def has_subject(data: Mapping[str, object] | None) -> bool:
     return is_valid_collected_value("subject", sanitized.get("subject"))
 
 
+def subject_needs_problem_definition(subject: object) -> bool:
+    cleaned = _clean_string(subject)
+    if not cleaned:
+        return False
+
+    normalized = re.sub(r"\s+", " ", cleaned).strip()
+    lowered = normalized.lower()
+
+    if any(keyword in lowered for keyword in SUBJECT_CONCRETE_KEYWORDS):
+        return False
+    if any(pattern.search(normalized) for pattern in SUBJECT_CONCRETE_PATTERNS):
+        return False
+
+    parts = [part for part in normalized.split(" ") if part]
+    if len(parts) <= 2 and len(normalized) <= 12:
+        return True
+
+    return not any(token in normalized for token in ("문제", "기능", "대상", "사용자", "프로젝트"))
+
+
 def has_any_collected_fact(data: Mapping[str, object] | None) -> bool:
     return bool(sanitize_collected_data(data))
 
@@ -556,18 +603,28 @@ def derive_phase_from_collected_data(
     current_phase: str = "EXPLORE",
 ) -> str:
     sanitized = sanitize_collected_data(data)
+    subject = sanitized.get("subject")
     derived = "EXPLORE"
     if is_template_ready(sanitized):
         derived = "READY"
-    elif has_title(sanitized) or (
-        has_subject(sanitized)
-        and any(
-            is_valid_collected_value(key, sanitized.get(key), team_size=sanitized.get("teamSize"))
+    elif has_title(sanitized):
+        derived = "GATHER"
+    elif has_subject(sanitized):
+        has_execution_fact = any(
+            is_valid_collected_value(
+                key,
+                sanitized.get(key),
+                team_size=sanitized.get("teamSize"),
+            )
             for key in ("goal", "teamSize", "roles", "dueDate", "deliverables")
         )
-    ):
-        derived = "GATHER"
-    elif has_subject(sanitized) or sanitized:
+        if has_execution_fact:
+            derived = "GATHER"
+        elif subject_needs_problem_definition(subject):
+            derived = "PROBLEM_DEFINE"
+        else:
+            derived = "GATHER"
+    elif sanitized:
         derived = "TOPIC_SET"
 
     if derived == "EXPLORE" and current_phase == "TOPIC_SET":

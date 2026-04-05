@@ -32,21 +32,35 @@ class AIChatRequest(BaseModel):
     content: str = ""
     actionType: str = "CHAT"
     currentStatus: str = "EXPLORE"
+    rawCollectedData: Dict[str, Any] = Field(default_factory=dict, exclude=True)
     collectedData: CollectedData = Field(default_factory=dict)
     recentMessages: List[str] = Field(default_factory=list)
     selectedMessage: Optional[str] = None
     selectedAnswers: List[str] = Field(default_factory=list)
 
     @root_validator(pre=True)
-    def normalize_spring_compatible_payload(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+    def normalize_spring_compatible_payload(
+        cls, values: Dict[str, Any]
+    ) -> Dict[str, Any]:
         payload = dict(values or {})
 
         if payload.get("roomId") is None and payload.get("projectId") is not None:
             payload["roomId"] = payload["projectId"]
 
-        payload["actionType"] = normalize_action_type(payload.get("actionType"), default="CHAT")
-        payload["currentStatus"] = normalize_phase(payload.get("currentStatus"), default="EXPLORE")
-        payload["collectedData"] = normalize_collected_data(payload.get("collectedData"))
+        raw_collected_data = payload.get("collectedData")
+        payload["rawCollectedData"] = (
+            dict(raw_collected_data) if isinstance(raw_collected_data, dict) else {}
+        )
+
+        payload["actionType"] = normalize_action_type(
+            payload.get("actionType"), default="CHAT"
+        )
+        payload["currentStatus"] = normalize_phase(
+            payload.get("currentStatus"), default="EXPLORE"
+        )
+        payload["collectedData"] = normalize_collected_data(
+            payload.get("collectedData")
+        )
 
         selected_answers = normalize_string_list(payload.get("selectedAnswers"))
         payload["selectedAnswers"] = selected_answers
@@ -112,7 +126,7 @@ def _derive_turn_policy(request: AIChatRequest) -> TurnPolicy:
         if _matches_topic_presence_button_message(effective_message):
             return "ASK_ONLY"
         return "CAPTURE_TITLE"
-    if phase in {"EXPLORE", "TOPIC_SET", "GATHER", "READY"}:
+    if phase in {"EXPLORE", "TOPIC_SET", "PROBLEM_DEFINE", "GATHER", "READY"}:
         return "ANSWER_THEN_ASK"
     return "ANSWER_ONLY"
 
@@ -122,13 +136,15 @@ async def process_chat(request: AIChatRequest):
     try:
         effective_phase = _derive_effective_phase(request)
         logger.info(
-            "chat request room=%s project_id=%s action=%s current_status=%s effective_phase=%s content=%r collected_data=%s recent_count=%d selected_message=%r",
+            "chat request room=%s project_id=%s action=%s current_status=%s effective_phase=%s content=%r raw_collected_keys=%s normalized_collected_keys=%s collected_data=%s recent_count=%d selected_message=%r",
             request.roomId,
             request.roomId,
             request.actionType,
             request.currentStatus,
             effective_phase,
             request.content,
+            sorted(request.rawCollectedData.keys()),
+            sorted(request.collectedData.keys()),
             request.collectedData,
             len(request.recentMessages),
             request.selectedMessage,

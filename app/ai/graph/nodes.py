@@ -24,6 +24,7 @@ from app.ai.graph.collected_data import (
     sanitize_llm_updated_data,
     sanitize_candidate_updates as _shared_sanitize_candidate_updates,
     sanitize_collected_data as _shared_sanitize_collected_data,
+    subject_needs_problem_definition,
 )
 from app.ai.graph.llm_clients import (
     conversation_llm,
@@ -95,6 +96,11 @@ SUMMARY_REQUEST_KEYWORDS = (
     "정리해줘",
     "정리해 줘",
     "지금 모인 정보",
+    "확정된 사항",
+    "확정된 정보",
+    "정리된 상황",
+    "정해진 사항",
+    "현재 확정",
     "현재까지",
     "세션 요약",
 )
@@ -644,7 +650,10 @@ def _postprocess_explicit_title_value(candidate: str) -> str:
 
 
 def _extract_title_updates_for_topic_set(
-    state: AgentState, current_data: dict[str, str] | None = None
+    state: AgentState,
+    current_data: dict[str, str] | None = None,
+    *,
+    direct_updates: dict[str, object] | None = None,
 ) -> dict[str, str]:
     current_data = _prune_collected_data(current_data or state.get("collected_data") or {})
     has_subject = _is_meaningful_fact(current_data.get("subject"))
@@ -658,7 +667,7 @@ def _extract_title_updates_for_topic_set(
     if _matches_topic_presence_button_message(user_message):
         return {}
 
-    direct_updates = _extract_direct_fact_updates(user_message)
+    direct_updates = dict(direct_updates or _extract_direct_fact_updates(user_message))
     if "subject" in direct_updates and not has_subject:
         return {"subject": direct_updates["subject"]}
     if "title" in direct_updates:
@@ -977,10 +986,17 @@ def _detect_requested_gather_focus(text: str) -> str | None:
     return matched_focus if matched_index >= 0 else None
 
 
-def _interpret_turn_type(state: AgentState, current_data: dict[str, str] | None = None) -> str:
+def _interpret_turn_type(
+    state: AgentState,
+    current_data: dict[str, str] | None = None,
+    *,
+    direct_updates: dict[str, object] | None = None,
+) -> str:
     current_data = _prune_collected_data(current_data or state.get("collected_data") or {})
     user_message = _effective_user_message(state)
-    direct_updates = _extract_direct_fact_updates(user_message)
+    direct_updates = dict(direct_updates or _extract_direct_fact_updates(user_message))
+    current_subject = str(current_data.get("subject") or "").strip()
+    broad_subject = subject_needs_problem_definition(current_subject)
     problem_area_candidate = _extract_problem_area_candidate(
         state,
         current_data,
@@ -992,7 +1008,7 @@ def _interpret_turn_type(state: AgentState, current_data: dict[str, str] | None 
     meta_request = _is_meta_conversation_message(user_message)
 
     logger.info(
-        "turn_type_detection message=%r request_like=%s undecided=%s meta=%s direct_candidates=%s problem_area=%r due_date=%r current_data=%s",
+        "turn_type_detection message=%r request_like=%s undecided=%s meta=%s direct_candidates=%s problem_area=%r due_date=%r broad_subject=%s current_data=%s",
         user_message,
         request_like,
         undecided,
@@ -1000,6 +1016,7 @@ def _interpret_turn_type(state: AgentState, current_data: dict[str, str] | None 
         direct_updates,
         problem_area_candidate,
         due_date_candidate,
+        broad_subject,
         current_data,
     )
 
@@ -1011,11 +1028,15 @@ def _interpret_turn_type(state: AgentState, current_data: dict[str, str] | None 
         return "request_fill_missing"
     if due_date_candidate:
         return "provide_due_date_candidate"
+    if problem_area_candidate and (current_phase := str(state.get("current_phase") or "")) == "PROBLEM_DEFINE":
+        return "provide_problem_area"
+    if problem_area_candidate and broad_subject:
+        return "provide_problem_area"
     if problem_area_candidate:
         return "provide_problem_area"
     if _should_offer_topic_guidance(current_data, user_message, direct_updates=direct_updates):
         return "request_guided_exploration"
-    if _extract_title_updates_for_topic_set(state, current_data):
+    if _extract_title_updates_for_topic_set(state, current_data, direct_updates=direct_updates):
         return "provide_topic"
     if direct_updates:
         return "provide_fact"
@@ -1201,6 +1222,34 @@ def _build_topic_refinement_message(current_data: dict[str, object]) -> str:
         f"{option_lines}\n"
         "번호로 답하거나 더 끌리는 방향을 한 줄로 적어 주세요."
     )
+
+
+def _build_problem_definition_prompt(subject: str) -> str:
+    return (
+        f"좋아요. 주제 방향은 '{subject}'로 정리해둘게요. "
+        "이제 이 안에서 어떤 문제를 해결하고 싶은지만 정하면 됩니다. "
+        "예: 예약 불편, 혼잡도, 접근성 정보 부족"
+    )
+
+
+def _refine_subject_from_problem_area(subject: str, problem_area: str) -> str:
+    base_subject = _clean_text(subject)
+    area = _clean_text(problem_area)
+    if not base_subject or not area:
+        return ""
+    if not subject_needs_problem_definition(base_subject):
+        return base_subject
+
+    heuristic_candidate = f"{base_subject} {area}"
+    lowered_area = area.lower()
+    if "예약" in lowered_area and any(token in lowered_area for token in ("불편", "절차", "대기", "신청", "효율")):
+        heuristic_candidate = f"{base_subject} 예약 효율화"
+    elif "혼잡" in lowered_area:
+        heuristic_candidate = f"{base_subject} 혼잡도 안내"
+    elif "접근성" in lowered_area:
+        heuristic_candidate = f"{base_subject} 접근성 개선"
+
+    return _normalize_topic_title_with_llm(heuristic_candidate, field_name="subject")
 
 
 def _looks_like_title_instruction(candidate: str) -> bool:
@@ -1594,11 +1643,18 @@ def _build_collected_data_summary(current_data: dict[str, object]) -> str:
 
 def _build_next_missing_field_prompt(current_data: dict[str, object]) -> str:
     normalized = _prune_collected_data(current_data)
-    for key in ("subject", "goal", "dueDate", "deliverables", "roles", "teamSize", "title"):
+    subject = str(normalized.get("subject") or "").strip()
+    if not subject:
+        return "먼저 어떤 분야나 문제를 다루는 프로젝트인지 한 줄로 정해볼까요?"
+    if subject_needs_problem_definition(subject):
+        return (
+            f"좋아요. '{subject}' 쪽으로 갈게요. "
+            "이 안에서 어떤 문제를 해결하고 싶은지 한 줄로 말해 주세요."
+        )
+
+    for key in ("goal", "dueDate", "deliverables", "roles", "teamSize", "title"):
         if _is_valid_collected_value(key, normalized.get(key)):
             continue
-        if key == "subject":
-            return "먼저 어떤 분야나 문제를 다루는 프로젝트인지 한 줄로 정해볼까요?"
         if key == "title":
             return "다음으로 프로젝트 제목을 한 줄로 정해볼까요?"
         return GATHER_FIELD_GUIDE[key]["question"]
@@ -1654,6 +1710,11 @@ def _finalize_committed_response(
             return follow_up
         return _build_collected_data_summary(merged_data)
     if turn_type in {"request_refine_topic", "request_guided_exploration"}:
+        subject = str(merged_data.get("subject") or "").strip()
+        if subject and not subject_needs_problem_definition(subject):
+            follow_up = _build_next_missing_field_prompt(merged_data)
+            if follow_up:
+                return follow_up
         return _build_topic_refinement_message(merged_data)
     if turn_type == "request_next_step":
         if is_sufficient:
@@ -2081,8 +2142,13 @@ def topic_exists_node(state: AgentState):
     user_message = _effective_user_message(state)
     raw_current_data = dict(state.get("collected_data") or {})
     current_data = _prune_collected_data(raw_current_data)
-    turn_type = _interpret_turn_type(state, current_data)
-    candidate_updates = _extract_title_updates_for_topic_set(state, current_data)
+    direct_updates = _extract_direct_fact_updates(user_message)
+    turn_type = _interpret_turn_type(state, current_data, direct_updates=direct_updates)
+    candidate_updates = _extract_title_updates_for_topic_set(
+        state,
+        current_data,
+        direct_updates=direct_updates,
+    )
     merged_data = merge_collected_data(current_data, candidate_updates)
     accepted_updates = {
         key: value for key, value in merged_data.items() if current_data.get(key) != value
@@ -2101,10 +2167,12 @@ def topic_exists_node(state: AgentState):
     )
     extracted_subject = accepted_updates.get("subject", "")
     if extracted_subject:
-        if turn_type in {"request_refine_topic", "request_guided_exploration"} or any(
+        broad_subject = subject_needs_problem_definition(extracted_subject)
+        wants_guidance = turn_type in {"request_refine_topic", "request_guided_exploration"} or any(
             checker(user_message)
             for checker in (_is_guidance_signal, _is_undecided_value, _is_request_like_value)
-        ):
+        )
+        if broad_subject and wants_guidance:
             return {
                 "ai_message": (
                     f"좋아요. 주제 방향은 '{extracted_subject}'로 정리해둘게요. "
@@ -2114,10 +2182,17 @@ def topic_exists_node(state: AgentState):
                 "is_sufficient": is_sufficient,
                 "next_phase": next_phase,
             }
+        if broad_subject:
+            return {
+                "ai_message": _build_problem_definition_prompt(extracted_subject),
+                "collected_data": merged_data,
+                "is_sufficient": is_sufficient,
+                "next_phase": next_phase,
+            }
         return {
             "ai_message": (
-                f"좋아요. 주제 방향은 '{extracted_subject}'로 정리해둘게요. "
-                "이 주제로 어떤 문제를 풀고 싶은지, 또는 어떤 결과물을 만들고 싶은지 한두 줄로 말해 주세요."
+                f"좋아요. 주제는 '{extracted_subject}'로 정리할게요. "
+                "이제 목표나 결과물을 한두 줄로 말해 주세요."
             ),
             "collected_data": merged_data,
             "is_sufficient": is_sufficient,
@@ -2154,6 +2229,30 @@ def topic_exists_node(state: AgentState):
     )
     if turn_type == "provide_problem_area" and problem_area_candidate:
         topic_anchor = _get_topic_anchor(merged_data or current_data)
+        if topic_anchor and subject_needs_problem_definition(topic_anchor):
+            refined_subject = _refine_subject_from_problem_area(topic_anchor, problem_area_candidate)
+            if refined_subject:
+                refined_data = merge_collected_data(merged_data, {"subject": refined_subject})
+                refined_phase = derive_phase_from_collected_data(
+                    refined_data,
+                    current_phase="PROBLEM_DEFINE",
+                )
+                logger.info(
+                    "topic_exists refined_subject before=%s problem_area=%r after=%s next_phase=%s",
+                    current_data,
+                    problem_area_candidate,
+                    refined_data,
+                    refined_phase,
+                )
+                return {
+                    "ai_message": (
+                        f"좋아요. {refined_subject}로 정리할게요. "
+                        "이 프로젝트 목표를 한두 줄로 말해 주세요."
+                    ),
+                    "collected_data": refined_data,
+                    "is_sufficient": _is_template_ready(refined_data),
+                    "next_phase": refined_phase,
+                }
         logger.info(
             "topic_exists problem_area topic=%r problem_area=%r before=%s after=%s",
             topic_anchor,
@@ -2262,7 +2361,6 @@ def gather_information_node(state: AgentState):
     current_data = _prune_collected_data(raw_current_data)
     prefilled_data = dict(current_data)
     was_ready = _is_template_ready(current_data)
-    turn_type = _interpret_turn_type(state, current_data)
     requested_next_step = _is_next_step_request(user_message)
     focus_type = _infer_conversation_focus(state)
     direct_updates = {
@@ -2270,11 +2368,12 @@ def gather_information_node(state: AgentState):
         for key, value in _extract_direct_fact_updates(user_message).items()
         if key in {"subject", "title", "goal", "teamSize", "roles", "dueDate", "deliverables"}
     }
+    turn_type = _interpret_turn_type(state, current_data, direct_updates=direct_updates)
     target_facility_candidate = _extract_target_facility_candidate(state, prefilled_data)
     recent_problem_area = _get_recent_problem_area_from_context(state)
     direct_conflict_message = _find_role_team_size_conflict(prefilled_data, direct_updates)
     merged_preview = merge_collected_data(prefilled_data, direct_updates)
-    if state.get("current_phase") == "TOPIC_SET" and _get_topic_anchor(prefilled_data):
+    if state.get("current_phase") in {"TOPIC_SET", "PROBLEM_DEFINE"} and _get_topic_anchor(prefilled_data):
         focus_type = focus_type or "goal"
     logger.info(
         "gather turn_type=%s user_message=%r before=%s direct_candidates=%s target_facility=%r recent_problem_area=%r",
@@ -2388,11 +2487,46 @@ def gather_information_node(state: AgentState):
             direct_updates=direct_updates,
         )
         if problem_area_candidate:
+            topic_anchor = _get_topic_anchor(prefilled_data)
+            if (
+                current_phase == "PROBLEM_DEFINE"
+                and topic_anchor
+                and subject_needs_problem_definition(topic_anchor)
+            ):
+                refined_subject = _refine_subject_from_problem_area(topic_anchor, problem_area_candidate)
+                if refined_subject and (
+                    refined_subject == topic_anchor
+                    or topic_anchor in refined_subject
+                    or any(token in refined_subject for token in problem_area_candidate.split())
+                ):
+                    refined_data = merge_collected_data(prefilled_data, {"subject": refined_subject})
+                    next_phase = derive_phase_from_collected_data(
+                        refined_data,
+                        current_phase="PROBLEM_DEFINE",
+                    )
+                    is_sufficient = _is_template_ready(refined_data)
+                    logger.info(
+                        "gather refined_subject topic=%r problem_area=%r before=%s after=%s next_phase=%s",
+                        topic_anchor,
+                        problem_area_candidate,
+                        prefilled_data,
+                        refined_data,
+                        next_phase,
+                    )
+                    return {
+                        "ai_message": _apply_turn_policy_to_message(
+                            state,
+                            f"좋아요. {refined_subject}로 정리할게요. 이 프로젝트 목표를 한두 줄로 말해 주세요.",
+                        ),
+                        "collected_data": refined_data,
+                        "is_sufficient": is_sufficient,
+                        "next_phase": next_phase,
+                    }
             next_phase = derive_phase_from_collected_data(prefilled_data, current_phase=current_phase)
             is_sufficient = _is_template_ready(prefilled_data)
             logger.info(
                 "gather problem_area topic=%r problem_area=%r before=%s next_phase=%s",
-                _get_topic_anchor(prefilled_data),
+                topic_anchor,
                 problem_area_candidate,
                 prefilled_data,
                 next_phase,
