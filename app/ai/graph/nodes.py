@@ -7,9 +7,13 @@ from json import JSONDecodeError
 from time import perf_counter
 
 from app.ai.graph.collected_data import (
+    FIELD_POLICY,
+    CandidateDecision,
     build_collected_data_json_example,
     build_role_team_size_conflict_message,
+    classify_role_team_size_conflict,
     derive_phase_from_collected_data,
+    evaluate_candidate_update,
     format_collected_value,
     has_role_team_size_conflict,
     is_template_ready as _shared_is_template_ready,
@@ -699,11 +703,6 @@ def _extract_title_updates_for_topic_set(
     direct_updates: dict[str, object] | None = None,
 ) -> dict[str, str]:
     current_data = _prune_collected_data(current_data or state.get("collected_data") or {})
-    has_subject = _is_meaningful_fact(current_data.get("subject"))
-    has_title = _is_meaningful_fact(current_data.get("title"))
-    if has_subject and has_title:
-        return {}
-
     user_message = _effective_user_message(state)
     if not user_message:
         return {}
@@ -711,6 +710,18 @@ def _extract_title_updates_for_topic_set(
         return {}
 
     direct_updates = dict(direct_updates or _extract_direct_fact_updates(user_message))
+    fresh_topic_candidate = _extract_fresh_topic_submission_candidate(
+        state,
+        current_data,
+        direct_updates=direct_updates,
+    )
+    if fresh_topic_candidate:
+        return {"subject": fresh_topic_candidate}
+
+    has_subject = _is_meaningful_fact(current_data.get("subject"))
+    has_title = _is_meaningful_fact(current_data.get("title"))
+    if has_subject and has_title:
+        return {}
     if "subject" in direct_updates and not has_subject:
         return {"subject": direct_updates["subject"]}
     if "title" in direct_updates:
@@ -743,12 +754,85 @@ def _extract_title_updates_for_topic_set(
     return {}
 
 
+def _extract_fresh_topic_submission_candidate(
+    state: AgentState,
+    current_data: dict[str, object] | None = None,
+    *,
+    direct_updates: dict[str, object] | None = None,
+) -> str:
+    current_data = _prune_collected_data(current_data or state.get("collected_data") or {})
+    current_anchor = _get_topic_anchor(current_data)
+    if not current_anchor:
+        return ""
+
+    if str(state.get("current_phase") or "") not in {"TOPIC_SET", "PROBLEM_DEFINE"}:
+        return ""
+
+    user_message = _effective_user_message(state)
+    normalized_message = _clean_text(user_message)
+    if not normalized_message:
+        return ""
+    if _is_non_storable_freeform_message(normalized_message):
+        return ""
+    if _is_summary_request(normalized_message) or _is_fill_remaining_request(normalized_message, current_data):
+        return ""
+    if _extract_choice_based_title(state):
+        return ""
+    if _is_awaiting_target_facility(state):
+        return ""
+
+    direct_updates = dict(direct_updates or {})
+    explicit_topic_candidate = str(
+        direct_updates.get("subject") or direct_updates.get("title") or ""
+    ).strip()
+    heuristic_candidate = _normalize_topic_title(_extract_topic_candidate(normalized_message))
+    candidate = explicit_topic_candidate or heuristic_candidate
+    if not candidate:
+        return ""
+    if candidate == current_anchor:
+        return ""
+
+    if explicit_topic_candidate:
+        return candidate
+
+    compact_candidate = re.sub(r"\s+", "", candidate)
+    if len(compact_candidate) < 8 and len(candidate.split()) < 2:
+        return ""
+
+    return _normalize_topic_title_with_llm(candidate, field_name="subject")
+
+
 def _looks_like_question_line(text: str) -> bool:
     cleaned = str(text or "").strip()
     if not cleaned:
         return False
     candidate = cleaned.lstrip("-*0123456789. ").strip()
     return bool(QUESTION_LINE_ENDING_PATTERN.search(candidate))
+
+
+def _looks_like_open_question(text: str) -> bool:
+    cleaned = _clean_text(text)
+    if not cleaned:
+        return False
+    lowered = cleaned.lower()
+    if "?" in lowered:
+        return True
+    return bool(
+        re.search(
+            r"(?:무엇|뭐|뭘|어떻게|어떤|왜|언제|누가).*(?:하지|할지|할까|해야\s*하지|해야\s*할지|좋을까|좋을지|아니었나)\s*$",
+            lowered,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _has_structured_fact_updates(direct_updates: dict[str, object] | None) -> bool:
+    if not direct_updates:
+        return False
+    return any(
+        key in direct_updates
+        for key in ("goal", "teamSize", "roles", "dueDate", "deliverables")
+    )
 
 
 def _trim_trailing_question_lines(message: str) -> str:
@@ -1071,6 +1155,8 @@ def _interpret_turn_type(
         return "request_summary"
     if _is_fill_remaining_request(user_message, current_data):
         return "request_fill_missing"
+    if _has_structured_fact_updates(direct_updates):
+        return "provide_fact"
     if due_date_candidate:
         return "provide_due_date_candidate"
     if target_facility_candidate:
@@ -1196,6 +1282,8 @@ def _is_non_storable_freeform_message(user_message: str) -> bool:
         or looks_like_non_committal_value(normalized)
         or _is_guidance_signal(normalized)
         or _is_meta_conversation_message(normalized)
+        or _looks_like_question_line(normalized)
+        or _looks_like_open_question(normalized)
     )
 
 
@@ -1467,9 +1555,16 @@ def _extract_problem_area_candidate(
     normalized = _clean_text(_strip_mates_mention(user_message))
     if not normalized:
         return ""
+    if _has_structured_fact_updates(direct_updates):
+        return ""
     if _matches_topic_presence_button_message(normalized):
         return ""
     if _extract_target_facility_candidate(state, current_data):
+        return ""
+    requested_focus = _detect_requested_gather_focus(normalized)
+    if requested_focus in {"goal", "teamSize", "roles", "dueDate", "deliverables"}:
+        return ""
+    if _looks_like_question_line(normalized):
         return ""
 
     choice_candidate = _extract_choice_based_title(state)
@@ -1802,17 +1897,226 @@ def _finalize_committed_response(
     return ai_message
 
 
+SOURCE_BASE_WEIGHTS = {
+    "direct_structured": 3,
+    "direct_heuristic": 2,
+    "llm": 2,
+}
+
+
+def _serialize_decision(decision: CandidateDecision) -> dict[str, object]:
+    return {
+        "approved": decision.approved,
+        "normalized_value": decision.normalized_value,
+        "reason": decision.reason,
+        "overwrite_mode": decision.overwrite_mode,
+        "source": decision.source,
+        "requires_followup_question": decision.requires_followup_question,
+        "conflict_severity": decision.conflict_severity,
+    }
+
+
+def _source_weight_for_field(key: str, source: str) -> int:
+    weight = SOURCE_BASE_WEIGHTS.get(source, 1)
+    policy = FIELD_POLICY.get(key, {})
+    source_bias = str(policy.get("source_bias") or "mixed")
+
+    if source_bias == "structured":
+        if source == "direct_structured":
+            weight += 2
+        elif source == "direct_heuristic":
+            weight += 1
+        elif source == "llm":
+            weight -= 1
+    elif source_bias == "context":
+        if source == "llm":
+            weight += 2
+        elif source == "direct_heuristic":
+            weight += 1
+    elif source_bias == "mixed":
+        if source in {"direct_structured", "llm"}:
+            weight += 1
+
+    return weight
+
+
+def _candidate_score(
+    *,
+    key: str,
+    source: str,
+    value: object,
+    user_message: str,
+    current_data: dict[str, object],
+) -> tuple[int, int, int]:
+    overwrite_mode = evaluate_candidate_update(
+        key=key,
+        current_value=current_data.get(key),
+        incoming_value=value,
+        source=source,
+        user_message=user_message,
+        current_phase="",
+        current_data=current_data,
+        candidate_updates={key: value},
+    ).overwrite_mode
+    overwrite_rank = {"NONE": 0, "STRONG_RESTATEMENT": 1, "EXPLICIT": 2}.get(overwrite_mode, 0)
+    shape_bonus = 1 if key in {"teamSize", "roles", "dueDate"} else 0
+    return (_source_weight_for_field(key, source), overwrite_rank, shape_bonus)
+
+
+def _merge_candidate_sources(
+    *,
+    current_data: dict[str, object],
+    user_message: str,
+    direct_updates: dict[str, object],
+    llm_updates: dict[str, object],
+) -> tuple[dict[str, dict[str, object]], dict[str, object]]:
+    merged_sources: dict[str, dict[str, object]] = {}
+
+    for key, value in direct_updates.items():
+        merged_sources[key] = {"value": value, "source": "direct_structured"}
+
+    for key, value in llm_updates.items():
+        candidate = {"value": value, "source": "llm"}
+        existing = merged_sources.get(key)
+        if existing is None:
+            merged_sources[key] = candidate
+            continue
+        if _candidate_score(
+            key=key,
+            source=candidate["source"],
+            value=candidate["value"],
+            user_message=user_message,
+            current_data=current_data,
+        ) > _candidate_score(
+            key=key,
+            source=str(existing["source"]),
+            value=existing["value"],
+            user_message=user_message,
+            current_data=current_data,
+        ):
+            merged_sources[key] = candidate
+
+    merged_values = {
+        key: payload["value"]
+        for key, payload in merged_sources.items()
+    }
+    return merged_sources, merged_values
+
+
+def _evaluate_candidate_updates(
+    *,
+    current_data: dict[str, object],
+    candidate_sources: dict[str, dict[str, object]],
+    candidate_updates: dict[str, object],
+    user_message: str,
+    current_phase: str,
+) -> tuple[
+    dict[str, object],
+    dict[str, object],
+    dict[str, str],
+    dict[str, CandidateDecision],
+    list[str],
+]:
+    approved_updates: dict[str, object] = {}
+    rejected_updates: dict[str, object] = {}
+    rejected_reasons: dict[str, str] = {}
+    decisions: dict[str, CandidateDecision] = {}
+    followup_fields: list[str] = []
+
+    for key, incoming_value in candidate_updates.items():
+        source = str(candidate_sources.get(key, {}).get("source") or "unknown")
+        decision = evaluate_candidate_update(
+            key=key,
+            current_value=current_data.get(key),
+            incoming_value=incoming_value,
+            source=source,
+            user_message=user_message,
+            current_phase=current_phase,
+            current_data=current_data,
+            candidate_updates=candidate_updates,
+        )
+        decisions[key] = decision
+        if decision.approved and decision.normalized_value is not None:
+            approved_updates[key] = decision.normalized_value
+        else:
+            rejected_updates[key] = incoming_value
+            rejected_reasons[key] = decision.reason
+
+        if decision.requires_followup_question and key not in followup_fields:
+            followup_fields.append(key)
+
+    return approved_updates, rejected_updates, rejected_reasons, decisions, followup_fields
+
+
+def _log_collected_data_trace(
+    state: AgentState,
+    *,
+    raw_collected_data: dict[str, object],
+    normalized_collected_data: dict[str, object],
+    direct_updates_raw: dict[str, object],
+    llm_updates_raw: dict[str, object],
+    candidate_updates_merged: dict[str, object],
+    approved_updates: dict[str, object],
+    rejected_updates: dict[str, object],
+    rejected_reasons: dict[str, str],
+    decisions: dict[str, CandidateDecision] | None = None,
+) -> None:
+    base = {
+        "project_id": state.get("project_id"),
+        "phase": state.get("current_phase"),
+        "action_type": state.get("action_type"),
+    }
+    payloads = [
+        ("raw_collected_data", raw_collected_data),
+        ("normalized_collected_data", normalized_collected_data),
+        ("direct_updates_raw", direct_updates_raw),
+        ("llm_updates_raw", llm_updates_raw),
+        ("candidate_updates_merged", candidate_updates_merged),
+        ("approved_updates", approved_updates),
+        ("rejected_updates", rejected_updates),
+        ("rejected_reasons", rejected_reasons),
+    ]
+    if decisions is not None:
+        payloads.append(
+            (
+                "candidate_decisions",
+                {key: _serialize_decision(value) for key, value in decisions.items()},
+            ),
+        )
+
+    for label, payload in payloads:
+        logger.info(
+            "%s\n%s",
+            label,
+            json.dumps({**base, "data": payload}, ensure_ascii=False, indent=2),
+        )
+
+
 def _find_role_team_size_conflict(
     current_data: dict[str, object],
     candidate_updates: dict[str, object],
 ) -> str:
     effective_team_size = candidate_updates.get("teamSize", current_data.get("teamSize"))
-    if not has_role_team_size_conflict(candidate_updates.get("roles"), effective_team_size):
+    if classify_role_team_size_conflict(candidate_updates.get("roles"), effective_team_size).value == "NONE":
         return ""
     return build_role_team_size_conflict_message(
         candidate_updates.get("roles"),
         effective_team_size,
     )
+
+
+def _decision_conflict_message(
+    current_data: dict[str, object],
+    candidate_updates: dict[str, object],
+    decisions: dict[str, CandidateDecision],
+) -> str:
+    if not any(
+        decision.conflict_severity != "NONE" for decision in decisions.values()
+    ):
+        return ""
+    effective_roles = candidate_updates.get("roles", current_data.get("roles"))
+    effective_team_size = candidate_updates.get("teamSize", current_data.get("teamSize"))
+    return build_role_team_size_conflict_message(effective_roles, effective_team_size)
 
 
 def _looks_like_template_ready_claim(message: str) -> bool:
@@ -1831,6 +2135,7 @@ def _coerce_gather_llm_result(raw_result: object) -> dict[str, object]:
         return {
             "intent": "general",
             "ai_message": "",
+            "raw_updated_data": {},
             "updated_data": {},
             "is_sufficient": False,
         }
@@ -1847,15 +2152,14 @@ def _coerce_gather_llm_result(raw_result: object) -> dict[str, object]:
     }:
         raw_intent = "general"
 
-    sanitized_updates = sanitize_llm_updated_data(raw_result.get("updated_data"))
-    logger.info(
-        "gather llm raw_updated_data=%s sanitized_updated_data=%s",
-        raw_result.get("updated_data"),
-        sanitized_updates,
-    )
+    raw_updates = raw_result.get("updated_data")
+    if not isinstance(raw_updates, dict):
+        raw_updates = {}
+    sanitized_updates = sanitize_llm_updated_data(raw_updates)
     return {
         "intent": raw_intent,
         "ai_message": str(raw_result.get("ai_message") or "").strip(),
+        "raw_updated_data": raw_updates,
         "updated_data": sanitized_updates,
         "is_sufficient": bool(raw_result.get("is_sufficient", False)),
     }
@@ -2092,6 +2396,57 @@ def _build_topic_exists_fallback_message() -> str:
     return FAST_TOPIC_EXISTS_REPLY
 
 
+def _build_topic_debug_payload(
+    *,
+    raw_user_message: object,
+    sanitized_user_message: str,
+    raw_current_data: dict[str, object],
+    current_data: dict[str, object],
+    direct_updates: dict[str, object],
+    candidate_updates: dict[str, object],
+    merged_data: dict[str, object],
+) -> dict[str, object]:
+    current_candidates = {
+        key: str(raw_current_data.get(key) or "").strip()
+        for key in ("subject", "title")
+        if str(raw_current_data.get(key) or "").strip()
+    }
+    blocked_candidates = [
+        {
+            "source": f"collected_data.{key}",
+            "value": str(raw_current_data.get(key) or "").strip(),
+        }
+        for key in ("subject", "title")
+        if str(raw_current_data.get(key) or "").strip() and not str(current_data.get(key) or "").strip()
+    ]
+    latest_message_candidate = _extract_topic_candidate(sanitized_user_message)
+
+    return {
+        "raw_user_message": str(raw_user_message or ""),
+        "sanitized_user_message": sanitized_user_message,
+        "topic_candidates_by_source": {
+            "latest_user_message": latest_message_candidate,
+            "direct_updates": {
+                key: direct_updates.get(key)
+                for key in ("subject", "title")
+                if direct_updates.get(key)
+            },
+            "candidate_updates": {
+                key: candidate_updates.get(key)
+                for key in ("subject", "title")
+                if candidate_updates.get(key)
+            },
+            "current_collected_data": current_candidates,
+        },
+        "blocked_candidates": blocked_candidates,
+        "final_merged_topic_title": {
+            key: merged_data.get(key)
+            for key in ("subject", "title")
+            if merged_data.get(key)
+        },
+    }
+
+
 # ----------------------------------------------------
 # 1. 아이디어가 없을 때 (NO 선택) : 탐색 노드
 def explore_problem_node(state: AgentState):
@@ -2202,28 +2557,88 @@ def topic_exists_node(state: AgentState):
     user_message = _effective_user_message(state)
     raw_current_data = dict(state.get("collected_data") or {})
     current_data = _prune_collected_data(raw_current_data)
-    direct_updates = _extract_direct_fact_updates(user_message)
-    turn_type = _interpret_turn_type(state, current_data, direct_updates=direct_updates)
-    candidate_updates = _extract_title_updates_for_topic_set(
+    direct_updates_raw = _extract_direct_fact_updates(user_message)
+    turn_type = _interpret_turn_type(state, current_data, direct_updates=direct_updates_raw)
+    fresh_topic_candidate = _extract_fresh_topic_submission_candidate(
         state,
         current_data,
-        direct_updates=direct_updates,
+        direct_updates=direct_updates_raw,
     )
-    merged_data = merge_collected_data(current_data, candidate_updates)
+    topic_candidates_raw = _extract_title_updates_for_topic_set(
+        state,
+        current_data,
+        direct_updates=direct_updates_raw,
+    )
+    direct_updates_raw = {
+        key: value
+        for key, value in topic_candidates_raw.items()
+        if key in {"subject", "title"}
+    }
+    llm_updates_raw: dict[str, object] = {}
+    candidate_sources, candidate_updates_merged = _merge_candidate_sources(
+        current_data=current_data,
+        user_message=user_message,
+        direct_updates=_shared_sanitize_candidate_updates(
+            direct_updates_raw,
+            current_data=current_data,
+        ),
+        llm_updates={},
+    )
+    approved_updates, rejected_updates, rejected_reasons, decisions, followup_fields = (
+        _evaluate_candidate_updates(
+            current_data=current_data,
+            candidate_sources=candidate_sources,
+            candidate_updates=candidate_updates_merged,
+            user_message=user_message,
+            current_phase="TOPIC_SET",
+        )
+    )
+    merged_data = merge_collected_data(current_data, approved_updates)
+    if (
+        fresh_topic_candidate
+        and approved_updates.get("subject") == fresh_topic_candidate
+        and current_data.get("title")
+        and not approved_updates.get("title")
+    ):
+        merged_data.pop("title", None)
     accepted_updates = {
         key: value for key, value in merged_data.items() if current_data.get(key) != value
     }
     next_phase = derive_phase_from_collected_data(merged_data, current_phase="TOPIC_SET")
     is_sufficient = _is_template_ready(merged_data)
+    topic_debug_payload = _build_topic_debug_payload(
+        raw_user_message=state.get("user_message"),
+        sanitized_user_message=user_message,
+        raw_current_data=raw_current_data,
+        current_data=current_data,
+        direct_updates=direct_updates_raw,
+        candidate_updates=candidate_updates_merged,
+        merged_data=merged_data,
+    )
     logger.info(
-        "topic_exists turn_type=%s user_message=%r before=%s candidates=%s after=%s next_phase=%s is_sufficient=%s",
+        "topic_exists turn_type=%s user_message=%r before=%s candidates=%s approved=%s rejected=%s after=%s next_phase=%s is_sufficient=%s",
         turn_type,
         user_message,
         current_data,
-        candidate_updates,
+        candidate_updates_merged,
+        approved_updates,
+        rejected_updates,
         merged_data,
         next_phase,
         is_sufficient,
+    )
+    logger.info("topic_resolution %s", topic_debug_payload)
+    _log_collected_data_trace(
+        state,
+        raw_collected_data=raw_current_data,
+        normalized_collected_data=current_data,
+        direct_updates_raw=direct_updates_raw,
+        llm_updates_raw=llm_updates_raw,
+        candidate_updates_merged=candidate_updates_merged,
+        approved_updates=approved_updates,
+        rejected_updates=rejected_updates,
+        rejected_reasons=rejected_reasons,
+        decisions=decisions,
     )
     extracted_subject = accepted_updates.get("subject", "")
     if extracted_subject:
@@ -2285,7 +2700,7 @@ def topic_exists_node(state: AgentState):
     problem_area_candidate = _extract_problem_area_candidate(
         state,
         merged_data or current_data,
-        direct_updates=candidate_updates,
+        direct_updates=candidate_updates_merged,
     )
     if turn_type == "provide_problem_area" and problem_area_candidate:
         topic_anchor = _get_topic_anchor(merged_data or current_data)
@@ -2426,24 +2841,54 @@ def gather_information_node(state: AgentState):
     was_ready = _is_template_ready(current_data)
     requested_next_step = _is_next_step_request(user_message)
     focus_type = _infer_conversation_focus(state)
-    direct_updates = {
+    direct_updates_raw = {
         key: value
         for key, value in _extract_direct_fact_updates(user_message).items()
         if key in {"subject", "title", "goal", "teamSize", "roles", "dueDate", "deliverables"}
     }
-    turn_type = _interpret_turn_type(state, current_data, direct_updates=direct_updates)
+    direct_updates = _shared_sanitize_candidate_updates(
+        direct_updates_raw,
+        current_data=prefilled_data,
+    )
+    direct_candidate_sources, direct_candidate_updates = _merge_candidate_sources(
+        current_data=prefilled_data,
+        user_message=user_message,
+        direct_updates=direct_updates,
+        llm_updates={},
+    )
+    (
+        direct_approved_updates,
+        direct_rejected_updates,
+        direct_rejected_reasons,
+        direct_decisions,
+        direct_followup_fields,
+    ) = _evaluate_candidate_updates(
+        current_data=prefilled_data,
+        candidate_sources=direct_candidate_sources,
+        candidate_updates=direct_candidate_updates,
+        user_message=user_message,
+        current_phase=current_phase,
+    )
+    turn_type = _interpret_turn_type(state, current_data, direct_updates=direct_updates_raw)
     target_facility_candidate = _extract_target_facility_candidate(state, prefilled_data)
     recent_problem_area = _get_recent_problem_area_from_context(state)
-    direct_conflict_message = _find_role_team_size_conflict(prefilled_data, direct_updates)
-    merged_preview = merge_collected_data(prefilled_data, direct_updates)
+    direct_conflict_message = _decision_conflict_message(
+        prefilled_data,
+        {**prefilled_data, **direct_candidate_updates},
+        direct_decisions,
+    )
+    merged_preview = merge_collected_data(prefilled_data, direct_approved_updates)
     if state.get("current_phase") in {"TOPIC_SET", "PROBLEM_DEFINE"} and _get_topic_anchor(prefilled_data):
         focus_type = focus_type or "goal"
     logger.info(
-        "gather turn_type=%s user_message=%r before=%s direct_candidates=%s target_facility=%r recent_problem_area=%r",
+        "gather turn_type=%s user_message=%r before=%s direct_updates_raw=%s direct_candidates=%s direct_approved=%s direct_rejected=%s target_facility=%r recent_problem_area=%r",
         turn_type,
         user_message,
         prefilled_data,
+        direct_updates_raw,
         direct_updates,
+        direct_approved_updates,
+        direct_rejected_updates,
         target_facility_candidate,
         recent_problem_area,
     )
@@ -2645,8 +3090,20 @@ def gather_information_node(state: AgentState):
         logger.info(
             "gather role/team mismatch before=%s attempted=%s after=%s",
             prefilled_data,
-            direct_updates,
+            direct_candidate_updates,
             merged_preview,
+        )
+        _log_collected_data_trace(
+            state,
+            raw_collected_data=raw_current_data,
+            normalized_collected_data=prefilled_data,
+            direct_updates_raw=direct_updates_raw,
+            llm_updates_raw={},
+            candidate_updates_merged=direct_candidate_updates,
+            approved_updates=direct_approved_updates,
+            rejected_updates=direct_rejected_updates,
+            rejected_reasons=direct_rejected_reasons,
+            decisions=direct_decisions,
         )
         follow_up = _build_next_missing_field_prompt(merged_preview)
         ai_message = direct_conflict_message
@@ -2657,6 +3114,10 @@ def gather_information_node(state: AgentState):
             "collected_data": merged_preview,
             "is_sufficient": is_sufficient,
             "next_phase": next_phase,
+            "approved_updates": direct_approved_updates,
+            "rejected_updates": direct_rejected_updates,
+            "rejected_reasons": direct_rejected_reasons,
+            "followup_fields": direct_followup_fields,
         }
     if direct_updates and (
         turn_type in {"provide_fact", "provide_due_date_candidate"}
@@ -2672,13 +3133,25 @@ def gather_information_node(state: AgentState):
             next_phase,
             is_sufficient,
         )
+        _log_collected_data_trace(
+            state,
+            raw_collected_data=raw_current_data,
+            normalized_collected_data=prefilled_data,
+            direct_updates_raw=direct_updates_raw,
+            llm_updates_raw={},
+            candidate_updates_merged=direct_candidate_updates,
+            approved_updates=direct_approved_updates,
+            rejected_updates=direct_rejected_updates,
+            rejected_reasons=direct_rejected_reasons,
+            decisions=direct_decisions,
+        )
         return {
             "ai_message": _apply_turn_policy_to_message(
                 state,
                 _finalize_committed_response(
                     turn_type="provide_fact",
                     merged_data=merged_preview,
-                    accepted_updates=direct_updates,
+                    accepted_updates=direct_approved_updates,
                     ai_message="",
                     is_sufficient=is_sufficient,
                 ),
@@ -2686,10 +3159,13 @@ def gather_information_node(state: AgentState):
             "collected_data": merged_preview,
             "is_sufficient": is_sufficient,
             "next_phase": next_phase,
+            "approved_updates": direct_approved_updates,
+            "rejected_updates": direct_rejected_updates,
+            "rejected_reasons": direct_rejected_reasons,
+            "followup_fields": direct_followup_fields,
         }
     focus_instruction = _build_gather_focus_instruction(focus_type)
     missing_field_summary = _build_missing_field_summary(prefilled_data)
-    fill_remaining_request = _is_fill_remaining_request(user_message, prefilled_data)
     rag_context = _fetch_rag_context(
         state,
         phase=state.get("current_phase", "GATHER"),
@@ -2708,13 +3184,13 @@ def gather_information_node(state: AgentState):
     - Prioritize the latest user request over phase guidance.
     - ai_message must be practical and within 220 characters.
     - Ask at most one short follow-up question only if needed.
-    - updated_data stores confirmed facts only.
-    - updated_data must be a partial object. Include only keys confirmed in this turn.
-    - If nothing was newly confirmed, return updated_data as {{}}.
-    - Never fill unknown fields with placeholders such as "...", empty arrays, sample values, or guesses.
-    - Never store guesses, questions, complaints, or temporary ideas.
-    - Do not say the project is ready for template generation unless all collected data fields are filled with valid values.
-    - If fill_remaining_request is true, you may fill empty fields with practical defaults grounded in the topic and recent context. Do not overwrite confirmed values unless the user clearly changes them.
+    - updated_data stores only candidate facts newly supported in this turn.
+    - updated_data must be partial.
+    - do not repeat full collected_data.
+    - do not overwrite existing values unless explicitly corrected or strongly restated.
+    - do not output placeholders, guesses, requests, or summary asks as facts.
+    - if the user is asking for summary/help, return updated_data={{}}.
+    - Never say the project is ready for template generation unless all collected data fields are filled with valid values.
     - {focus_instruction}
     {PLAIN_LANGUAGE_RULES}
 
@@ -2738,9 +3214,6 @@ def gather_information_node(state: AgentState):
 
     [Latest user intent]
     {turn_type}
-
-    [Fill remaining request]
-    {fill_remaining_request}
 
     [User message]
     {user_message}
@@ -2786,6 +3259,7 @@ def gather_information_node(state: AgentState):
             "next_phase": next_phase,
         }
 
+    llm_updates_raw = dict(result.get("raw_updated_data", {}))
     filtered_updates = _filter_gather_updates(
         user_message,
         result["updated_data"],
@@ -2793,19 +3267,49 @@ def gather_information_node(state: AgentState):
     )
     filtered_updates.pop("subject", None)
     filtered_updates.pop("title", None)
-    candidate_updates = dict(filtered_updates)
-    candidate_updates.update(direct_updates)
-    candidate_conflict_message = _find_role_team_size_conflict(prefilled_data, candidate_updates)
-    merged_data = merge_collected_data(prefilled_data, candidate_updates)
+    candidate_sources, candidate_updates_merged = _merge_candidate_sources(
+        current_data=prefilled_data,
+        user_message=user_message,
+        direct_updates=direct_updates,
+        llm_updates=filtered_updates,
+    )
+    (
+        approved_updates,
+        rejected_updates,
+        rejected_reasons,
+        decisions,
+        followup_fields,
+    ) = _evaluate_candidate_updates(
+        current_data=prefilled_data,
+        candidate_sources=candidate_sources,
+        candidate_updates=candidate_updates_merged,
+        user_message=user_message,
+        current_phase=current_phase,
+    )
+    merged_data = merge_collected_data(prefilled_data, approved_updates)
     accepted_updates = {
         key: value for key, value in merged_data.items() if prefilled_data.get(key) != value
     }
     next_phase = derive_phase_from_collected_data(merged_data, current_phase=current_phase)
     is_sufficient = _is_template_ready(merged_data)
+    _log_collected_data_trace(
+        state,
+        raw_collected_data=raw_current_data,
+        normalized_collected_data=prefilled_data,
+        direct_updates_raw=direct_updates_raw,
+        llm_updates_raw=llm_updates_raw,
+        candidate_updates_merged=candidate_updates_merged,
+        approved_updates=approved_updates,
+        rejected_updates=rejected_updates,
+        rejected_reasons=rejected_reasons,
+        decisions=decisions,
+    )
     logger.info(
-        "gather llm_candidates=%s accepted_updates=%s before=%s after=%s next_phase=%s is_sufficient=%s",
+        "gather llm_candidates=%s candidate_updates_merged=%s accepted_updates=%s rejected_updates=%s before=%s after=%s next_phase=%s is_sufficient=%s",
         filtered_updates,
+        candidate_updates_merged,
         accepted_updates,
+        rejected_updates,
         prefilled_data,
         merged_data,
         next_phase,
@@ -2817,6 +3321,11 @@ def gather_information_node(state: AgentState):
         accepted_updates=accepted_updates,
         ai_message=str(result.get("ai_message") or "").strip(),
         is_sufficient=is_sufficient,
+    )
+    candidate_conflict_message = _decision_conflict_message(
+        prefilled_data,
+        {**prefilled_data, **candidate_updates_merged},
+        decisions,
     )
     if candidate_conflict_message:
         follow_up = _build_next_missing_field_prompt(merged_data)
@@ -2841,6 +3350,10 @@ def gather_information_node(state: AgentState):
         "collected_data": merged_data,
         "is_sufficient": is_sufficient,
         "next_phase": next_phase,
+        "approved_updates": approved_updates,
+        "rejected_updates": rejected_updates,
+        "rejected_reasons": rejected_reasons,
+        "followup_fields": followup_fields,
     }
 
 

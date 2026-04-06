@@ -12,7 +12,7 @@ from app.ai.graph.nodes import (
     gather_information_node,
     topic_exists_node,
 )
-from app.ai.services.template_generation import generate_dev_template, generate_plan_template
+from app.api.endpoints.template import generate_dev_template, generate_plan_template
 
 
 def _has_title(state: AgentState) -> bool:

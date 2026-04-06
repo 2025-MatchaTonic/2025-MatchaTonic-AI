@@ -1,5 +1,7 @@
 import re
-from typing import Dict, Mapping, TypeAlias
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, Dict, Mapping, TypeAlias
 
 
 COLLECTED_DATA_FIELDS: Dict[str, str] = {
@@ -13,6 +15,48 @@ COLLECTED_DATA_FIELDS: Dict[str, str] = {
 }
 CollectedDataValue: TypeAlias = str | int | list[str]
 CollectedData: TypeAlias = Dict[str, CollectedDataValue]
+
+FIELD_POLICY: Dict[str, dict[str, object]] = {
+    "title": {"overwrite": "strict", "source_bias": "context", "allow_additive": False},
+    "subject": {"overwrite": "guarded", "source_bias": "context", "allow_additive": False},
+    "goal": {"overwrite": "strict", "source_bias": "context", "allow_additive": False},
+    "teamSize": {
+        "overwrite": "guarded",
+        "source_bias": "structured",
+        "allow_additive": False,
+    },
+    "roles": {"overwrite": "guarded", "source_bias": "mixed", "allow_additive": True},
+    "dueDate": {"overwrite": "strict", "source_bias": "structured", "allow_additive": False},
+    "deliverables": {
+        "overwrite": "strict",
+        "source_bias": "context",
+        "allow_additive": True,
+    },
+}
+
+
+class OverwriteMode(str, Enum):
+    NONE = "NONE"
+    EXPLICIT = "EXPLICIT"
+    STRONG_RESTATEMENT = "STRONG_RESTATEMENT"
+
+
+class ConflictSeverity(str, Enum):
+    NONE = "NONE"
+    SOFT = "SOFT"
+    HARD = "HARD"
+
+
+@dataclass
+class CandidateDecision:
+    key: str
+    approved: bool
+    normalized_value: object | None
+    reason: str
+    overwrite_mode: str
+    source: str
+    requires_followup_question: bool
+    conflict_severity: str = "NONE"
 
 PHASE_ORDER = {
     "EXPLORE": 0,
@@ -128,6 +172,18 @@ META_CONVERSATION_VALUE_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 IDENTIFIER_LIKE_NOISE_PATTERN = re.compile(r"^(?=.*\d{4,})(?=.*[ㄱ-ㅎㅏ-ㅣ])[A-Za-z0-9ㄱ-ㅎㅏ-ㅣ_-]+$")
+ROOM_TITLE_METADATA_PATTERN = re.compile(r"^([A-Za-z가-힣]+)\s*([0-9]{1,3})$")
+ROOM_TITLE_METADATA_PREFIXES: tuple[str, ...] = (
+    "room",
+    "chat",
+    "project",
+    "team",
+    "group",
+    "캠퍼스",
+    "프로젝트",
+    "채팅방",
+    "팀",
+)
 TEAM_SIZE_VALUE_PATTERN = re.compile(r"^\s*(\d{1,2})(?:\s*명)?\s*$")
 ROLE_VALUE_PREFIX_PATTERN = re.compile(
     r"^\s*(?:역할|역할은|구성|구성은|담당|담당은)\s*[:은는이가]?\s*",
@@ -138,6 +194,48 @@ ROLE_COUNT_TOKEN_PATTERN = re.compile(
     r"^\s*(.+?)\s+(\d{1,2})\s*명(?:\s*씩)?(?:\s*(?:으로|로).*)?\s*$"
 )
 ROLE_TRAILING_PARTICLE_PATTERN = re.compile(r"(?:으로|로|은|는|이|가)$")
+
+
+EXPLICIT_CORRECTION_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\b(?:아니|아니요|아니고|아니라|정정하면|수정하면|수정할게|수정은)\b"),
+    re.compile(r"\b(?:다시|바꾸면|바꿀게|정확히는|말고)\b"),
+)
+STRONG_RESTATEMENT_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
+    "__all__": (
+        re.compile(r"정리하면"),
+        re.compile(r"최종적으로"),
+        re.compile(r"최종안은"),
+        re.compile(r"확정하면"),
+    ),
+    "dueDate": (
+        re.compile(r"마감은"),
+        re.compile(r"데드라인은"),
+    ),
+    "goal": (
+        re.compile(r"목표는"),
+    ),
+    "deliverables": (
+        re.compile(r"산출물은"),
+        re.compile(r"결과물은"),
+    ),
+    "roles": (
+        re.compile(r"역할은"),
+        re.compile(r"역할 구성이"),
+    ),
+}
+STRONG_RESTATEMENT_ENDINGS: tuple[re.Pattern[str], ...] = (
+    re.compile(r".+로 잡았어요"),
+    re.compile(r".+입니다(?:\s*\.?)?$"),
+)
+APPROXIMATE_DUE_DATE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"쯤"),
+    re.compile(r"정도"),
+    re.compile(r"예정"),
+    re.compile(r"아마"),
+    re.compile(r"중순"),
+    re.compile(r"초[에쯤]?"),
+    re.compile(r"말[쯤]?"),
+)
 
 
 def _clean_string(value: object) -> str:
@@ -204,6 +302,23 @@ def _looks_like_identifier_noise(value: object) -> bool:
         and hangul_syllable_count < 2
         and (jamo_count > 0 or latin_count < 3)
     )
+
+
+def _looks_like_room_title_metadata(value: object) -> bool:
+    cleaned = _clean_string(value)
+    if not cleaned:
+        return False
+
+    compact = re.sub(r"\s+", "", cleaned)
+    if len(compact) < 3 or len(compact) > 16:
+        return False
+
+    match = ROOM_TITLE_METADATA_PATTERN.fullmatch(compact)
+    if not match:
+        return False
+
+    prefix = match.group(1).lower()
+    return prefix in ROOM_TITLE_METADATA_PREFIXES
 
 
 def looks_like_non_committal_value(value: object) -> bool:
@@ -368,6 +483,109 @@ def has_role_team_size_conflict(roles: object, team_size: object) -> bool:
     return len(normalized_roles) > normalized_team_size
 
 
+def classify_role_team_size_conflict(
+    roles: object,
+    team_size: object,
+) -> ConflictSeverity:
+    normalized_roles = normalize_roles(roles)
+    normalized_team_size = normalize_team_size(team_size)
+    if not normalized_roles or normalized_team_size is None:
+        return ConflictSeverity.NONE
+
+    role_count = len(normalized_roles)
+    if role_count <= normalized_team_size:
+        return ConflictSeverity.NONE
+
+    hard_threshold = (
+        normalized_team_size + 4
+        if normalized_team_size <= 2
+        else normalized_team_size + max(3, normalized_team_size // 2 + 1)
+    )
+    if role_count >= hard_threshold:
+        return ConflictSeverity.HARD
+    return ConflictSeverity.SOFT
+
+
+def is_explicit_correction_message(user_message: str) -> bool:
+    cleaned = _clean_string(user_message)
+    if not cleaned:
+        return False
+    return any(pattern.search(cleaned) for pattern in EXPLICIT_CORRECTION_PATTERNS)
+
+
+def _strong_restatement_matches_key(key: str, user_message: str) -> bool:
+    patterns = STRONG_RESTATEMENT_PATTERNS.get("__all__", ()) + STRONG_RESTATEMENT_PATTERNS.get(
+        key,
+        (),
+    )
+    return any(pattern.search(user_message) for pattern in patterns)
+
+
+def detect_overwrite_mode(
+    *,
+    key: str,
+    current_value: object,
+    incoming_value: object,
+    user_message: str,
+) -> OverwriteMode:
+    current_normalized = normalize_collected_value(key, current_value)
+    incoming_normalized = normalize_collected_value(key, incoming_value)
+    if current_normalized is None or incoming_normalized is None:
+        return OverwriteMode.NONE
+    if current_normalized == incoming_normalized:
+        return OverwriteMode.NONE
+
+    cleaned_message = _clean_string(user_message)
+    if not cleaned_message:
+        return OverwriteMode.NONE
+    if is_explicit_correction_message(cleaned_message):
+        return OverwriteMode.EXPLICIT
+    if _strong_restatement_matches_key(key, cleaned_message) or any(
+        pattern.search(cleaned_message) for pattern in STRONG_RESTATEMENT_ENDINGS
+    ):
+        return OverwriteMode.STRONG_RESTATEMENT
+    return OverwriteMode.NONE
+
+
+def _merge_additive_values(
+    key: str,
+    current_value: object,
+    incoming_value: object,
+) -> object | None:
+    if key == "roles":
+        current_roles = normalize_roles(current_value) or []
+        incoming_roles = normalize_roles(incoming_value) or []
+        if not incoming_roles:
+            return None
+
+        merged_roles = list(current_roles)
+        current_compact = {role.lower() for role in current_roles}
+        added = False
+        for role in incoming_roles:
+            if role.lower() in current_compact:
+                continue
+            merged_roles.append(role)
+            current_compact.add(role.lower())
+            added = True
+        return merged_roles if added else None
+
+    if key == "deliverables":
+        current_cleaned = _clean_string(current_value)
+        incoming_cleaned = _clean_string(incoming_value)
+        if not current_cleaned or not incoming_cleaned:
+            return None
+        if incoming_cleaned in current_cleaned or current_cleaned in incoming_cleaned:
+            return incoming_cleaned if len(incoming_cleaned) >= len(current_cleaned) else None
+    return None
+
+
+def _is_approximate_due_date(value: object) -> bool:
+    cleaned = _clean_string(value)
+    if not cleaned:
+        return False
+    return any(pattern.search(cleaned) for pattern in APPROXIMATE_DUE_DATE_PATTERNS)
+
+
 def normalize_collected_value(
     key: str,
     value: object,
@@ -436,6 +654,8 @@ def is_valid_collected_value(key: str, value: object, *, team_size: object = Non
     if looks_like_non_committal_value(cleaned):
         return False
     if key in {"subject", "title"} and _looks_like_identifier_noise(cleaned):
+        return False
+    if key in {"subject", "title"} and _looks_like_room_title_metadata(cleaned):
         return False
     if key in {"title", "goal"} and re.fullmatch(r"\d+(?:\.\d+)?", cleaned):
         return False
@@ -536,6 +756,385 @@ def sanitize_candidate_updates(
     return sanitized
 
 
+def normalize_collected_value(
+    key: str,
+    value: object,
+    *,
+    team_size: object = None,
+) -> CollectedDataValue | None:
+    if is_placeholder_value(value):
+        return None
+
+    if key == "teamSize":
+        return normalize_team_size(value)
+
+    if key == "roles":
+        normalized_roles = normalize_roles(value)
+        return normalized_roles or None
+
+    cleaned = _clean_string(value)
+    return cleaned or None
+
+
+def build_role_team_size_conflict_message(roles: object, team_size: object) -> str:
+    normalized_roles = normalize_roles(roles) or []
+    normalized_team_size = normalize_team_size(team_size)
+    if not normalized_roles or normalized_team_size is None:
+        return ""
+
+    severity = classify_role_team_size_conflict(normalized_roles, normalized_team_size)
+    if severity == ConflictSeverity.HARD:
+        return (
+            f"역할 인원 합계가 {len(normalized_roles)}명인데 현재 총 인원은 "
+            f"{normalized_team_size}명입니다. 현재 정보로는 설명이 어려워서 역할 구성이나 총 인원을 다시 확인해 주세요."
+        )
+    return (
+        f"역할 인원 합계가 {len(normalized_roles)}명인데 현재 총 인원은 "
+        f"{normalized_team_size}명입니다. 겸임 기준인지 포함해서 역할 구성이나 총 인원을 다시 확인해 주세요."
+    )
+
+
+def is_valid_collected_value(key: str, value: object, *, team_size: object = None) -> bool:
+    cleaned = _clean(key, value)
+    if not cleaned:
+        return False
+
+    normalized = cleaned.lower()
+    if "@mates" in normalized or "?" in cleaned:
+        return False
+    if is_placeholder_value(cleaned):
+        return False
+    if any(keyword in normalized for keyword in NEGATIVE_VALUE_KEYWORDS):
+        return False
+    if looks_like_non_committal_value(cleaned):
+        return False
+    if key in {"subject", "title"} and _looks_like_identifier_noise(cleaned):
+        return False
+    if key in {"subject", "title"} and _looks_like_room_title_metadata(cleaned):
+        return False
+    if key in {"title", "goal"} and re.fullmatch(r"\d+(?:\.\d+)?", cleaned):
+        return False
+    return True
+
+
+def sanitize_llm_updated_data(raw_updated_data: object) -> CollectedData:
+    if not isinstance(raw_updated_data, Mapping):
+        return {}
+    return sanitize_candidate_updates(raw_updated_data)
+
+
+def sanitize_candidate_updates(
+    updated_data: Mapping[str, object] | None,
+    *,
+    current_data: Mapping[str, object] | None = None,
+) -> CollectedData:
+    sanitized: CollectedData = {}
+    team_size = _effective_team_size(current_data, updated_data)
+    normalized_team_size = normalize_team_size((updated_data or {}).get("teamSize"))
+    if normalized_team_size is not None:
+        sanitized["teamSize"] = normalized_team_size
+
+    for key in COLLECTED_DATA_FIELDS:
+        if key == "teamSize":
+            continue
+
+        value = (updated_data or {}).get(key)
+        normalized_value = normalize_collected_value(key, value, team_size=team_size)
+        if normalized_value is None:
+            continue
+        if not is_valid_collected_value(key, normalized_value, team_size=team_size):
+            continue
+        sanitized[key] = normalized_value
+
+    return sanitized
+
+
+def evaluate_candidate_update(
+    *,
+    key: str,
+    current_value: object,
+    incoming_value: object,
+    source: str,
+    user_message: str,
+    current_phase: str,
+    current_data: Mapping[str, object] | None,
+    candidate_updates: Mapping[str, object] | None,
+) -> CandidateDecision:
+    policy = FIELD_POLICY.get(
+        key,
+        {"overwrite": "guarded", "source_bias": "mixed", "allow_additive": False},
+    )
+    effective_team_size = _effective_team_size(current_data, candidate_updates)
+    team_size_for_key = incoming_value if key == "teamSize" else effective_team_size
+    normalized_incoming = normalize_collected_value(key, incoming_value, team_size=team_size_for_key)
+    overwrite_mode = detect_overwrite_mode(
+        key=key,
+        current_value=current_value,
+        incoming_value=incoming_value,
+        user_message=user_message,
+    )
+
+    if normalized_incoming is None:
+        return CandidateDecision(
+            key=key,
+            approved=False,
+            normalized_value=None,
+            reason="invalid_or_empty_candidate",
+            overwrite_mode=overwrite_mode.value,
+            source=source,
+            requires_followup_question=False,
+        )
+
+    if not is_valid_collected_value(key, normalized_incoming, team_size=team_size_for_key):
+        return CandidateDecision(
+            key=key,
+            approved=False,
+            normalized_value=None,
+            reason="non_committal_or_placeholder_candidate",
+            overwrite_mode=overwrite_mode.value,
+            source=source,
+            requires_followup_question=False,
+        )
+
+    current_team_size = normalize_team_size((current_data or {}).get("teamSize"))
+    current_normalized = normalize_collected_value(
+        key,
+        current_value,
+        team_size=current_team_size,
+    )
+    if current_normalized == normalized_incoming:
+        return CandidateDecision(
+            key=key,
+            approved=True,
+            normalized_value=normalized_incoming,
+            reason="same_as_current",
+            overwrite_mode=OverwriteMode.NONE.value,
+            source=source,
+            requires_followup_question=False,
+        )
+
+    additive_value = None
+    if policy.get("allow_additive"):
+        additive_value = _merge_additive_values(key, current_normalized, normalized_incoming)
+
+    conflict_severity = ConflictSeverity.NONE
+    requires_followup_question = False
+    if key in {"roles", "teamSize"}:
+        conflict_roles = normalized_incoming if key == "roles" else (candidate_updates or {}).get(
+            "roles",
+            (current_data or {}).get("roles"),
+        )
+        conflict_team_size = (
+            normalized_incoming
+            if key == "teamSize"
+            else (candidate_updates or {}).get("teamSize", (current_data or {}).get("teamSize"))
+        )
+        conflict_severity = classify_role_team_size_conflict(conflict_roles, conflict_team_size)
+        if conflict_severity == ConflictSeverity.HARD:
+            return CandidateDecision(
+                key=key,
+                approved=False,
+                normalized_value=None,
+                reason="hard_role_team_size_conflict",
+                overwrite_mode=overwrite_mode.value,
+                source=source,
+                requires_followup_question=True,
+                conflict_severity=conflict_severity.value,
+            )
+        if conflict_severity == ConflictSeverity.SOFT:
+            requires_followup_question = True
+
+    if key == "dueDate" and current_normalized is not None and _is_approximate_due_date(
+        normalized_incoming,
+    ):
+        return CandidateDecision(
+            key=key,
+            approved=False,
+            normalized_value=None,
+            reason="approximate_due_date_cannot_overwrite_confirmed_value",
+            overwrite_mode=overwrite_mode.value,
+            source=source,
+            requires_followup_question=True,
+        )
+
+    if current_normalized is None:
+        return CandidateDecision(
+            key=key,
+            approved=True,
+            normalized_value=normalized_incoming,
+            reason="new_fact_approved",
+            overwrite_mode=overwrite_mode.value,
+            source=source,
+            requires_followup_question=requires_followup_question,
+            conflict_severity=conflict_severity.value,
+        )
+
+    if key in {"subject", "title"} and source == "direct_structured" and current_phase in {
+        "TOPIC_SET",
+        "PROBLEM_DEFINE",
+    }:
+        return CandidateDecision(
+            key=key,
+            approved=True,
+            normalized_value=normalized_incoming,
+            reason="topic_field_direct_structured_override",
+            overwrite_mode=overwrite_mode.value,
+            source=source,
+            requires_followup_question=requires_followup_question,
+            conflict_severity=conflict_severity.value,
+        )
+
+    if additive_value is not None:
+        return CandidateDecision(
+            key=key,
+            approved=True,
+            normalized_value=additive_value,
+            reason="additive_update_approved",
+            overwrite_mode=overwrite_mode.value,
+            source=source,
+            requires_followup_question=requires_followup_question,
+            conflict_severity=conflict_severity.value,
+        )
+
+    if overwrite_mode in {OverwriteMode.EXPLICIT, OverwriteMode.STRONG_RESTATEMENT}:
+        return CandidateDecision(
+            key=key,
+            approved=True,
+            normalized_value=normalized_incoming,
+            reason="overwrite_approved",
+            overwrite_mode=overwrite_mode.value,
+            source=source,
+            requires_followup_question=requires_followup_question,
+            conflict_severity=conflict_severity.value,
+        )
+
+    overwrite_policy = str(policy.get("overwrite") or "guarded")
+    if overwrite_policy == "strict":
+        reason = "protected_field_requires_explicit_or_strong_restatement"
+    else:
+        reason = "guarded_field_kept_existing_value"
+
+    return CandidateDecision(
+        key=key,
+        approved=False,
+        normalized_value=None,
+        reason=reason,
+        overwrite_mode=overwrite_mode.value,
+        source=source,
+        requires_followup_question=requires_followup_question,
+        conflict_severity=conflict_severity.value,
+    )
+
+
+def is_placeholder_value(value: object) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return False
+    if isinstance(value, (list, tuple, set)):
+        return len(value) == 0 or all(is_placeholder_value(item) for item in value)
+
+    cleaned = _clean_string(value)
+    if not cleaned:
+        return True
+
+    normalized = cleaned.lower()
+    return normalized in PLACEHOLDER_VALUE_KEYWORDS
+
+
+def normalize_roles(value: object) -> list[str] | None:
+    if value is None or isinstance(value, bool):
+        return None
+
+    def _clean_role_label(token: object) -> str:
+        cleaned = _clean_string(token)
+        if not cleaned:
+            return ""
+        cleaned = re.sub(r"^\s*(?:역할|구성|멤버|담당)\s*[:：]?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"(?:으로|로|이가|은|는)$", "", cleaned).strip()
+        cleaned = cleaned.strip(" .,!?:;\"'()[]")
+        lowered = cleaned.lower()
+        mapping = {"pm": "PM", "po": "PO", "ai": "AI", "ios": "iOS"}
+        return mapping.get(lowered, cleaned)
+
+    if isinstance(value, (list, tuple, set)):
+        roles = [_clean_role_label(item) for item in value]
+        cleaned_roles = [role for role in roles if role]
+        return _number_duplicate_roles(cleaned_roles) or None
+
+    if not isinstance(value, str):
+        return None
+
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+
+    tokens = [
+        token.strip()
+        for token in re.split(r"\s*(?:,|/| 그리고 | 및 | 와 | 과 )\s*", cleaned)
+        if token.strip()
+    ]
+    parsed_counts: list[tuple[str, int]] = []
+    if tokens:
+        for token in tokens:
+            match = re.fullmatch(r"(.+?)\s+(\d{1,2})\s*명(?:씩)?(?:\s*(?:으로|로.*)?)?", token)
+            if not match:
+                parsed_counts = []
+                break
+            role = _clean_role_label(match.group(1))
+            count = int(match.group(2))
+            if not role or count <= 0:
+                parsed_counts = []
+                break
+            parsed_counts.append((role, count))
+    if parsed_counts:
+        expanded_roles: list[str] = []
+        for role, count in parsed_counts:
+            expanded_roles.extend([role] * count)
+        return _number_duplicate_roles(expanded_roles) or None
+
+    normalized_roles = [_clean_role_label(token) for token in tokens]
+    cleaned_roles = [role for role in normalized_roles if role]
+    if cleaned_roles:
+        return _number_duplicate_roles(cleaned_roles)
+
+    single_role = _clean_role_label(cleaned)
+    return [single_role] if single_role else None
+
+
+def detect_overwrite_mode(
+    *,
+    key: str,
+    current_value: object,
+    incoming_value: object,
+    user_message: str,
+) -> OverwriteMode:
+    current_normalized = normalize_collected_value(key, current_value)
+    incoming_normalized = normalize_collected_value(key, incoming_value)
+    if current_normalized is None or incoming_normalized is None:
+        return OverwriteMode.NONE
+    if current_normalized == incoming_normalized:
+        return OverwriteMode.NONE
+
+    cleaned_message = _clean_string(user_message)
+    if not cleaned_message:
+        return OverwriteMode.NONE
+    if is_explicit_correction_message(cleaned_message):
+        return OverwriteMode.EXPLICIT
+    if key in {"subject", "title", "goal", "dueDate", "deliverables", "roles"} and re.match(
+        r"^\s*(?:주제|제목|목표|마감|산출물|결과물|역할)\s*[:：]",
+        cleaned_message,
+    ):
+        return OverwriteMode.EXPLICIT
+    if _strong_restatement_matches_key(key, cleaned_message) or any(
+        pattern.search(cleaned_message) for pattern in STRONG_RESTATEMENT_ENDINGS
+    ):
+        return OverwriteMode.STRONG_RESTATEMENT
+    return OverwriteMode.NONE
+
+
 def missing_collected_fields(data: Mapping[str, object] | None) -> list[str]:
     sanitized = sanitize_collected_data(data)
     missing: list[str] = []
@@ -555,6 +1154,16 @@ def missing_collected_fields(data: Mapping[str, object] | None) -> list[str]:
             team_size=sanitized.get("teamSize"),
         ):
             missing.append(key)
+
+    if (
+        "roles" not in missing
+        and classify_role_team_size_conflict(
+            sanitized.get("roles"),
+            sanitized.get("teamSize"),
+        )
+        == ConflictSeverity.HARD
+    ):
+        missing.append("roles")
 
     return missing
 
