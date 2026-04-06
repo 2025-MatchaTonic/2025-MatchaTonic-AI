@@ -11,7 +11,11 @@ from app.ai.graph.text_support import (
     strip_mates_mention as _strip_mates_mention,
     truncate_message as _truncate_content,
 )
-from app.ai.graph.collected_data import CollectedData, derive_phase_from_collected_data
+from app.ai.graph.collected_data import (
+    CollectedData,
+    derive_phase_from_collected_data,
+    missing_collected_fields,
+)
 from app.ai.graph.state import TurnPolicy
 from app.ai.graph.workflow import ai_app
 from app.api.schemas.template import NotionTemplatePayload
@@ -95,6 +99,23 @@ class AIChatResponse(BaseModel):
     notionTemplatePayload: Optional[NotionTemplatePayload] = None
 
 
+QUESTION_BY_FIELD = {
+    "subject": "프로젝트 주제를 한 줄로 적어주세요.",
+    "title": "프로젝트 제목은 어떻게 정할까요?",
+    "goal": "이 프로젝트 목표를 한 줄로 말해 주세요.",
+    "teamSize": "현재 팀원은 총 몇 명인가요?",
+    "roles": "각자 맡을 역할을 짧게 적어주세요.",
+    "dueDate": "마감일이나 발표일은 언제인가요?",
+    "deliverables": "최종 산출물은 무엇인가요?",
+}
+
+PHASE_FIELD_PRIORITY = {
+    "PROBLEM_DEFINE": ["subject", "goal", "title"],
+    "GATHER": ["teamSize", "roles", "dueDate", "deliverables", "goal"],
+    "READY": ["goal", "teamSize", "roles", "dueDate", "deliverables"],
+}
+
+
 def _derive_effective_phase(request: AIChatRequest) -> str:
     return derive_phase_from_collected_data(
         request.collectedData,
@@ -133,6 +154,48 @@ def _derive_turn_policy(request: AIChatRequest) -> TurnPolicy:
     return "ANSWER_ONLY"
 
 
+def _build_suggested_questions(
+    *,
+    phase: str,
+    collected_data: CollectedData,
+    rejected_updates: Dict[str, Any] | None,
+    followup_fields: List[str] | None,
+) -> List[str]:
+    suggestions: List[str] = []
+    seen_fields: set[str] = set()
+
+    priority_fields: List[str] = []
+    for field in followup_fields or []:
+        if field not in seen_fields:
+            priority_fields.append(field)
+            seen_fields.add(field)
+    for field in (rejected_updates or {}).keys():
+        if field not in seen_fields:
+            priority_fields.append(field)
+            seen_fields.add(field)
+
+    missing_fields = missing_collected_fields(collected_data)
+    for field in PHASE_FIELD_PRIORITY.get(phase, PHASE_FIELD_PRIORITY.get("GATHER", [])):
+        if field in missing_fields and field not in seen_fields:
+            priority_fields.append(field)
+            seen_fields.add(field)
+    if phase == "READY":
+        for field in missing_fields:
+            if field not in seen_fields:
+                priority_fields.append(field)
+                seen_fields.add(field)
+
+    for field in priority_fields:
+        question = QUESTION_BY_FIELD.get(field)
+        if not question:
+            continue
+        suggestions.append(question)
+        if len(suggestions) == 3:
+            break
+
+    return suggestions
+
+
 @router.post("/", response_model=AIChatResponse)
 async def process_chat(request: AIChatRequest):
     try:
@@ -169,6 +232,18 @@ async def process_chat(request: AIChatRequest):
         result = await asyncio.to_thread(ai_app.invoke, initial_state)
         response_phase = result.get("next_phase", effective_phase)
         response_collected_data = result.get("collected_data", request.collectedData)
+        approved_updates = result.get("approved_updates", {})
+        rejected_updates = result.get("rejected_updates", {})
+        rejected_reasons = result.get("rejected_reasons", {})
+        followup_fields = result.get("followup_fields", [])
+        logger.info(
+            "chat decision room=%s phase=%s approved_updates=%s rejected_updates=%s rejected_reasons=%s",
+            request.roomId,
+            response_phase,
+            approved_updates,
+            rejected_updates,
+            rejected_reasons,
+        )
         logger.info(
             "chat response room=%s next_phase=%s is_sufficient=%s collected_data=%s ai_message=%r",
             request.roomId,
@@ -180,7 +255,12 @@ async def process_chat(request: AIChatRequest):
 
         return AIChatResponse(
             content=_truncate_content(result.get("ai_message", "")),
-            suggestedQuestions=[],
+            suggestedQuestions=_build_suggested_questions(
+                phase=response_phase,
+                collected_data=response_collected_data,
+                rejected_updates=rejected_updates,
+                followup_fields=followup_fields,
+            ),
             currentStatus=response_phase,
             isSufficient=result.get("is_sufficient", False),
             collectedData=response_collected_data,
