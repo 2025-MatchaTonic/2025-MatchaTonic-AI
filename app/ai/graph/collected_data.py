@@ -1429,3 +1429,107 @@ def sanitize_collected_data(data: Mapping[str, object] | None) -> CollectedData:
     if _looks_like_room_title_metadata(sanitized.get("title")):
         sanitized.pop("title", None)
     return sanitized
+
+
+def _split_role_tokens_preserving_parentheses(text: str) -> list[str]:
+    if not text:
+        return []
+
+    parts: list[str] = []
+    buffer: list[str] = []
+    depth = 0
+    index = 0
+    separators = (" 그리고 ", " 및 ", " 와 ", " 과 ")
+
+    while index < len(text):
+        matched_separator = False
+        if depth == 0:
+            for separator in separators:
+                if text.startswith(separator, index):
+                    token = "".join(buffer).strip()
+                    if token:
+                        parts.append(token)
+                    buffer = []
+                    index += len(separator)
+                    matched_separator = True
+                    break
+            if matched_separator:
+                continue
+
+        char = text[index]
+        if char in "([":
+            depth += 1
+        elif char in ")]" and depth > 0:
+            depth -= 1
+
+        if depth == 0 and char in ",/;":
+            token = "".join(buffer).strip()
+            if token:
+                parts.append(token)
+            buffer = []
+            index += 1
+            continue
+
+        buffer.append(char)
+        index += 1
+
+    token = "".join(buffer).strip()
+    if token:
+        parts.append(token)
+    return parts
+
+
+def normalize_roles(value: object) -> list[str] | None:
+    if value is None or isinstance(value, bool):
+        return None
+
+    def _clean_role_label(token: object) -> str:
+        cleaned = _clean_string(token)
+        if not cleaned:
+            return ""
+        cleaned = re.sub(r"^\s*(?:역할|구성|멤버|담당)\s*[:：]?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"(?:으로|로|이가|은|는)$", "", cleaned).strip()
+        cleaned = cleaned.strip(" .,!?:;\"'[]")
+        lowered = cleaned.lower()
+        mapping = {"pm": "PM", "po": "PO", "ai": "AI", "ios": "iOS"}
+        return mapping.get(lowered, cleaned)
+
+    if isinstance(value, (list, tuple, set)):
+        roles = [_clean_role_label(item) for item in value]
+        cleaned_roles = [role for role in roles if role]
+        return _number_duplicate_roles(cleaned_roles) or None
+
+    if not isinstance(value, str):
+        return None
+
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+
+    tokens = _split_role_tokens_preserving_parentheses(cleaned)
+    parsed_counts: list[tuple[str, int]] = []
+    if tokens:
+        for token in tokens:
+            match = re.fullmatch(r"(.+?)\s+(\d{1,2})\s*명(?:씩)?(?:\s*(?:으로|로.*)?)?", token)
+            if not match:
+                parsed_counts = []
+                break
+            role = _clean_role_label(match.group(1))
+            count = int(match.group(2))
+            if not role or count <= 0:
+                parsed_counts = []
+                break
+            parsed_counts.append((role, count))
+    if parsed_counts:
+        expanded_roles: list[str] = []
+        for role, count in parsed_counts:
+            expanded_roles.extend([role] * count)
+        return _number_duplicate_roles(expanded_roles) or None
+
+    normalized_roles = [_clean_role_label(token) for token in tokens]
+    cleaned_roles = [role for role in normalized_roles if role]
+    if cleaned_roles:
+        return _number_duplicate_roles(cleaned_roles)
+
+    single_role = _clean_role_label(cleaned)
+    return [single_role] if single_role else None

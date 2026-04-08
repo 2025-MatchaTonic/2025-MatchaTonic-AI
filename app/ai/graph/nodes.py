@@ -2824,6 +2824,10 @@ def topic_exists_node(state: AgentState):
                 "collected_data": merged_data,
                 "is_sufficient": is_sufficient,
                 "next_phase": next_phase,
+                "approved_updates": approved_updates,
+                "rejected_updates": rejected_updates,
+                "rejected_reasons": rejected_reasons,
+                "followup_fields": followup_fields,
             }
         if broad_subject:
             return {
@@ -2831,6 +2835,10 @@ def topic_exists_node(state: AgentState):
                 "collected_data": merged_data,
                 "is_sufficient": is_sufficient,
                 "next_phase": next_phase,
+                "approved_updates": approved_updates,
+                "rejected_updates": rejected_updates,
+                "rejected_reasons": rejected_reasons,
+                "followup_fields": followup_fields,
             }
         return {
             "ai_message": (
@@ -2840,6 +2848,10 @@ def topic_exists_node(state: AgentState):
             "collected_data": merged_data,
             "is_sufficient": is_sufficient,
             "next_phase": next_phase,
+            "approved_updates": approved_updates,
+            "rejected_updates": rejected_updates,
+            "rejected_reasons": rejected_reasons,
+            "followup_fields": followup_fields,
         }
     extracted_title = accepted_updates.get("title", "")
     if extracted_title:
@@ -2855,6 +2867,10 @@ def topic_exists_node(state: AgentState):
                 "collected_data": merged_data,
                 "is_sufficient": is_sufficient,
                 "next_phase": next_phase,
+                "approved_updates": approved_updates,
+                "rejected_updates": rejected_updates,
+                "rejected_reasons": rejected_reasons,
+                "followup_fields": followup_fields,
             }
         return {
             "ai_message": (
@@ -2864,6 +2880,10 @@ def topic_exists_node(state: AgentState):
             "collected_data": merged_data,
             "is_sufficient": is_sufficient,
             "next_phase": next_phase,
+            "approved_updates": approved_updates,
+            "rejected_updates": rejected_updates,
+            "rejected_reasons": rejected_reasons,
+            "followup_fields": followup_fields,
         }
     if turn_type == "provide_problem_area" and problem_area_candidate:
         topic_anchor = _get_topic_anchor(
@@ -2893,6 +2913,10 @@ def topic_exists_node(state: AgentState):
                     "collected_data": refined_data,
                     "is_sufficient": _is_template_ready(refined_data),
                     "next_phase": refined_phase,
+                    "approved_updates": approved_updates,
+                    "rejected_updates": rejected_updates,
+                    "rejected_reasons": rejected_reasons,
+                    "followup_fields": followup_fields,
                 }
         logger.info(
             "topic_exists problem_area topic=%r problem_area=%r before=%s after=%s",
@@ -2906,6 +2930,10 @@ def topic_exists_node(state: AgentState):
             "collected_data": merged_data,
             "is_sufficient": is_sufficient,
             "next_phase": next_phase,
+            "approved_updates": approved_updates,
+            "rejected_updates": rejected_updates,
+            "rejected_reasons": rejected_reasons,
+            "followup_fields": followup_fields,
         }
     if turn_type in {
         "request_summary",
@@ -2935,6 +2963,10 @@ def topic_exists_node(state: AgentState):
                 raw_current_data,
                 current_phase="TOPIC_SET",
             ),
+            "approved_updates": approved_updates,
+            "rejected_updates": rejected_updates,
+            "rejected_reasons": rejected_reasons,
+            "followup_fields": followup_fields,
         }
     if not _get_topic_anchor(current_data, allow_title_fallback=False) and user_message:
         return {
@@ -2945,6 +2977,10 @@ def topic_exists_node(state: AgentState):
             "collected_data": raw_current_data,
             "is_sufficient": False,
             "next_phase": "TOPIC_SET",
+            "approved_updates": approved_updates,
+            "rejected_updates": rejected_updates,
+            "rejected_reasons": rejected_reasons,
+            "followup_fields": followup_fields,
         }
 
     recent_context = _build_recent_context(state)
@@ -2989,6 +3025,10 @@ def topic_exists_node(state: AgentState):
         "collected_data": merged_data,
         "is_sufficient": is_sufficient,
         "next_phase": next_phase,
+        "approved_updates": approved_updates,
+        "rejected_updates": rejected_updates,
+        "rejected_reasons": rejected_reasons,
+        "followup_fields": followup_fields,
     }
 
 
@@ -3013,6 +3053,9 @@ def gather_information_node(state: AgentState):
         for key, value in _extract_direct_fact_updates(user_message).items()
         if key in {"subject", "title", "goal", "teamSize", "roles", "dueDate", "deliverables"}
     }
+    confirmed_title = _extract_confirmed_title_from_context(state, current_data)
+    if confirmed_title and "title" not in direct_updates_raw:
+        direct_updates_raw["title"] = confirmed_title
     direct_updates = _shared_sanitize_candidate_updates(
         direct_updates_raw,
         current_data=prefilled_data,
@@ -3894,3 +3937,317 @@ def _is_summary_request(user_message: str) -> bool:
         return False
 
     return _final_is_summary_request(user_message)
+
+
+_latest_extract_direct_fact_updates = _extract_direct_fact_updates
+_latest_extract_problem_area_candidate = _extract_problem_area_candidate
+_latest_interpret_turn_type = _interpret_turn_type
+
+
+def _has_structured_fact_updates(direct_updates: dict[str, object] | None) -> bool:
+    if not direct_updates:
+        return False
+    return any(
+        key in direct_updates
+        for key in ("subject", "title", "goal", "teamSize", "roles", "dueDate", "deliverables")
+    )
+
+
+def _split_items_preserving_parentheses(text: str) -> list[str]:
+    if not text:
+        return []
+
+    parts: list[str] = []
+    buffer: list[str] = []
+    depth = 0
+    index = 0
+    separators = (" 그리고 ", " 및 ", " 와 ", " 과 ")
+
+    while index < len(text):
+        chunk_matched = False
+        if depth == 0:
+            for separator in separators:
+                if text.startswith(separator, index):
+                    token = "".join(buffer).strip()
+                    if token:
+                        parts.append(token)
+                    buffer = []
+                    index += len(separator)
+                    chunk_matched = True
+                    break
+            if chunk_matched:
+                continue
+
+        char = text[index]
+        if char in "([":
+            depth += 1
+        elif char in ")]" and depth > 0:
+            depth -= 1
+
+        if depth == 0 and char in ",/;":
+            token = "".join(buffer).strip()
+            if token:
+                parts.append(token)
+            buffer = []
+            index += 1
+            continue
+
+        buffer.append(char)
+        index += 1
+
+    token = "".join(buffer).strip()
+    if token:
+        parts.append(token)
+    return parts
+
+
+def _normalize_role_token(token: str) -> str:
+    cleaned = _clean_text(token)
+    if not cleaned:
+        return ""
+
+    cleaned = ROLE_PREFIX_PATTERN.sub("", cleaned)
+    cleaned = ROLE_TRAILING_SPLIT_PATTERN.split(cleaned, maxsplit=1)[0].strip()
+    cleaned = re.sub(r"(?:으로|로)$", "", cleaned).strip()
+    cleaned = cleaned.strip(" .,!?:;\"'[]")
+    if not cleaned:
+        return ""
+
+    lowered = cleaned.lower()
+    if lowered == "pm":
+        return "PM"
+    if lowered == "po":
+        return "PO"
+    if lowered == "ai":
+        return "AI"
+    if lowered == "ios":
+        return "iOS"
+    return cleaned
+
+
+def _extract_roles_from_message(message: str) -> str:
+    role_match = ROLE_PATTERN.search(message)
+    if not role_match:
+        role_match = re.search(r"(?:역할|롤)\s*(?:은|는|:)?\s*(.+)$", message, flags=re.IGNORECASE)
+    candidate = role_match.group(1) if role_match else message
+    candidate = ROLE_TRAILING_SPLIT_PATTERN.split(candidate, maxsplit=1)[0]
+    candidate = re.split(r"[.?!]\s*|다음엔|다음에|그다음", candidate, maxsplit=1)[0]
+    candidate = re.split(r"\s+정도(?:로)?\b", candidate, maxsplit=1)[0]
+    candidate = candidate.split("\n", 1)[0].strip()
+
+    roles: list[str] = []
+    for part in _split_items_preserving_parentheses(candidate):
+        normalized = _normalize_role_token(part)
+        if not _looks_like_role_token(normalized):
+            continue
+        if normalized not in roles:
+            roles.append(normalized)
+
+    if not roles and role_match:
+        fallback_tokens = _split_items_preserving_parentheses(role_match.group(1))
+        roles = [
+            normalized
+            for normalized in (_normalize_role_token(token) for token in fallback_tokens)
+            if _looks_like_role_token(normalized)
+        ]
+
+    return ", ".join(dict.fromkeys(roles))
+
+
+def _extract_explicit_deliverables_candidate(message: str) -> str:
+    normalized_message = _clean_text(message)
+    if not normalized_message:
+        return ""
+
+    match = re.search(
+        r"^(?:최종\s*)?(?:산출물|결과물|제출물)(?:은|는|:)?\s*(.+)$",
+        normalized_message,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return ""
+
+    candidate = _normalize_direct_fact_value(match.group(1))
+    if not candidate or _is_non_storable_freeform_message(candidate):
+        return ""
+    return candidate
+
+
+def _normalize_goal_candidate(candidate: str) -> str:
+    normalized = _normalize_direct_fact_value(candidate)
+    if not normalized:
+        return ""
+
+    normalized = re.sub(r"^\s*(?:목표|goal)\s*(?:은|는|이|가|:)\s*", "", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(
+        r"\s*(?:이|가)\s*목표(?:야|예요|입니다)?\s*$",
+        "",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    normalized = re.sub(
+        r"\s*(?:을|를)\s*목표(?:로|로는)?\s*(?:할게|할 거야|할래|잡을게|정할게|삼을게|둘게)\s*$",
+        "",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    normalized = re.sub(r"\s*거(?:예요|야|입니다)?\s*$", " 것", normalized)
+    normalized = re.sub(r"^\s*\d{1,2}[)\.\-:]\s*", "", normalized).strip()
+    normalized = re.sub(r"\s+", " ", normalized).strip(" .,!?:;\"'")
+    return normalized
+
+
+def _extract_goal_candidate_from_message(message: str) -> str:
+    normalized_message = _clean_text(message)
+    if not normalized_message or _is_meta_conversation_message(normalized_message):
+        return ""
+
+    explicit_patterns = (
+        r"^목표(?:는|은)?\s*(.+?)(?:이|가)\s*목표(?:야|예요|입니다)?\s*$",
+        r"^(.+?)(?:이|가)\s*목표(?:야|예요|입니다)?\s*$",
+        r"^목표(?:는|은)?\s*(.+)$",
+        r"^(.+?)(?:을|를)\s*목표(?:로|로는)?\s*(?:할게|할 거야|할래|잡을게|정할게|삼을게|둘게)\s*$",
+    )
+    for pattern in explicit_patterns:
+        match = re.search(pattern, normalized_message, flags=re.IGNORECASE)
+        if not match:
+            continue
+        candidate = _normalize_goal_candidate(match.group(1))
+        if candidate and not _is_non_storable_freeform_message(candidate):
+            return candidate
+    return ""
+
+
+def _extract_problem_statement_candidate(message: str) -> str:
+    normalized_message = _clean_text(message)
+    if not normalized_message:
+        return ""
+
+    patterns = (
+        r"^(.+?\b문제)\s*(?:를\s*해결하고\s*싶(?:어|어요)|를\s*풀고\s*싶(?:어|어요))\s*$",
+        r"^(.+?)\s*(?:어려움을\s*겪고\s*있(?:어|어요)|불편을\s*겪고\s*있(?:어|어요)|문제가\s*있(?:어|어요))\s*$",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, normalized_message, flags=re.IGNORECASE)
+        if not match:
+            continue
+        candidate = _normalize_direct_fact_value(match.group(1))
+        if candidate and not _is_non_storable_freeform_message(candidate):
+            return candidate
+    return ""
+
+
+def _extract_direct_fact_updates(user_message: str) -> dict[str, object]:
+    updates = dict(_latest_extract_direct_fact_updates(user_message))
+    normalized_message = _clean_text(_strip_mates_mention(user_message))
+
+    goal_candidate = _extract_goal_candidate_from_message(normalized_message)
+    if goal_candidate:
+        updates["goal"] = goal_candidate
+
+    deliverables_candidate = _extract_explicit_deliverables_candidate(normalized_message)
+    if deliverables_candidate:
+        updates["deliverables"] = deliverables_candidate
+
+    return _sanitize_gather_updates(updates)
+
+
+def _extract_problem_area_candidate(
+    state: AgentState,
+    current_data: dict[str, object] | None = None,
+    *,
+    direct_updates: dict[str, object] | None = None,
+) -> str:
+    candidate = _latest_extract_problem_area_candidate(
+        state,
+        current_data,
+        direct_updates=direct_updates,
+    )
+    if candidate:
+        return candidate
+
+    current_data = current_data or {}
+    direct_updates = direct_updates or {}
+    topic_anchor = _get_topic_anchor(current_data, allow_title_fallback=False) or str(
+        direct_updates.get("subject") or direct_updates.get("title") or ""
+    ).strip()
+    if not topic_anchor:
+        return ""
+    if _has_structured_fact_updates(direct_updates):
+        return ""
+
+    normalized_message = _clean_text(_strip_mates_mention(_effective_user_message(state)))
+    if (
+        not normalized_message
+        or _is_meta_conversation_message(normalized_message)
+        or _looks_like_question_line(normalized_message)
+        or _extract_due_date_candidate_from_message(normalized_message)
+        or _extract_target_facility_candidate(state, current_data)
+    ):
+        return ""
+
+    return _extract_problem_statement_candidate(normalized_message)
+
+
+def _interpret_turn_type(
+    state: AgentState,
+    current_data: dict[str, object] | None = None,
+    *,
+    direct_updates: dict[str, object] | None = None,
+) -> str:
+    interpreted = _latest_interpret_turn_type(
+        state,
+        current_data,
+        direct_updates=direct_updates,
+    )
+    if interpreted != "general":
+        return interpreted
+
+    current_data = current_data or {}
+    direct_updates = direct_updates or {}
+    if _has_structured_fact_updates(direct_updates):
+        return interpreted
+
+    problem_area_candidate = _extract_problem_area_candidate(
+        state,
+        current_data,
+        direct_updates=direct_updates,
+    )
+    if problem_area_candidate and _get_topic_anchor(current_data, allow_title_fallback=False):
+        return "provide_problem_area"
+    return interpreted
+
+
+def _extract_confirmed_title_from_context(
+    state: AgentState,
+    current_data: dict[str, object] | None = None,
+) -> str:
+    current_data = current_data or {}
+    if _is_valid_collected_value("title", current_data.get("title")):
+        return ""
+
+    user_message = _clean_text(_strip_mates_mention(_effective_user_message(state)))
+    if not user_message:
+        return ""
+
+    confirmation_patterns = (
+        r"그\s*제목으로\s*해줘",
+        r"그\s*제목으로\s*할게",
+        r"그걸로\s*해줘",
+        r"그걸로\s*할게",
+        r"그\s*이름으로\s*해줘",
+    )
+    if not any(re.search(pattern, user_message, flags=re.IGNORECASE) for pattern in confirmation_patterns):
+        return ""
+
+    recent_messages = [str(message or "") for message in state.get("recent_messages", [])[-6:]]
+    recent_messages.append(str(state.get("selected_message") or ""))
+    for message in reversed(recent_messages):
+        if not message:
+            continue
+        title_match = re.search(r"[\"']([^\"']+)[\"']", message)
+        if title_match:
+            candidate = _normalize_topic_title(title_match.group(1))
+            if candidate and not _looks_like_title_instruction(candidate):
+                return candidate
+    return ""
