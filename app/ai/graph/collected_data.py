@@ -169,6 +169,10 @@ PLACEHOLDER_VALUE_KEYWORDS: tuple[str, ...] = (
 META_CONVERSATION_VALUE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^\s*(?:아니|아니요|그게 아니라|다시|잠깐)\b"),
     re.compile(r"^\s*(?:왜|뭔 말|무슨 말|이게 무슨)\b"),
+    re.compile(r"^\s*(?:엥|에엥)\b"),
+    re.compile(r"^\s*(?:엥|에엥)\s*(?:무슨|뭔)\s*소리"),
+    re.compile(r"^\s*(?:무슨|뭔)\s*(?:말|소리)"),
+    re.compile(r"^\s*(?:이상한데|이상해|말이\s*안\s*되|이해가\s*안)"),
 )
 
 IDENTIFIER_LIKE_NOISE_PATTERN = re.compile(r"^(?=.*\d{4,})(?=.*[ㄱ-ㅎㅏ-ㅣ])[A-Za-z0-9ㄱ-ㅎㅏ-ㅣ_-]+$")
@@ -647,6 +651,8 @@ def is_valid_collected_value(key: str, value: object, *, team_size: object = Non
     normalized = cleaned.lower()
     if "@mates" in normalized or "?" in cleaned:
         return False
+    if is_meta_conversation(cleaned):
+        return False
     if is_placeholder_value(cleaned):
         return False
     if any(keyword in normalized for keyword in NEGATIVE_VALUE_KEYWORDS):
@@ -658,8 +664,6 @@ def is_valid_collected_value(key: str, value: object, *, team_size: object = Non
     if key in {"subject", "title"} and _looks_like_room_title_metadata(cleaned):
         return False
     if key in {"title", "goal"} and re.fullmatch(r"\d+(?:\.\d+)?", cleaned):
-        return False
-    if key == "roles" and has_role_team_size_conflict(value, team_size):
         return False
     return True
 
@@ -792,61 +796,6 @@ def build_role_team_size_conflict_message(roles: object, team_size: object) -> s
         f"역할 인원 합계가 {len(normalized_roles)}명인데 현재 총 인원은 "
         f"{normalized_team_size}명입니다. 겸임 기준인지 포함해서 역할 구성이나 총 인원을 다시 확인해 주세요."
     )
-
-
-def is_valid_collected_value(key: str, value: object, *, team_size: object = None) -> bool:
-    cleaned = _clean(key, value)
-    if not cleaned:
-        return False
-
-    normalized = cleaned.lower()
-    if "@mates" in normalized or "?" in cleaned:
-        return False
-    if is_placeholder_value(cleaned):
-        return False
-    if any(keyword in normalized for keyword in NEGATIVE_VALUE_KEYWORDS):
-        return False
-    if looks_like_non_committal_value(cleaned):
-        return False
-    if key in {"subject", "title"} and _looks_like_identifier_noise(cleaned):
-        return False
-    if key in {"subject", "title"} and _looks_like_room_title_metadata(cleaned):
-        return False
-    if key in {"title", "goal"} and re.fullmatch(r"\d+(?:\.\d+)?", cleaned):
-        return False
-    return True
-
-
-def sanitize_llm_updated_data(raw_updated_data: object) -> CollectedData:
-    if not isinstance(raw_updated_data, Mapping):
-        return {}
-    return sanitize_candidate_updates(raw_updated_data)
-
-
-def sanitize_candidate_updates(
-    updated_data: Mapping[str, object] | None,
-    *,
-    current_data: Mapping[str, object] | None = None,
-) -> CollectedData:
-    sanitized: CollectedData = {}
-    team_size = _effective_team_size(current_data, updated_data)
-    normalized_team_size = normalize_team_size((updated_data or {}).get("teamSize"))
-    if normalized_team_size is not None:
-        sanitized["teamSize"] = normalized_team_size
-
-    for key in COLLECTED_DATA_FIELDS:
-        if key == "teamSize":
-            continue
-
-        value = (updated_data or {}).get(key)
-        normalized_value = normalize_collected_value(key, value, team_size=team_size)
-        if normalized_value is None:
-            continue
-        if not is_valid_collected_value(key, normalized_value, team_size=team_size):
-            continue
-        sanitized[key] = normalized_value
-
-    return sanitized
 
 
 def evaluate_candidate_update(
