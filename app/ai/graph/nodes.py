@@ -3529,3 +3529,103 @@ def gather_information_node(state: AgentState):
     }
 
 
+_original_extract_topic_candidate = _extract_topic_candidate
+_original_extract_direct_fact_updates = _extract_direct_fact_updates
+_original_looks_like_commit_confirmation = _looks_like_commit_confirmation
+
+
+def _extract_topic_candidate(user_message: str) -> str:
+    candidate = _original_extract_topic_candidate(user_message)
+    if candidate:
+        return candidate
+
+    text = _clean_text(_strip_mates_mention(user_message))
+    if not text or "?" in text or _is_meta_conversation_message(text):
+        return ""
+
+    reverse_match = re.match(
+        r"^(.+?)\s*(?:을|를|이|가)?\s*주제로\s*(?:생각(?:하고)?\s*있(?:어|어요)|생각중(?:이야|이에요)?|잡(?:고)?\s*있(?:어|어요)|정했(?:어|어요)|하려(?:고)?(?:\s*해)?|하고\s*싶(?:어|어요))\s*$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not reverse_match:
+        return ""
+
+    candidate = reverse_match.group(1).strip()
+    candidate = TRAILING_TOPIC_ENDINGS_PATTERN.sub("", candidate).strip(" .,!?:;\"'")
+    if not candidate or len(candidate) > 60:
+        return ""
+    return candidate
+
+
+def _normalize_goal_candidate(candidate: str) -> str:
+    normalized = _normalize_direct_fact_value(candidate)
+    if not normalized:
+        return ""
+
+    normalized = re.sub(r"^\s*\d{1,2}[)\.\-:]\s*", "", normalized).strip()
+    normalized = re.sub(
+        r"\s*(?:을|를)\s*목표(?:로|로는)?\s*(?:할게|할 거야|할래|잡을게|정할게|삼을게|둘게)\s*$",
+        "",
+        normalized,
+        flags=re.IGNORECASE,
+    ).strip()
+    normalized = re.sub(
+        r"\s*(?:이|가)\s*목표(?:야|예요|입니다)\s*$",
+        "",
+        normalized,
+        flags=re.IGNORECASE,
+    ).strip()
+    normalized = re.sub(
+        r"^\s*(?:목표|goal)\s*(?:은|는|이|가|:)\s*",
+        "",
+        normalized,
+        flags=re.IGNORECASE,
+    ).strip()
+    return normalized.strip(" .,!?:;\"'")
+
+
+def _extract_goal_candidate_from_message(message: str) -> str:
+    normalized_message = _clean_text(message)
+    if not normalized_message or _is_meta_conversation_message(normalized_message):
+        return ""
+
+    explicit_patterns = (
+        r"(?:목표|goal)\s*(?:은|는|이|가|:)\s*(.+)$",
+        r"(.+?)\s*(?:을|를)\s*목표(?:로|로는)?\s*(?:할게|할 거야|할래|잡을게|정할게|삼을게|둘게)\s*$",
+        r"(.+?)\s*(?:이|가)\s*목표(?:야|예요|입니다)\s*$",
+    )
+    for pattern in explicit_patterns:
+        match = re.search(pattern, normalized_message, flags=re.IGNORECASE)
+        if not match:
+            continue
+        candidate = _normalize_goal_candidate(match.group(1))
+        if candidate and not _is_non_storable_freeform_message(candidate):
+            return candidate
+    return ""
+
+
+def _extract_direct_fact_updates(user_message: str) -> dict[str, object]:
+    updates = dict(_original_extract_direct_fact_updates(user_message))
+    goal_candidate = _extract_goal_candidate_from_message(
+        _clean_text(_strip_mates_mention(user_message))
+    )
+    if goal_candidate:
+        updates["goal"] = goal_candidate
+    return _sanitize_gather_updates(updates)
+
+
+def _looks_like_commit_confirmation(message: str) -> bool:
+    if _original_looks_like_commit_confirmation(message):
+        return True
+
+    normalized = _clean_text(message)
+    if not normalized:
+        return False
+
+    return bool(
+        re.search(r"(?:주제|목표|제목|마감|역할|인원|산출물).{0,6}확인했", normalized)
+        or re.search(r"(?:확인했습니다|확인했어요|확인할게요)", normalized)
+    )
+
+

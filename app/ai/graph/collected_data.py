@@ -1231,3 +1231,112 @@ def merge_collected_data(
             merged[key] = value
 
     return merged
+
+
+_original_is_request_like_value = is_request_like_value
+_original_is_undecided_value = is_undecided_value
+_original_is_valid_collected_value = is_valid_collected_value
+_original_evaluate_candidate_update = evaluate_candidate_update
+
+
+def is_request_like_value(value: object) -> bool:
+    if _original_is_request_like_value(value):
+        return True
+
+    cleaned = _clean_string(value)
+    if not cleaned:
+        return False
+
+    normalized = cleaned.lower()
+    extra_keywords = ("도와줘", "도와 줘", "도움 필요", "같이 정하자")
+    return any(keyword in normalized for keyword in extra_keywords)
+
+
+def is_undecided_value(value: object) -> bool:
+    if _original_is_undecided_value(value):
+        return True
+
+    cleaned = _clean_string(value)
+    if not cleaned:
+        return False
+
+    return bool(
+        re.match(r"^\s*아직\s+정하지\s+못했", cleaned)
+        or re.match(r"^\s*아직\s+못\s+정했", cleaned)
+    )
+
+
+def looks_like_non_committal_value(value: object) -> bool:
+    cleaned = _clean_string(value)
+    if not cleaned:
+        return False
+
+    return is_request_like_value(cleaned) or is_undecided_value(cleaned) or is_meta_conversation(
+        cleaned
+    )
+
+
+def is_valid_collected_value(key: str, value: object, *, team_size: object = None) -> bool:
+    if not _original_is_valid_collected_value(key, value, team_size=team_size):
+        return False
+
+    cleaned = _clean(key, value)
+    if key == "goal" and (is_request_like_value(cleaned) or is_undecided_value(cleaned)):
+        return False
+    return True
+
+
+def evaluate_candidate_update(
+    *,
+    key: str,
+    current_value: object,
+    incoming_value: object,
+    source: str,
+    user_message: str,
+    current_phase: str,
+    current_data: Mapping[str, object] | None,
+    candidate_updates: Mapping[str, object] | None,
+) -> CandidateDecision:
+    effective_team_size = _effective_team_size(current_data, candidate_updates)
+    team_size_for_key = incoming_value if key == "teamSize" else effective_team_size
+    normalized_incoming = normalize_collected_value(key, incoming_value, team_size=team_size_for_key)
+    current_team_size = normalize_team_size((current_data or {}).get("teamSize"))
+    current_normalized = normalize_collected_value(
+        key,
+        current_value,
+        team_size=current_team_size,
+    )
+
+    if (
+        key == "goal"
+        and current_normalized is not None
+        and not is_valid_collected_value(key, current_normalized, team_size=current_team_size)
+        and normalized_incoming is not None
+        and is_valid_collected_value(key, normalized_incoming, team_size=team_size_for_key)
+    ):
+        overwrite_mode = detect_overwrite_mode(
+            key=key,
+            current_value=current_value,
+            incoming_value=incoming_value,
+            user_message=user_message,
+        )
+        return CandidateDecision(
+            key=key,
+            approved=True,
+            normalized_value=normalized_incoming,
+            reason="replace_unconfirmed_goal",
+            overwrite_mode=overwrite_mode.value,
+            source=source,
+            requires_followup_question=False,
+        )
+
+    return _original_evaluate_candidate_update(
+        key=key,
+        current_value=current_value,
+        incoming_value=incoming_value,
+        source=source,
+        user_message=user_message,
+        current_phase=current_phase,
+        current_data=current_data,
+        candidate_updates=candidate_updates,
+    )
