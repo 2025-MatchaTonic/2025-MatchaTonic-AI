@@ -3821,3 +3821,76 @@ def _normalize_contextual_llm_updates(
         normalized_updates["dueDate"] = f"{due_date} ({qualifier})"
 
     return normalized_updates
+
+
+_final_extract_direct_fact_updates = _extract_direct_fact_updates
+_final_is_summary_request = _is_summary_request
+
+
+def _normalize_goal_candidate(candidate: str) -> str:
+    normalized = _normalize_direct_fact_value(candidate)
+    if not normalized:
+        return ""
+
+    normalized = re.sub(r"^\s*(?:목표|goal)\s*(?:은|는|이|가|:)\s*", "", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(
+        r"\s*(?:이|가)\s*목표(?:야|예요|입니다)?\s*$",
+        "",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    normalized = re.sub(
+        r"\s*(?:을|를)\s*목표(?:로|로는)?\s*(?:할게|할 거야|할래|잡을게|정할게|삼을게|둘게)\s*$",
+        "",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    normalized = re.sub(r"^\s*\d{1,2}[)\.\-:]\s*", "", normalized).strip()
+    normalized = re.sub(r"\s+", " ", normalized).strip(" .,!?:;\"'")
+    return normalized
+
+
+def _extract_goal_candidate_from_message(message: str) -> str:
+    normalized_message = _clean_text(message)
+    if not normalized_message or _is_meta_conversation_message(normalized_message):
+        return ""
+
+    explicit_patterns = (
+        r"^목표(?:는|은)?\s*(.+?)(?:이|가)\s*목표(?:야|예요|입니다)?\s*$",
+        r"^(.+?)(?:이|가)\s*목표(?:야|예요|입니다)?\s*$",
+        r"^목표(?:는|은)?\s*(.+)$",
+        r"^(.+?)(?:을|를)\s*목표(?:로|로는)?\s*(?:할게|할 거야|할래|잡을게|정할게|삼을게|둘게)\s*$",
+    )
+    for pattern in explicit_patterns:
+        match = re.search(pattern, normalized_message, flags=re.IGNORECASE)
+        if not match:
+            continue
+        candidate = _normalize_goal_candidate(match.group(1))
+        if candidate and not _is_non_storable_freeform_message(candidate):
+            return candidate
+    return ""
+
+
+def _extract_direct_fact_updates(user_message: str) -> dict[str, object]:
+    updates = dict(_final_extract_direct_fact_updates(user_message))
+    goal_candidate = _extract_goal_candidate_from_message(
+        _clean_text(_strip_mates_mention(user_message))
+    )
+    if goal_candidate:
+        updates["goal"] = goal_candidate
+    return _sanitize_gather_updates(updates)
+
+
+def _is_summary_request(user_message: str) -> bool:
+    normalized = _clean_text(_strip_mates_mention(user_message))
+    if not normalized:
+        return False
+
+    recommendation_topics = ("산출물", "결과물", "제출물")
+    recommendation_verbs = ("추천", "알려", "가이드", "예시", "정리해줘")
+    if any(topic in normalized for topic in recommendation_topics) and any(
+        verb in normalized for verb in recommendation_verbs
+    ):
+        return False
+
+    return _final_is_summary_request(user_message)
