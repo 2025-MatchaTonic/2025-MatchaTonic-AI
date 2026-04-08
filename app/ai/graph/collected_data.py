@@ -1308,6 +1308,30 @@ def evaluate_candidate_update(
     )
 
     if (
+        key == "dueDate"
+        and current_normalized is not None
+        and normalized_incoming is not None
+        and str(normalized_incoming).startswith(str(current_normalized))
+        and str(normalized_incoming) != str(current_normalized)
+        and any(marker in str(normalized_incoming) for marker in ("최종 제출", "중간 발표"))
+    ):
+        overwrite_mode = detect_overwrite_mode(
+            key=key,
+            current_value=current_value,
+            incoming_value=incoming_value,
+            user_message=user_message,
+        )
+        return CandidateDecision(
+            key=key,
+            approved=True,
+            normalized_value=normalized_incoming,
+            reason="enrich_existing_due_date",
+            overwrite_mode=overwrite_mode.value,
+            source=source,
+            requires_followup_question=False,
+        )
+
+    if (
         key == "goal"
         and current_normalized is not None
         and not is_valid_collected_value(key, current_normalized, team_size=current_team_size)
