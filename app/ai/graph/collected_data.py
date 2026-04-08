@@ -1213,26 +1213,26 @@ def derive_phase_from_collected_data(
 ) -> str:
     sanitized = sanitize_collected_data(data)
     subject = sanitized.get("subject")
+    has_execution_fact = any(
+        is_valid_collected_value(
+            key,
+            sanitized.get(key),
+            team_size=sanitized.get("teamSize"),
+        )
+        for key in ("goal", "teamSize", "roles", "dueDate", "deliverables")
+    )
     derived = "EXPLORE"
     if is_template_ready(sanitized):
         derived = "READY"
-    elif has_title(sanitized):
-        derived = "GATHER"
     elif has_subject(sanitized):
-        has_execution_fact = any(
-            is_valid_collected_value(
-                key,
-                sanitized.get(key),
-                team_size=sanitized.get("teamSize"),
-            )
-            for key in ("goal", "teamSize", "roles", "dueDate", "deliverables")
-        )
         if has_execution_fact:
             derived = "GATHER"
         elif subject_needs_problem_definition(subject):
             derived = "PROBLEM_DEFINE"
         else:
             derived = "GATHER"
+    elif has_title(sanitized):
+        derived = "GATHER" if has_execution_fact else "TOPIC_SET"
     elif sanitized:
         derived = "TOPIC_SET"
 

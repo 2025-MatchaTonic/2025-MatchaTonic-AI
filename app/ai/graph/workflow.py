@@ -5,7 +5,6 @@ from app.ai.graph.nodes import (
     _extract_title_updates_for_topic_set,
     _extract_direct_fact_updates,
     _extract_topic_candidate,
-    _is_meaningful_fact,
     _normalize_topic_title,
     _prune_collected_data,
     explore_problem_node,
@@ -13,13 +12,6 @@ from app.ai.graph.nodes import (
     topic_exists_node,
 )
 from app.api.endpoints.template import generate_dev_template, generate_plan_template
-
-
-def _has_title(state: AgentState) -> bool:
-    current_data = _prune_collected_data(state.get("collected_data") or {})
-    return _is_meaningful_fact(current_data.get("title"))
-
-
 def _has_any_collected_fact(state: AgentState) -> bool:
     current_data = _prune_collected_data(state.get("collected_data") or {})
     return bool(current_data)
@@ -61,14 +53,10 @@ def route_logic(state: AgentState):
 
     if action == "CHAT":
         if phase == "EXPLORE":
-            if _has_title(state):
-                return "gather_node"
             if _should_promote_explore_to_topic_set(state):
                 return "topic_exists_node"
             return "explore_node"
         if phase == "TOPIC_SET":
-            if _has_title(state):
-                return "gather_node"
             return "topic_exists_node"
         if phase == "PROBLEM_DEFINE":
             return "gather_node"
