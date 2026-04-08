@@ -126,10 +126,9 @@ def _derive_effective_phase(request: AIChatRequest) -> str:
 def _derive_turn_policy(request: AIChatRequest) -> TurnPolicy:
     action = request.actionType
     phase = _derive_effective_phase(request)
-    current_topic = (
-        str(request.collectedData.get("subject", "")).strip()
-        or str(request.collectedData.get("title", "")).strip()
-    )
+    current_topic = str(request.collectedData.get("subject", "")).strip()
+    if not current_topic and phase not in {"TOPIC_SET", "PROBLEM_DEFINE"}:
+        current_topic = str(request.collectedData.get("title", "")).strip()
     effective_message = _strip_mates_mention(request.content)
 
     if action == "BTN_NO":
