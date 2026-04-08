@@ -3431,9 +3431,15 @@ def gather_information_node(state: AgentState):
         }
 
     llm_updates_raw = dict(result.get("raw_updated_data", {}))
+    normalized_llm_updates = _normalize_contextual_llm_updates(
+        raw_updates=llm_updates_raw,
+        sanitized_updates=result["updated_data"],
+        current_data=prefilled_data,
+        user_message=user_message,
+    )
     filtered_updates = _filter_gather_updates(
         user_message,
-        result["updated_data"],
+        normalized_llm_updates,
         focus_type=focus_type,
     )
     if _get_topic_anchor(prefilled_data, allow_title_fallback=False):
@@ -3629,3 +3635,189 @@ def _looks_like_commit_confirmation(message: str) -> bool:
     )
 
 
+_prior_extract_due_date_candidate_from_message = _extract_due_date_candidate_from_message
+_prior_extract_direct_fact_updates = _extract_direct_fact_updates
+_prior_extract_target_facility_candidate = _extract_target_facility_candidate
+_prior_extract_problem_area_candidate = _extract_problem_area_candidate
+_prior_interpret_turn_type = _interpret_turn_type
+
+
+def _looks_like_public_facility_topic(topic_anchor: str) -> bool:
+    normalized = _clean_text(topic_anchor)
+    if not normalized:
+        return False
+    return any(keyword in normalized for keyword in ("공공시설", "시설", "도서관", "공원", "주민센터"))
+
+
+def _extract_deliverable_type_candidate(message: str) -> str:
+    normalized = _clean_text(message)
+    compact = re.sub(r"\s+", "", normalized)
+    if not normalized:
+        return ""
+    if any(token in normalized for token in ("알려줘", "도와줘", "정리해줘", "추천해줘", "예시")):
+        return ""
+    if any(token in compact for token in ("웹서비스", "웹형태", "웹서비스형태", "웹앱", "웹app")):
+        return "웹 서비스"
+    if any(token in compact for token in ("모바일앱", "앱형태")):
+        return "모바일 앱"
+    if "프로토타입" in normalized:
+        return "프로토타입"
+    return ""
+
+
+def _normalize_due_date_qualifier(value: str) -> str:
+    normalized = _clean_text(value)
+    compact = re.sub(r"\s+", "", normalized)
+    if compact in {"최종제출", "최종발표"}:
+        return "최종 제출"
+    if compact in {"중간발표", "중간제출"}:
+        return "중간 발표"
+    return normalized
+
+
+def _extract_due_date_candidate_from_message(message: str) -> str:
+    candidate = _prior_extract_due_date_candidate_from_message(message)
+    if candidate:
+        return candidate
+
+    normalized = _clean_text(message)
+    if not normalized:
+        return ""
+
+    date_chunk = r"((?:20\d{2}|\d{2})\s*년\s*\d{1,2}\s*월(?:\s*\d{1,2}\s*일)?|\d{1,2}\s*월(?:\s*\d{1,2}\s*일)?)"
+    patterns = (
+        rf"{date_chunk}\s*(?:이|가)?\s*(?:마감(?:일)?|데드라인)",
+        rf"(?:마감(?:일)?|데드라인|최종\s*제출|중간\s*발표)\s*(?:은|는|이|가|:)?\s*{date_chunk}",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, normalized, flags=re.IGNORECASE)
+        if not match:
+            continue
+        for group in match.groups():
+            if group:
+                return _normalize_due_date_candidate(group)
+    return ""
+
+
+def _extract_direct_fact_updates(user_message: str) -> dict[str, object]:
+    updates = dict(_prior_extract_direct_fact_updates(user_message))
+    message = _clean_text(_strip_mates_mention(user_message))
+    deliverable_candidate = _extract_deliverable_type_candidate(message)
+    if deliverable_candidate:
+        updates["deliverables"] = deliverable_candidate
+    return _sanitize_gather_updates(updates)
+
+
+def _extract_target_facility_candidate(
+    state: AgentState,
+    current_data: dict[str, object] | None = None,
+) -> str:
+    candidate = _prior_extract_target_facility_candidate(state, current_data)
+    if candidate:
+        return candidate
+
+    current_data = current_data or {}
+    topic_anchor = _get_topic_anchor(current_data, allow_title_fallback=False)
+    if not topic_anchor or not _looks_like_public_facility_topic(topic_anchor):
+        return ""
+
+    normalized = _clean_text(_effective_user_message(state))
+    if not normalized:
+        return ""
+    if _is_request_like_value(normalized) or _is_undecided_value(normalized):
+        return ""
+    if _is_meta_conversation_message(normalized) or _extract_due_date_candidate_from_message(normalized):
+        return ""
+    if _extract_choice_index(normalized) is not None:
+        return ""
+
+    compact = re.sub(r"\s+", "", normalized)
+    if len(compact) > 10:
+        return ""
+    if not TARGET_FACILITY_NOUN_PATTERN.search(normalized):
+        return ""
+    return _normalize_direct_fact_value(normalized).strip(" '\"")
+
+
+def _extract_problem_area_candidate(
+    state: AgentState,
+    current_data: dict[str, object] | None = None,
+    *,
+    direct_updates: dict[str, object] | None = None,
+) -> str:
+    candidate = _prior_extract_problem_area_candidate(
+        state,
+        current_data,
+        direct_updates=direct_updates,
+    )
+    if not candidate:
+        return ""
+
+    normalized = _clean_text(candidate)
+    compact = re.sub(r"\s+", "", normalized)
+    if "형태" in normalized:
+        return ""
+    if compact.endswith("우선") or compact in {"시민이우선", "관리자가우선"}:
+        return ""
+    if any(token in normalized for token in ("시민", "관리자", "사용자")) and "우선" in normalized:
+        return ""
+    if TARGET_FACILITY_NOUN_PATTERN.search(normalized) and len(compact) <= 10:
+        return ""
+    return candidate
+
+
+def _looks_like_advice_request(user_message: str) -> bool:
+    normalized = _clean_text(_strip_mates_mention(user_message))
+    if not normalized:
+        return False
+    help_tokens = ("알려줘", "도와줘", "정리해줘", "써줘", "만들어줘", "추천해줘")
+    advice_topics = ("형태", "문장", "논리", "구조", "예시", "발표용", "산출물")
+    return any(token in normalized for token in help_tokens) and any(
+        topic in normalized for topic in advice_topics
+    )
+
+
+def _interpret_turn_type(
+    state: AgentState,
+    current_data: dict[str, str] | None = None,
+    *,
+    direct_updates: dict[str, object] | None = None,
+) -> str:
+    turn_type = _prior_interpret_turn_type(
+        state,
+        current_data,
+        direct_updates=direct_updates,
+    )
+    user_message = _effective_user_message(state)
+    direct_updates = dict(direct_updates or {})
+
+    if turn_type == "request_next_step" and _looks_like_advice_request(user_message):
+        return "general"
+
+    if turn_type == "provide_problem_area":
+        effective_current_data = current_data or state.get("collected_data") or {}
+        if not _extract_problem_area_candidate(state, effective_current_data, direct_updates=direct_updates):
+            if _extract_target_facility_candidate(state, effective_current_data):
+                return "provide_target_facility"
+            return "general"
+
+    return turn_type
+
+
+def _normalize_contextual_llm_updates(
+    *,
+    raw_updates: dict[str, object],
+    sanitized_updates: dict[str, object],
+    current_data: dict[str, object],
+    user_message: str,
+) -> dict[str, object]:
+    normalized_updates = dict(sanitized_updates or {})
+    due_date = str(current_data.get("dueDate") or "").strip()
+    qualifier = _normalize_due_date_qualifier(
+        str(raw_updates.get("dueDatePhase") or raw_updates.get("dueDateType") or "").strip()
+    )
+
+    if due_date and qualifier:
+        normalized_updates["dueDate"] = f"{due_date} ({qualifier})"
+
+    return normalized_updates

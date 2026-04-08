@@ -96,6 +96,10 @@ class AIChatResponse(BaseModel):
     currentStatus: str
     isSufficient: bool
     collectedData: CollectedData
+    approvedUpdates: Dict[str, Any] = Field(default_factory=dict)
+    rejectedUpdates: Dict[str, Any] = Field(default_factory=dict)
+    rejectedReasons: Dict[str, Any] = Field(default_factory=dict)
+    followupFields: List[str] = Field(default_factory=list)
     notionTemplatePayload: Optional[NotionTemplatePayload] = None
 
 
@@ -263,6 +267,10 @@ async def process_chat(request: AIChatRequest):
             currentStatus=response_phase,
             isSufficient=result.get("is_sufficient", False),
             collectedData=response_collected_data,
+            approvedUpdates=approved_updates,
+            rejectedUpdates=rejected_updates,
+            rejectedReasons=rejected_reasons,
+            followupFields=followup_fields,
             notionTemplatePayload=result.get("template_payload"),
         )
     except Exception as exc:

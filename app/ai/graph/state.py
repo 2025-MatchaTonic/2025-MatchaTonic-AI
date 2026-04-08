@@ -24,3 +24,7 @@ class AgentState(TypedDict):
     ai_message: str
     next_phase: str
     template_payload: Dict[str, Any] | None
+    approved_updates: Dict[str, Any]
+    rejected_updates: Dict[str, Any]
+    rejected_reasons: Dict[str, Any]
+    followup_fields: List[str]
