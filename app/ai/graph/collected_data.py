@@ -1364,3 +1364,68 @@ def evaluate_candidate_update(
         current_data=current_data,
         candidate_updates=candidate_updates,
     )
+
+
+_previous_normalize_collected_value = normalize_collected_value
+_previous_sanitize_llm_updated_data = sanitize_llm_updated_data
+_previous_sanitize_candidate_updates = sanitize_candidate_updates
+_previous_sanitize_collected_data = sanitize_collected_data
+_previous_looks_like_room_title_metadata = _looks_like_room_title_metadata
+
+
+def _looks_like_room_title_metadata(value: object) -> bool:
+    cleaned = _clean_string(value)
+    if not cleaned:
+        return False
+    compact = re.sub(r"\s+", "", cleaned).lower()
+    if re.fullmatch(r"promate\d+", compact):
+        return True
+    return _previous_looks_like_room_title_metadata(value)
+
+
+def normalize_collected_value(
+    key: str,
+    value: object,
+    *,
+    team_size: object = None,
+) -> CollectedDataValue | None:
+    if key == "deliverables" and isinstance(value, (list, tuple, set)):
+        parts = [_clean_string(item) for item in value if _clean_string(item)]
+        if not parts:
+            return None
+        return "; ".join(parts)
+    return _previous_normalize_collected_value(key, value, team_size=team_size)
+
+
+def sanitize_llm_updated_data(raw_updated_data: object) -> CollectedData:
+    if not isinstance(raw_updated_data, Mapping):
+        return {}
+
+    normalized_payload = dict(raw_updated_data)
+    if isinstance(raw_updated_data.get("deliverables"), (list, tuple, set)):
+        normalized_payload["deliverables"] = normalize_collected_value(
+            "deliverables",
+            raw_updated_data.get("deliverables"),
+        )
+    return _previous_sanitize_llm_updated_data(normalized_payload)
+
+
+def sanitize_candidate_updates(
+    updated_data: Mapping[str, object] | None,
+    *,
+    current_data: Mapping[str, object] | None = None,
+) -> CollectedData:
+    normalized_payload = dict(updated_data or {})
+    if isinstance(normalized_payload.get("deliverables"), (list, tuple, set)):
+        normalized_payload["deliverables"] = normalize_collected_value(
+            "deliverables",
+            normalized_payload.get("deliverables"),
+        )
+    return _previous_sanitize_candidate_updates(normalized_payload, current_data=current_data)
+
+
+def sanitize_collected_data(data: Mapping[str, object] | None) -> CollectedData:
+    sanitized = _previous_sanitize_collected_data(data)
+    if _looks_like_room_title_metadata(sanitized.get("title")):
+        sanitized.pop("title", None)
+    return sanitized
