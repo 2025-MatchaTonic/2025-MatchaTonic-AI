@@ -13,6 +13,7 @@ from app.ai.graph.text_support import (
 )
 from app.ai.graph.collected_data import (
     CollectedData,
+    choose_next_question_field,
     derive_phase_from_collected_data,
     missing_collected_fields,
 )
@@ -167,6 +168,18 @@ def _build_suggested_questions(
     suggestions: List[str] = []
     seen_fields: set[str] = set()
 
+    next_field = choose_next_question_field(
+        collected_data,
+        current_phase=phase,
+        followup_fields=followup_fields or [],
+        rejected_updates=rejected_updates or {},
+    )
+    if next_field:
+        seen_fields.add(next_field)
+        question = QUESTION_BY_FIELD.get(next_field)
+        if question:
+            suggestions.append(question)
+
     priority_fields: List[str] = []
     for field in followup_fields or []:
         if field not in seen_fields:
@@ -239,13 +252,20 @@ async def process_chat(request: AIChatRequest):
         rejected_updates = result.get("rejected_updates", {})
         rejected_reasons = result.get("rejected_reasons", {})
         followup_fields = result.get("followup_fields", [])
+        next_question_field = choose_next_question_field(
+            response_collected_data,
+            current_phase=response_phase,
+            followup_fields=followup_fields,
+            rejected_updates=rejected_updates,
+        )
         logger.info(
-            "chat decision room=%s phase=%s approved_updates=%s rejected_updates=%s rejected_reasons=%s",
+            "chat decision room=%s phase=%s approved_updates=%s rejected_updates=%s rejected_reasons=%s next_question_field=%s",
             request.roomId,
             response_phase,
             approved_updates,
             rejected_updates,
             rejected_reasons,
+            next_question_field,
         )
         logger.info(
             "chat response room=%s next_phase=%s is_sufficient=%s collected_data=%s ai_message=%r",
