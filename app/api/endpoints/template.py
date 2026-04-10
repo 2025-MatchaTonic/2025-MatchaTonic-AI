@@ -9,9 +9,9 @@ from pydantic import ValidationError
 
 from app.ai.graph.collected_data import (
     CollectedData,
+    build_approved_collected_data_snapshot,
     derive_phase_from_collected_data,
     missing_collected_fields,
-    sanitize_collected_data,
 )
 from app.ai.graph.llm_clients import structured_llm
 from app.ai.graph.nodes import _fetch_rag_context, _get_rag_filters
@@ -145,7 +145,7 @@ def _build_template_state(request: TemplateGenerateRequest) -> dict:
             else "기획 템플릿 생성해줘"
         )
 
-    approved_collected_data = sanitize_collected_data(request.collectedData)
+    approved_collected_data = build_approved_collected_data_snapshot(request.collectedData)
     effective_phase = derive_phase_from_collected_data(
         approved_collected_data,
         current_phase=request.currentStatus,
@@ -170,11 +170,12 @@ def _build_template_state(request: TemplateGenerateRequest) -> dict:
 def _run_template_generation(request: TemplateGenerateRequest) -> tuple[dict, dict]:
     state = _build_template_state(request)
     logger.info(
-        "template request room=%s current_status=%s effective_phase=%s missing_fields=%s collected_data=%s",
+        "template request room=%s current_status=%s effective_phase=%s missing_fields=%s snapshot_before=%s snapshot_after=%s",
         request.roomId,
         request.currentStatus,
         state["current_phase"],
         missing_collected_fields(state["collected_data"]),
+        request.collectedData,
         state["collected_data"],
     )
     result = (

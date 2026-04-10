@@ -9,8 +9,10 @@ from time import perf_counter
 from app.ai.graph.collected_data import (
     FIELD_POLICY,
     CandidateDecision,
+    apply_collected_data_updates,
     build_collected_data_json_example,
     build_role_team_size_conflict_message,
+    choose_next_question_field,
     classify_role_team_size_conflict,
     derive_phase_from_collected_data,
     evaluate_candidate_update,
@@ -2011,6 +2013,220 @@ def _finalize_committed_response(
     return ai_message
 
 
+def _build_next_missing_field_prompt(
+    current_data: dict[str, object],
+    *,
+    current_phase: str = "GATHER",
+    followup_fields: list[str] | None = None,
+    rejected_updates: dict[str, object] | None = None,
+) -> str:
+    normalized = _prune_collected_data(current_data)
+    subject = str(normalized.get("subject") or "").strip()
+    next_field = choose_next_question_field(
+        normalized,
+        current_phase=current_phase,
+        followup_fields=followup_fields,
+        rejected_updates=rejected_updates,
+    )
+    if next_field == "subject" and not subject:
+        return "먼저 어떤 분야나 문제를 다루는 프로젝트인지 한 줄로 정해볼까요?"
+    if subject and subject_needs_problem_definition(subject):
+        return (
+            f"좋아요. '{subject}' 쪽으로 가면 "
+            "그 안에서 어떤 문제를 해결하고 싶은지 한 줄로 말해 주세요."
+        )
+    if next_field == "title":
+        return "다음으로 프로젝트 제목을 한 줄로 정해볼까요?"
+    if next_field and next_field in GATHER_FIELD_GUIDE:
+        return GATHER_FIELD_GUIDE[next_field]["question"]
+    return ""
+
+
+def _build_fact_confirmation_message(
+    merged_data: dict[str, object],
+    accepted_updates: dict[str, object],
+    *,
+    current_phase: str = "GATHER",
+    followup_fields: list[str] | None = None,
+    rejected_updates: dict[str, object] | None = None,
+) -> str:
+    confirmations: list[str] = []
+    if "subject" in accepted_updates and merged_data.get("subject"):
+        confirmations.append(f"주제는 '{merged_data['subject']}'")
+    if "title" in accepted_updates and merged_data.get("title"):
+        confirmations.append(f"제목은 '{merged_data['title']}'")
+    if "goal" in accepted_updates and merged_data.get("goal"):
+        confirmations.append(f"목표는 '{merged_data['goal']}'")
+    if "teamSize" in accepted_updates and merged_data.get("teamSize"):
+        confirmations.append(
+            f"팀 인원은 {format_collected_value('teamSize', merged_data['teamSize'])}명"
+        )
+    if "roles" in accepted_updates and merged_data.get("roles"):
+        confirmations.append(f"역할은 {format_collected_value('roles', merged_data['roles'])}")
+    if "dueDate" in accepted_updates and merged_data.get("dueDate"):
+        confirmations.append(f"마감일은 {merged_data['dueDate']}")
+    if "deliverables" in accepted_updates and merged_data.get("deliverables"):
+        confirmations.append(f"산출물은 {merged_data['deliverables']}")
+
+    if not confirmations:
+        return _build_collected_data_summary(merged_data)
+
+    message = "좋아요. " + ", ".join(confirmations) + "로 반영할게요."
+    follow_up = _build_next_missing_field_prompt(
+        merged_data,
+        current_phase=current_phase,
+        followup_fields=followup_fields,
+        rejected_updates=rejected_updates,
+    )
+    if follow_up:
+        message += f" {follow_up}"
+    return message
+
+
+def _build_rejection_response(
+    merged_data: dict[str, object],
+    *,
+    rejected_updates: dict[str, object],
+    rejected_reasons: dict[str, str],
+    current_phase: str,
+    followup_fields: list[str] | None = None,
+    ai_message: str = "",
+) -> str:
+    labels = {
+        "subject": "주제",
+        "title": "제목",
+        "goal": "목표",
+        "teamSize": "팀 인원",
+        "roles": "역할",
+        "dueDate": "마감일",
+        "deliverables": "산출물",
+    }
+    key = next(iter(rejected_reasons), "")
+    reason = rejected_reasons.get(key, "")
+    label = labels.get(key, key or "이 내용")
+
+    if reason in {
+        "turn_type_blocks_storage",
+        "subject_request_like_not_storable",
+        "goal_request_like_not_storable",
+        "title_request_like_not_storable",
+    }:
+        message = f"방금 말씀은 요청으로 이해돼서 {label}로 바로 저장하진 않았어요."
+    elif reason in {"title_requires_explicit_confirmation", "title_requires_recent_context"}:
+        message = "제목은 명시적으로 정하거나 직전 제안을 확정한 경우에만 반영할게요."
+    elif reason in {
+        "overwrite_requires_explicit_correction",
+        "protected_field_requires_explicit_or_strong_restatement",
+        "guarded_field_kept_existing_value",
+    }:
+        message = f"기존 {label}은 수정 의도가 분명할 때만 바꿀게요."
+    else:
+        message = f"{label}은 이번 턴에 바로 저장하지 않았어요."
+
+    if ai_message and not _looks_like_commit_confirmation(ai_message):
+        message = f"{message} {ai_message}".strip()
+    follow_up = _build_next_missing_field_prompt(
+        merged_data,
+        current_phase=current_phase,
+        followup_fields=followup_fields,
+        rejected_updates=rejected_updates,
+    )
+    if follow_up:
+        message = f"{message} {follow_up}".strip()
+    return message
+
+
+def _finalize_committed_response(
+    *,
+    turn_type: str,
+    merged_data: dict[str, object],
+    accepted_updates: dict[str, object],
+    ai_message: str,
+    is_sufficient: bool,
+    current_phase: str = "GATHER",
+    rejected_updates: dict[str, object] | None = None,
+    rejected_reasons: dict[str, str] | None = None,
+    followup_fields: list[str] | None = None,
+) -> str:
+    if turn_type == "request_summary":
+        return _build_collected_data_summary(merged_data)
+    if turn_type == "request_fill_missing":
+        if is_sufficient:
+            return _build_collected_data_summary(merged_data)
+        follow_up = _build_next_missing_field_prompt(
+            merged_data,
+            current_phase=current_phase,
+            followup_fields=followup_fields,
+            rejected_updates=rejected_updates,
+        )
+        if follow_up:
+            return follow_up
+        return _build_collected_data_summary(merged_data)
+    if turn_type == "request_goal_guidance":
+        return _build_goal_guidance_message(merged_data)
+    if turn_type in {"request_refine_topic", "request_guided_exploration"}:
+        subject = str(merged_data.get("subject") or "").strip()
+        if subject and not subject_needs_problem_definition(subject):
+            follow_up = _build_next_missing_field_prompt(
+                merged_data,
+                current_phase=current_phase,
+                followup_fields=followup_fields,
+                rejected_updates=rejected_updates,
+            )
+            if follow_up:
+                return follow_up
+        return _build_topic_refinement_message(merged_data)
+    if turn_type == "request_next_step":
+        if is_sufficient:
+            return _build_collected_data_summary(merged_data)
+        follow_up = _build_next_missing_field_prompt(
+            merged_data,
+            current_phase=current_phase,
+            followup_fields=followup_fields,
+            rejected_updates=rejected_updates,
+        )
+        if follow_up:
+            return follow_up
+        return _build_collected_data_summary(merged_data)
+    if turn_type in {"provide_fact", "provide_topic"} and accepted_updates:
+        return _build_fact_confirmation_message(
+            merged_data,
+            accepted_updates,
+            current_phase=current_phase,
+            followup_fields=followup_fields,
+            rejected_updates=rejected_updates,
+        )
+    if turn_type in {"provide_fact", "provide_topic"} and rejected_reasons:
+        return _build_rejection_response(
+            merged_data,
+            rejected_updates=rejected_updates or {},
+            rejected_reasons=rejected_reasons,
+            current_phase=current_phase,
+            followup_fields=followup_fields,
+            ai_message=ai_message,
+        )
+    if not accepted_updates and _looks_like_commit_confirmation(ai_message):
+        follow_up = _build_next_missing_field_prompt(
+            merged_data,
+            current_phase=current_phase,
+            followup_fields=followup_fields,
+            rejected_updates=rejected_updates,
+        )
+        if follow_up:
+            return follow_up
+        return _build_collected_data_summary(merged_data)
+    if not is_sufficient and _looks_like_template_ready_claim(ai_message):
+        follow_up = _build_next_missing_field_prompt(
+            merged_data,
+            current_phase=current_phase,
+            followup_fields=followup_fields,
+            rejected_updates=rejected_updates,
+        )
+        summary = _build_collected_data_summary(merged_data)
+        return f"{summary} {follow_up}".strip() if follow_up else summary
+    return ai_message
+
+
 SOURCE_BASE_WEIGHTS = {
     "direct_structured": 3,
     "direct_heuristic": 2,
@@ -2124,6 +2340,9 @@ def _evaluate_candidate_updates(
     candidate_updates: dict[str, object],
     user_message: str,
     current_phase: str,
+    turn_type: str,
+    recent_messages: list[str] | None = None,
+    selected_message: str | None = None,
 ) -> tuple[
     dict[str, object],
     dict[str, object],
@@ -2131,35 +2350,23 @@ def _evaluate_candidate_updates(
     dict[str, CandidateDecision],
     list[str],
 ]:
-    approved_updates: dict[str, object] = {}
-    rejected_updates: dict[str, object] = {}
-    rejected_reasons: dict[str, str] = {}
-    decisions: dict[str, CandidateDecision] = {}
-    followup_fields: list[str] = []
-
-    for key, incoming_value in candidate_updates.items():
-        source = str(candidate_sources.get(key, {}).get("source") or "unknown")
-        decision = evaluate_candidate_update(
-            key=key,
-            current_value=current_data.get(key),
-            incoming_value=incoming_value,
-            source=source,
-            user_message=user_message,
-            current_phase=current_phase,
-            current_data=current_data,
-            candidate_updates=candidate_updates,
-        )
-        decisions[key] = decision
-        if decision.approved and decision.normalized_value is not None:
-            approved_updates[key] = decision.normalized_value
-        else:
-            rejected_updates[key] = incoming_value
-            rejected_reasons[key] = decision.reason
-
-        if decision.requires_followup_question and key not in followup_fields:
-            followup_fields.append(key)
-
-    return approved_updates, rejected_updates, rejected_reasons, decisions, followup_fields
+    _, audit = apply_collected_data_updates(
+        current=current_data,
+        candidate=candidate_updates,
+        turn_type=turn_type,
+        current_status=current_phase,
+        recent_messages=recent_messages,
+        selected_message=selected_message,
+        user_message=user_message,
+        candidate_sources=candidate_sources,
+    )
+    return (
+        dict(audit.get("approved", {})),
+        dict(audit.get("rejected", {})),
+        dict(audit.get("rejected_reasons", {})),
+        dict(audit.get("decisions", {})),
+        list(audit.get("needs_confirmation", [])),
+    )
 
 
 def _log_collected_data_trace(
@@ -2501,6 +2708,30 @@ def _sanitize_gather_updates(updated_data: dict[str, object]) -> dict[str, objec
     return _shared_sanitize_candidate_updates(sanitized)
 
 
+def _extract_confirmed_title_from_context(state: AgentState) -> str:
+    user_message = _clean_text(_strip_mates_mention(_effective_user_message(state)))
+    if not any(token in user_message for token in ("그 제목", "그 이름", "그걸로")):
+        return ""
+
+    blocks = [str(state.get("selected_message") or "")]
+    blocks.extend(str(message or "") for message in state.get("recent_messages", [])[-6:])
+    for block in reversed(blocks):
+        if not block:
+            continue
+        for pattern in (
+            r"'([^']+)'",
+            r'"([^"]+)"',
+            r"제목\s*제안[:：]?\s*([^\n]+)",
+        ):
+            match = re.search(pattern, block)
+            if not match:
+                continue
+            candidate = _normalize_topic_title(match.group(1))
+            if candidate and not _looks_like_title_instruction(candidate):
+                return candidate
+    return ""
+
+
 def _filter_gather_updates(
     user_message: str,
     updated_data: dict[str, object],
@@ -2721,6 +2952,10 @@ def topic_exists_node(state: AgentState):
     raw_current_data = dict(state.get("collected_data") or {})
     current_data = _prune_collected_data(raw_current_data)
     direct_updates_raw = _extract_direct_fact_updates(user_message)
+    if "title" not in direct_updates_raw:
+        confirmed_title = _extract_confirmed_title_from_context(state)
+        if confirmed_title:
+            direct_updates_raw["title"] = confirmed_title
     turn_type = _interpret_turn_type(state, current_data, direct_updates=direct_updates_raw)
     problem_area_candidate = _extract_problem_area_candidate(
         state,
@@ -2749,6 +2984,7 @@ def topic_exists_node(state: AgentState):
             current_data=current_data,
         ),
     )
+    turn_type = _interpret_turn_type(state, current_data, direct_updates=direct_updates_raw)
     approved_updates, rejected_updates, rejected_reasons, decisions, followup_fields = (
         _evaluate_candidate_updates(
             current_data=current_data,
@@ -2756,6 +2992,9 @@ def topic_exists_node(state: AgentState):
             candidate_updates=candidate_updates_merged,
             user_message=user_message,
             current_phase="TOPIC_SET",
+            turn_type=turn_type,
+            recent_messages=state.get("recent_messages", []),
+            selected_message=state.get("selected_message"),
         )
     )
     merged_data = merge_collected_data(current_data, approved_updates)
@@ -2824,6 +3063,10 @@ def topic_exists_node(state: AgentState):
                 "collected_data": merged_data,
                 "is_sufficient": is_sufficient,
                 "next_phase": next_phase,
+                "approved_updates": approved_updates,
+                "rejected_updates": rejected_updates,
+                "rejected_reasons": rejected_reasons,
+                "followup_fields": followup_fields,
             }
         if broad_subject:
             return {
@@ -2831,6 +3074,10 @@ def topic_exists_node(state: AgentState):
                 "collected_data": merged_data,
                 "is_sufficient": is_sufficient,
                 "next_phase": next_phase,
+                "approved_updates": approved_updates,
+                "rejected_updates": rejected_updates,
+                "rejected_reasons": rejected_reasons,
+                "followup_fields": followup_fields,
             }
         return {
             "ai_message": (
@@ -2840,6 +3087,10 @@ def topic_exists_node(state: AgentState):
             "collected_data": merged_data,
             "is_sufficient": is_sufficient,
             "next_phase": next_phase,
+            "approved_updates": approved_updates,
+            "rejected_updates": rejected_updates,
+            "rejected_reasons": rejected_reasons,
+            "followup_fields": followup_fields,
         }
     extracted_title = accepted_updates.get("title", "")
     if extracted_title:
@@ -2855,6 +3106,10 @@ def topic_exists_node(state: AgentState):
                 "collected_data": merged_data,
                 "is_sufficient": is_sufficient,
                 "next_phase": next_phase,
+                "approved_updates": approved_updates,
+                "rejected_updates": rejected_updates,
+                "rejected_reasons": rejected_reasons,
+                "followup_fields": followup_fields,
             }
         return {
             "ai_message": (
@@ -2864,6 +3119,10 @@ def topic_exists_node(state: AgentState):
             "collected_data": merged_data,
             "is_sufficient": is_sufficient,
             "next_phase": next_phase,
+            "approved_updates": approved_updates,
+            "rejected_updates": rejected_updates,
+            "rejected_reasons": rejected_reasons,
+            "followup_fields": followup_fields,
         }
     if turn_type == "provide_problem_area" and problem_area_candidate:
         topic_anchor = _get_topic_anchor(
@@ -3013,6 +3272,10 @@ def gather_information_node(state: AgentState):
         for key, value in _extract_direct_fact_updates(user_message).items()
         if key in {"subject", "title", "goal", "teamSize", "roles", "dueDate", "deliverables"}
     }
+    if "title" not in direct_updates_raw:
+        confirmed_title = _extract_confirmed_title_from_context(state)
+        if confirmed_title:
+            direct_updates_raw["title"] = confirmed_title
     direct_updates = _shared_sanitize_candidate_updates(
         direct_updates_raw,
         current_data=prefilled_data,
@@ -3023,6 +3286,7 @@ def gather_information_node(state: AgentState):
         direct_updates=direct_updates,
         llm_updates={},
     )
+    turn_type = _interpret_turn_type(state, current_data, direct_updates=direct_updates_raw)
     (
         direct_approved_updates,
         direct_rejected_updates,
@@ -3035,8 +3299,10 @@ def gather_information_node(state: AgentState):
         candidate_updates=direct_candidate_updates,
         user_message=user_message,
         current_phase=current_phase,
+        turn_type=turn_type,
+        recent_messages=state.get("recent_messages", []),
+        selected_message=state.get("selected_message"),
     )
-    turn_type = _interpret_turn_type(state, current_data, direct_updates=direct_updates_raw)
     target_facility_candidate = _extract_target_facility_candidate(state, prefilled_data)
     recent_problem_area = _get_recent_problem_area_from_context(state)
     direct_conflict_message = _decision_conflict_message(
@@ -3276,7 +3542,12 @@ def gather_information_node(state: AgentState):
             rejected_reasons=direct_rejected_reasons,
             decisions=direct_decisions,
         )
-        follow_up = _build_next_missing_field_prompt(merged_preview)
+        follow_up = _build_next_missing_field_prompt(
+            merged_preview,
+            current_phase=current_phase,
+            followup_fields=direct_followup_fields,
+            rejected_updates=direct_rejected_updates,
+        )
         ai_message = direct_conflict_message
         if follow_up:
             ai_message = f"{ai_message} {follow_up}"
@@ -3294,15 +3565,23 @@ def gather_information_node(state: AgentState):
         turn_type in {"provide_fact", "provide_due_date_candidate"}
         or requested_next_step
         or turn_type == "request_fill_missing"
+        or direct_approved_updates
     ):
+        next_question_field = choose_next_question_field(
+            merged_preview,
+            current_phase=current_phase,
+            followup_fields=direct_followup_fields,
+            rejected_updates=direct_rejected_updates,
+        )
         next_phase = derive_phase_from_collected_data(merged_preview, current_phase=current_phase)
         is_sufficient = _is_template_ready(merged_preview)
         logger.info(
-            "gather committed direct updates before=%s after=%s next_phase=%s is_sufficient=%s",
+            "gather committed direct updates before=%s after=%s next_phase=%s is_sufficient=%s next_question_field=%s",
             prefilled_data,
             merged_preview,
             next_phase,
             is_sufficient,
+            next_question_field,
         )
         _log_collected_data_trace(
             state,
@@ -3325,6 +3604,10 @@ def gather_information_node(state: AgentState):
                     accepted_updates=direct_approved_updates,
                     ai_message="",
                     is_sufficient=is_sufficient,
+                    current_phase=current_phase,
+                    rejected_updates=direct_rejected_updates,
+                    rejected_reasons=direct_rejected_reasons,
+                    followup_fields=direct_followup_fields,
                 ),
             ),
             "collected_data": merged_preview,
@@ -3463,6 +3746,9 @@ def gather_information_node(state: AgentState):
         candidate_updates=candidate_updates_merged,
         user_message=user_message,
         current_phase=current_phase,
+        turn_type=turn_type,
+        recent_messages=state.get("recent_messages", []),
+        selected_message=state.get("selected_message"),
     )
     merged_data = merge_collected_data(prefilled_data, approved_updates)
     accepted_updates = {
@@ -3470,6 +3756,12 @@ def gather_information_node(state: AgentState):
     }
     next_phase = derive_phase_from_collected_data(merged_data, current_phase=current_phase)
     is_sufficient = _is_template_ready(merged_data)
+    next_question_field = choose_next_question_field(
+        merged_data,
+        current_phase=current_phase,
+        followup_fields=followup_fields,
+        rejected_updates=rejected_updates,
+    )
     _log_collected_data_trace(
         state,
         raw_collected_data=raw_current_data,
@@ -3483,7 +3775,7 @@ def gather_information_node(state: AgentState):
         decisions=decisions,
     )
     logger.info(
-        "gather llm_candidates=%s candidate_updates_merged=%s accepted_updates=%s rejected_updates=%s before=%s after=%s next_phase=%s is_sufficient=%s",
+        "gather llm_candidates=%s candidate_updates_merged=%s accepted_updates=%s rejected_updates=%s before=%s after=%s next_phase=%s is_sufficient=%s next_question_field=%s",
         filtered_updates,
         candidate_updates_merged,
         accepted_updates,
@@ -3492,6 +3784,7 @@ def gather_information_node(state: AgentState):
         merged_data,
         next_phase,
         is_sufficient,
+        next_question_field,
     )
     ai_msg = _finalize_committed_response(
         turn_type=turn_type,
@@ -3499,6 +3792,10 @@ def gather_information_node(state: AgentState):
         accepted_updates=accepted_updates,
         ai_message=str(result.get("ai_message") or "").strip(),
         is_sufficient=is_sufficient,
+        current_phase=current_phase,
+        rejected_updates=rejected_updates,
+        rejected_reasons=rejected_reasons,
+        followup_fields=followup_fields,
     )
     candidate_conflict_message = _decision_conflict_message(
         prefilled_data,
@@ -3506,7 +3803,12 @@ def gather_information_node(state: AgentState):
         decisions,
     )
     if candidate_conflict_message:
-        follow_up = _build_next_missing_field_prompt(merged_data)
+        follow_up = _build_next_missing_field_prompt(
+            merged_data,
+            current_phase=current_phase,
+            followup_fields=followup_fields,
+            rejected_updates=rejected_updates,
+        )
         ai_msg = candidate_conflict_message
         if follow_up:
             ai_msg = f"{ai_msg} {follow_up}"

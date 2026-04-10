@@ -1,9 +1,13 @@
-from app.ai.graph.collected_data import format_collected_value
+from app.ai.graph.collected_data import (
+    build_approved_collected_data_snapshot,
+    format_collected_value,
+)
 from app.ai.graph.state import AgentState
 from app.ai.graph.text_support import clean_text, strip_mates_mention
 
 
 def build_project_snapshot(data: dict) -> dict[str, str]:
+    data = build_approved_collected_data_snapshot(data)
     subject = clean_text(data.get("subject")) or "프로젝트 주제 미정"
     title = clean_text(data.get("title")) or subject
     goal = clean_text(data.get("goal")) or "프로젝트 목표는 추가 논의가 필요합니다."
