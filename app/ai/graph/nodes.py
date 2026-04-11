@@ -20,7 +20,6 @@ from app.ai.graph.collected_data import (
     has_role_team_size_conflict,
     is_template_ready as _shared_is_template_ready,
     is_valid_collected_value as _shared_is_valid_collected_value,
-    is_meta_conversation,
     is_placeholder_value,
     is_request_like_value,
     is_undecided_value,
@@ -37,6 +36,52 @@ from app.ai.graph.llm_clients import (
     invoke_llm as _invoke_llm,
     structured_llm,
 )
+from app.ai.graph.conversation_heuristics import (
+    CHOICE_INDEX_PATTERN,
+    CHOICE_PREFIX_PATTERN,
+    DELIVERABLES_PATTERN,
+    DIRECT_FACT_ENDING_PATTERN,
+    DUE_DATE_PATTERN,
+    FAST_RAG_PHASES,
+    FILL_REMAINING_EXACT_KEYWORDS,
+    FILL_REMAINING_SCOPE_KEYWORDS,
+    FILL_REMAINING_TRIGGER_KEYWORDS,
+    GATHER_FIELD_GUIDE,
+    GATHER_FOCUS_KEYWORDS,
+    GOAL_PATTERN,
+    GREETING_TOKENS,
+    KOREAN_DUE_DATE_CANDIDATE_PATTERNS,
+    NUMBERED_OPTION_INLINE_PATTERN,
+    NUMBERED_OPTION_LINE_PATTERN,
+    PROBLEM_AREA_CONTEXT_PATTERNS,
+    PROBLEM_AREA_PATTERN,
+    QUESTION_LINE_ENDING_PATTERN,
+    RAG_FILTERS_BY_PHASE,
+    ROLE_PATTERN,
+    ROLE_PREFIX_PATTERN,
+    ROLE_SPLIT_PATTERN,
+    ROLE_TOKEN_HINTS,
+    ROLE_TRAILING_SPLIT_PATTERN,
+    SHORT_MESSAGE_PATTERN,
+    SUBJECT_PATTERN,
+    TARGET_FACILITY_NOUN_PATTERN,
+    TARGET_FACILITY_PROMPT_PATTERN,
+    TEAM_SIZE_GENERIC_PATTERN,
+    TEAM_SIZE_HINT_KEYWORDS,
+    TEAM_SIZE_PATTERN,
+    TITLE_EXPLICIT_PATTERN,
+    TITLE_INSTRUCTION_KEYWORDS,
+    TRAILING_TOPIC_ENDINGS_PATTERN,
+    TRIVIAL_MESSAGES,
+    UNSUPPORTED_GATHER_TOPICS,
+)
+from app.ai.graph.conversation_signals import (
+    is_guidance_signal as _signal_is_guidance_signal,
+    is_help_request as _signal_is_help_request,
+    is_meta_conversation_message as _signal_is_meta_conversation_message,
+    is_next_step_request as _signal_is_next_step_request,
+    is_summary_request as _signal_is_summary_request,
+)
 from app.ai.graph.state import AgentState, TurnPolicy
 from app.ai.graph.template_support import build_recent_context as _build_recent_context
 from app.ai.graph.text_support import (
@@ -46,6 +91,12 @@ from app.ai.graph.text_support import (
     strip_mates_mention as _strip_mates_mention,
     truncate_message as _truncate_ai_message,
 )
+from app.ai.graph.topic_presence import (
+    _is_topic_presence_negative_message,
+    _matches_initial_button_message,
+    _matches_topic_presence_button_message,
+    _normalize_button_token,
+)
 from app.core.config import settings
 from app.rag.retriever import get_rag_context
 
@@ -53,317 +104,12 @@ logger = logging.getLogger(__name__)
 
 RAG_EMPTY_CONTEXT = "(관련 레퍼런스를 찾지 못했습니다.)"
 FAST_EXPLORE_REPLY = "좋아요. 최근 일주일 동안 '이거 좀 불편하다' 싶었던 순간이 있었나요?"
-SHORT_MESSAGE_PATTERN = re.compile(r"[^a-z0-9가-힣]+")
 FAST_TOPIC_EXISTS_REPLY = (
     "좋아요. 이미 생각해둔 주제가 있다면 지금 한두 줄로 보내주세요. "
     "입력해주신 내용을 바탕으로 프로젝트 주제를 짧게 정리해 반영하겠습니다."
 )
-BUTTON_ONLY_PATTERN = re.compile(r"[\s\.\,\!\?]+")
-TRAILING_TOPIC_ENDINGS_PATTERN = re.compile(
-    r"(이에요|예요|입니다|이요|요|입니다요|하고 싶어요|하려고 해요|생각 중이에요|같아요)$"
-)
-QUESTION_LINE_ENDING_PATTERN = re.compile(
-    r"(\?|？)\s*$|"
-    r"(인가요|있나요|없나요|어떤가요|뭔가요|무엇인가요|왜인가요|어떨까요|할까요|볼까요|나요|까요)\s*$"
-)
-TRIVIAL_MESSAGES = {
-    "",
-    "hi",
-    "hello",
-    "hey",
-    "yo",
-    "안녕",
-    "안녕하세요",
-    "하이",
-    "헬로",
-    "ㅎㅇ",
-    "ㅁㅌ",
-    "mates",
-}
-GREETING_TOKENS = {
-    "hi",
-    "hello",
-    "hey",
-    "\uc548\ub155",
-    "\uc548\ub155\ud558\uc138\uc694",
-    "\ubc18\uac00\uc6cc",
-    "\ubc18\uac11\uc2b5\ub2c8\ub2e4",
-}
-TEAM_SIZE_GENERIC_PATTERN = re.compile(r"(?<!\d)(\d{1,2})\s*명(?!\d)")
-ROLE_SPLIT_PATTERN = re.compile(r"\s*(?:,|/|및|그리고|와|과)\s*")
-ROLE_PREFIX_PATTERN = re.compile(
-    r"^\s*(?:역할|역할은|담당|담당은|구성|구성은|멤버|멤버는)\s*[:은는이가]?\s*"
-)
-ROLE_TRAILING_SPLIT_PATTERN = re.compile(
-    r"\s*(?:이렇게|정도로|정할게|정할 거|정할|나눌 거|나눌게|나눌|나눠|운영|하려고|할게|세부|포지션)"
-)
-SUMMARY_REQUEST_KEYWORDS = (
-    "요약",
-    "정리해줘",
-    "정리해 줘",
-    "지금 모인 정보",
-    "확정된 사항",
-    "확정된 정보",
-    "정리된 상황",
-    "정해진 사항",
-    "현재 확정",
-    "현재까지",
-    "세션 요약",
-)
-TEAM_SIZE_HINT_KEYWORDS = ("팀", "인원", "멤버", "우리", "총", "전체")
-ROLE_TOKEN_HINTS = (
-    "개발자",
-    "개발",
-    "기획자",
-    "기획",
-    "pm",
-    "po",
-    "디자이너",
-    "디자인",
-    "백엔드",
-    "프론트엔드",
-    "프론트",
-    "서버",
-    "ios",
-    "android",
-    "안드로이드",
-    "데이터",
-    "ai",
-)
-INITIAL_BUTTON_TOKENS = {
-    "",
-    "yes",
-    "y",
-    "no",
-    "n",
-    "네",
-    "예",
-    "응",
-    "ㅇㅇ",
-    "아니오",
-    "아니요",
-    "ㄴㄴ",
-    "있음",
-    "없음",
-    "있어요",
-    "없어요",
-    "주제있음",
-    "주제없음",
-}
-GATHER_FIELD_GUIDE = {
-    "subject": {
-        "label": "프로젝트 주제",
-        "question": "어떤 분야나 문제 영역을 다루는 프로젝트인지 한 줄로 정리하면 무엇인가요?",
-    },
-    "title": {
-        "label": "프로젝트 제목",
-        "question": "프로젝트 제목을 한 줄로 어떻게 정리하면 될까요?",
-    },
-    "goal": {
-        "label": "프로젝트 목표",
-        "question": "이 프로젝트로 팀이 최종적으로 만들고 싶은 결과를 한 줄로 말하면 무엇인가요?",
-    },
-    "teamSize": {
-        "label": "팀 인원",
-        "question": "현재 이 프로젝트를 함께하는 팀원은 몇 명인가요?",
-    },
-    "roles": {
-        "label": "역할",
-        "question": "팀원 역할 분담은 어떻게 가져갈 생각인가요? 아직 미정이면 필요한 역할만 말해도 됩니다.",
-    },
-    "dueDate": {
-        "label": "마감일",
-        "question": "중간발표나 최종제출 기준으로 생각하는 마감일은 언제인가요?",
-    },
-    "deliverables": {
-        "label": "산출물",
-        "question": "최종적으로 제출하거나 보여줘야 하는 산출물은 무엇인가요?",
-    },
-}
-UNSUPPORTED_GATHER_TOPICS = {
-    "targetUser": {
-        "label": "혜택 대상",
-        "instruction": (
-            "최근 대화의 초점은 혜택 대상입니다. 사용자의 답변이나 질문에 먼저 반응하되 "
-            "이 정보는 collected_data의 기존 키로 억지로 저장하지 마세요."
-        ),
-    },
-    "importance": {
-        "label": "중요한 이유",
-        "instruction": (
-            "최근 대화의 초점은 문제의 중요성입니다. 먼저 이유를 설명하거나 정리해 주고, "
-            "이 정보는 collected_data의 기존 키로 억지로 저장하지 마세요."
-        ),
-    },
-}
-GATHER_FOCUS_KEYWORDS = {
-    "subject": ("주제", "분야", "문제 영역", "큰 방향"),
-    "title": ("제목", "프로젝트명", "서비스명", "이름"),
-    "goal": ("목표", "무엇을 만들", "최종적으로 만들", "해결하려는 문제"),
-    "teamSize": ("몇 명", "팀원", "인원", "팀 규모"),
-    "roles": ("역할", "역할 분담", "담당", "누가 맡"),
-    "dueDate": ("마감", "마감일", "언제까지", "제출", "발표", "데드라인"),
-    "deliverables": ("산출물", "결과물", "제출물", "무엇을 제출", "최종 산출"),
-    "targetUser": ("누가 혜택", "대상 사용자", "누가 쓰", "누구를 위한", "누가 받"),
-    "importance": ("왜 중요", "왜 필요한", "이유", "왜 문제", "중요한가"),
-}
-HELP_REQUEST_KEYWORDS = (
-    "추천",
-    "예시",
-    "후보",
-    "뭐가 좋",
-    "어떻게",
-    "왜",
-    "이유",
-    "설명",
-    "알려",
-    "모르겠",
-    "도와",
-)
-GUIDANCE_SIGNAL_PATTERNS = (
-    re.compile(r"잘\s*모르겠", re.IGNORECASE),
-    re.compile(r"모르겠", re.IGNORECASE),
-    re.compile(r"도와\s*(?:줘|주세요|주라)?", re.IGNORECASE),
-    re.compile(r"추천해\s*(?:줘|주세요|주라)?", re.IGNORECASE),
-    re.compile(r"정해\s*(?:줘|주세요|주라)?", re.IGNORECASE),
-    re.compile(r"같이\s*(?:정하|골라|좁혀)", re.IGNORECASE),
-    re.compile(r"고민\s*중", re.IGNORECASE),
-    re.compile(r"감이\s*안", re.IGNORECASE),
-    re.compile(r"(?:뭘|뭐를|무엇을|어떤\s*걸?)\s*(?:해야|만들어야|하고\s*싶은지)", re.IGNORECASE),
-)
-META_CONVERSATION_PATTERNS = (
-    re.compile(r"^\s*(?:아니|아니야|아뇨)\b", re.IGNORECASE),
-    re.compile(r"^\s*(?:그게\s+아니라|다시|잠깐)\b", re.IGNORECASE),
-    re.compile(r"^\s*(?:엥|에엥|어|응)\s*(?:\?|!|\.|$)", re.IGNORECASE),
-    re.compile(r"^\s*(?:엥|에엥)\s*(?:무슨|뭔)\s*소리", re.IGNORECASE),
-    re.compile(r"^\s*(?:무슨|뭔)\s*(?:말|소리)", re.IGNORECASE),
-    re.compile(r"^\s*(?:이상한데|이상해|말이\s*안\s*되|이해가\s*안)", re.IGNORECASE),
-)
-TITLE_INSTRUCTION_KEYWORDS = (
-    "넣어",
-    "추천",
-    "알려",
-    "해줘",
-    "보여",
-    "데이터",
-    "후보",
-)
-FILL_REMAINING_EXACT_KEYWORDS = (
-    "나머지 다 확정해줘",
-    "나머지 확정해줘",
-    "나머지 다 정해줘",
-    "나머지 다 지정해줘",
-    "나머지 다 채워줘",
-    "남은 것들 다 확정해줘",
-    "전부 확정해줘",
-    "다 확정해줘",
-    "다 정해줘",
-    "다 지정해줘",
-    "다 채워줘",
-    "전부 정해줘",
-)
-FILL_REMAINING_TRIGGER_KEYWORDS = (
-    "확정",
-    "정해",
-    "지정",
-    "채워",
-    "반영",
-    "업데이트",
-    "저장",
-    "기록",
-    "맞춰",
-    "완성",
-)
-FILL_REMAINING_SCOPE_KEYWORDS = (
-    "나머지",
-    "남은",
-    "전부",
-    "전체",
-    "모두",
-    "세션 요약",
-    "세션요약",
-    "핵심 결정사항",
-    "저 부분",
-    "위 내용",
-    "방금 내용",
-    "이걸로",
-)
-TITLE_EXPLICIT_PATTERN = re.compile(
-    r"^\s*(?:프로젝트\s*주제|프로젝트명|주제|제목|이름)\s*(?:은|는|:)?\s*",
-    re.IGNORECASE,
-)
-TEAM_SIZE_PATTERN = re.compile(r"(?:팀\s*인원|팀원|인원)\D{0,8}(\d{1,2})\s*명?")
-ROLE_PATTERN = re.compile(r"(?:역할|롤|role)\s*(?:은|는|:)?\s*(.+)$", re.IGNORECASE)
-DUE_DATE_PATTERN = re.compile(
-    r"(?:마감(?:일)?|데드라인|due)\s*(?:은|는|:)?\s*"
-    r"([0-9]{4}[./-][0-9]{1,2}[./-][0-9]{1,2}|[0-9]{1,2}월\s*[0-9]{1,2}일)",
-    re.IGNORECASE,
-)
-GOAL_PATTERN = re.compile(r"(?:목표|goal)\s*(?:은|는|:)?\s*(.+)$", re.IGNORECASE)
-SUBJECT_PATTERN = re.compile(r"(?:주제|subject|topic)\s*(?:은|는|:)?\s*(.+)$", re.IGNORECASE)
-DELIVERABLES_PATTERN = re.compile(
-    r"(?:산출물|결과물|제출물|deliverable[s]?)\s*(?:은|는|:)?\s*(.+)$",
-    re.IGNORECASE,
-)
-CHOICE_INDEX_PATTERN = re.compile(r"^\s*([1-9])\s*(?:번)?\s*$")
-CHOICE_PREFIX_PATTERN = re.compile(r"^\s*([1-9])\s*번(?:\s*.*)?$")
-NUMBERED_OPTION_LINE_PATTERN = re.compile(r"^\s*(\d{1,2})[)\.\-:]\s*(.+?)\s*$")
-NUMBERED_OPTION_INLINE_PATTERN = re.compile(
-    r"(\d{1,2})[)\.\-:]\s*(.+?)(?=\s+\d{1,2}[)\.\-:]|$)"
-)
-DIRECT_FACT_ENDING_PATTERN = re.compile(
-    r"\s*(?:입니다|이에요|예요|이야|야|요)\s*$"
-)
-KOREAN_DUE_DATE_CANDIDATE_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"(\d{2,4}년\s*(?:초|중|말))"),
-    re.compile(r"(내년\s*(?:초|중|말))"),
-    re.compile(r"(올해\s*(?:초|중|말))"),
-    re.compile(r"(다음\s*달\s*(?:초|중|말))"),
-    re.compile(r"(\d{1,2}월\s*말(?:쯤)?)"),
-    re.compile(r"(이번\s*학기\s*말)"),
-    re.compile(r"(중간발표\s*전)"),
-    re.compile(r"(최종발표\s*전)"),
-)
-PROBLEM_AREA_PATTERN = re.compile(r"(.+?)(?:하는\s*문제|문제|쪽|관점|방향)(?:로|을|를)?(?:\s|$)")
-TARGET_FACILITY_PROMPT_PATTERN = re.compile(r"어떤\s+시설을\s+대상으로\s+하나요")
-TARGET_FACILITY_NOUN_PATTERN = re.compile(
-    r"(도서관|공원|주민센터|버스터미널|체육관|체육시설|복지관|주차장|공공화장실|박물관|미술관|학교|강의실|병원|보건소)"
-)
-PROBLEM_AREA_CONTEXT_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"좋아요\.\s*(.+?)의\s+(.+?)\s+문제로\s+좁혀볼게요"),
-    re.compile(r"좋아요\.\s*(.+?)에서\s+'(.+?)'\s+방향으로\s+좁혀볼게요"),
-)
-FAST_RAG_PHASES = {"EXPLORE", "TOPIC_SET", "GATHER"}
 RAG_CACHE_MAX_ITEMS = 128
 RAG_CONTEXT_CACHE: dict[tuple[str, str, tuple[str, ...], tuple[str, ...], int], str] = {}
-
-RAG_FILTERS_BY_PHASE: dict[str, dict[str, list[str]]] = {
-    "EXPLORE": {
-        "topics": ["value_proposition", "team_playbook"],
-        "doc_types": ["reference", "playbook"],
-    },
-    "TOPIC_SET": {
-        "topics": ["design_sprint", "team_playbook", "scrum_guide"],
-        "doc_types": ["reference", "playbook", "guide"],
-    },
-    "GATHER": {
-        "topics": [
-            "value_proposition",
-            "design_sprint",
-            "team_playbook",
-            "scrum_guide",
-        ],
-        "doc_types": ["reference", "playbook", "guide"],
-    },
-    "READY_PLAN": {
-        "topics": ["scrum_guide", "team_playbook", "design_sprint"],
-        "doc_types": ["guide", "playbook", "reference"],
-    },
-    "READY_DEV": {
-        "topics": ["api_design", "software_engineering_standard", "scrum_guide"],
-        "doc_types": ["reference", "guide"],
-    },
-}
 
 
 def _normalize_message(value: str) -> str:
@@ -384,89 +130,6 @@ def _is_trivial_message(user_message: str) -> bool:
 def _is_greeting_message(user_message: str) -> bool:
     normalized = _normalize_button_token(_strip_mates_mention(user_message))
     return normalized in GREETING_TOKENS
-
-
-def _normalize_button_token(value: object) -> str:
-    lowered = str(value or "").strip().lower()
-    return BUTTON_ONLY_PATTERN.sub("", lowered)
-
-
-def _matches_topic_presence_button_message(message: object) -> bool:
-    normalized = _normalize_button_token(message)
-    if not normalized:
-        return False
-    if normalized in INITIAL_BUTTON_TOKENS:
-        return True
-
-    cleaned = _clean_text(message).lower()
-    if not cleaned or ("주제" not in cleaned and "프로젝트" not in cleaned):
-        return False
-
-    if any(
-        phrase in cleaned
-        for phrase in (
-            "주제가 있습니다",
-            "주제 있습니다",
-            "정해진 주제가 있습니다",
-            "생각해둔 주제가 있습니다",
-            "이미 주제가 있습니다",
-            "주제가 없습니다",
-            "주제 없습니다",
-            "정해진 주제가 없습니다",
-            "아직 주제가 없습니다",
-            "주제는 아직 없습니다",
-        )
-    ):
-        return True
-
-    if re.search(r"(?:주제|프로젝트)\s*(?:은|는|:)\s*.+", cleaned):
-        return False
-
-    return len(cleaned) <= 25 and any(
-        keyword in cleaned for keyword in ("있", "없", "미정", "정해", "정했", "생각해")
-    )
-
-
-def _is_topic_presence_negative_message(message: object) -> bool:
-    normalized = _normalize_button_token(message)
-    if normalized in {"아니오", "아니요", "노", "n", "no"}:
-        return True
-
-    cleaned = _clean_text(message).lower()
-    if not cleaned:
-        return False
-
-    return any(
-        phrase in cleaned
-        for phrase in (
-            "주제가 없습니다",
-            "주제 없습니다",
-            "정해진 주제가 없습니다",
-            "아직 주제가 없습니다",
-            "주제는 아직 없습니다",
-        )
-    )
-
-
-def _matches_initial_button_message(action: str, message: object) -> bool:
-    normalized = _normalize_button_token(message)
-    if not normalized:
-        return True
-    if normalized in INITIAL_BUTTON_TOKENS:
-        return True
-
-    cleaned = _clean_text(message).lower()
-    if action in {"BTN_YES", "BTN_GO_DEF"}:
-        return (
-            ("주제" in cleaned or "프로젝트" in cleaned)
-            and any(keyword in cleaned for keyword in ("있", "정해", "정했", "생각해"))
-        )
-    if action == "BTN_NO":
-        return (
-            ("주제" in cleaned or "프로젝트" in cleaned)
-            and any(keyword in cleaned for keyword in ("없", "미정", "아직"))
-        )
-    return False
 
 
 def _is_initial_button_selection(state: AgentState) -> bool:
@@ -1279,8 +942,7 @@ def _build_gather_focus_instruction(focus_type: str | None) -> str:
 
 
 def _is_help_request(user_message: str) -> bool:
-    normalized = _clean_text(user_message)
-    return any(keyword in normalized for keyword in HELP_REQUEST_KEYWORDS)
+    return _signal_is_help_request(user_message)
 
 
 def _is_request_like_value(user_message: str) -> bool:
@@ -1294,19 +956,11 @@ def _is_undecided_value(user_message: str) -> bool:
 
 
 def _is_guidance_signal(user_message: str) -> bool:
-    normalized = _clean_text(user_message)
-    if not normalized:
-        return False
-    return any(pattern.search(normalized) for pattern in GUIDANCE_SIGNAL_PATTERNS)
+    return _signal_is_guidance_signal(user_message)
 
 
 def _is_meta_conversation_message(user_message: str) -> bool:
-    normalized = _clean_text(user_message)
-    if not normalized:
-        return False
-    return is_meta_conversation(normalized) or any(
-        pattern.match(normalized) for pattern in META_CONVERSATION_PATTERNS
-    )
+    return _signal_is_meta_conversation_message(user_message)
 
 
 def _is_non_storable_freeform_message(user_message: str) -> bool:
@@ -1754,10 +1408,7 @@ def _trim_subject_candidate_clause(value: str) -> str:
 
 
 def _is_summary_request(user_message: str) -> bool:
-    normalized = _clean_text(_strip_mates_mention(user_message))
-    if not normalized:
-        return False
-    return any(keyword in normalized for keyword in SUMMARY_REQUEST_KEYWORDS)
+    return _signal_is_summary_request(user_message)
 
 
 def _extract_corrected_team_size_from_message(message: str) -> str:
@@ -1811,11 +1462,7 @@ def _extract_team_size_from_message(message: str) -> str:
 
 
 def _is_next_step_request(user_message: str) -> bool:
-    normalized = _clean_text(_strip_mates_mention(user_message))
-    if not normalized:
-        return False
-    keywords = ("다음", "그다음", "뭐 정", "무엇을 정", "뭐 하면", "다음엔", "next")
-    return any(keyword in normalized for keyword in keywords)
+    return _signal_is_next_step_request(user_message)
 
 
 def _looks_like_role_token(token: str) -> bool:
@@ -4079,6 +3726,19 @@ def _looks_like_advice_request(user_message: str) -> bool:
     )
 
 
+def _looks_like_planning_request(user_message: str) -> bool:
+    normalized = _clean_text(_strip_mates_mention(user_message))
+    if not normalized:
+        return False
+    planning_patterns = (
+        re.compile(r"(?:우선순위|priority)\s*정리", re.IGNORECASE),
+        re.compile(r"(?:다음|그다음)\s*할\s*일", re.IGNORECASE),
+        re.compile(r"(?:action\s*items?|todo|to-do|체크리스트|로드맵)", re.IGNORECASE),
+        re.compile(r"(?:실행\s*계획|진행\s*순서|mvp\s*기준)", re.IGNORECASE),
+    )
+    return any(pattern.search(normalized) for pattern in planning_patterns)
+
+
 def _interpret_turn_type(
     state: AgentState,
     current_data: dict[str, str] | None = None,
@@ -4093,7 +3753,9 @@ def _interpret_turn_type(
     user_message = _effective_user_message(state)
     direct_updates = dict(direct_updates or {})
 
-    if turn_type == "request_next_step" and _looks_like_advice_request(user_message):
+    if turn_type == "request_next_step" and (
+        _looks_like_advice_request(user_message) or _looks_like_planning_request(user_message)
+    ):
         return "general"
 
     if turn_type == "provide_problem_area":
@@ -4126,9 +3788,6 @@ def _normalize_contextual_llm_updates(
 
 
 _final_extract_direct_fact_updates = _extract_direct_fact_updates
-_final_is_summary_request = _is_summary_request
-
-
 def _normalize_goal_candidate(candidate: str) -> str:
     normalized = _normalize_direct_fact_value(candidate)
     if not normalized:
@@ -4195,4 +3854,4 @@ def _is_summary_request(user_message: str) -> bool:
     ):
         return False
 
-    return _final_is_summary_request(user_message)
+    return _signal_is_summary_request(user_message)
