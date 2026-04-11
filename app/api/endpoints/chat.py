@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, root_validator
 
-from app.ai.graph.nodes import _matches_topic_presence_button_message
+from app.ai.graph.topic_presence import _matches_topic_presence_button_message
 from app.ai.graph.text_support import (
     strip_mates_mention as _strip_mates_mention,
     truncate_message as _truncate_content,
