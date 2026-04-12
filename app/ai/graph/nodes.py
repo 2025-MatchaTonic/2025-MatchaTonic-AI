@@ -938,6 +938,20 @@ def _get_active_prompted_slot(
     followup_fields: list[str] | None = None,
     rejected_updates: dict[str, object] | None = None,
 ) -> str:
+    explicit_slot = str(
+        state.get("current_slot") or state.get("next_question_field") or ""
+    ).strip()
+    if explicit_slot in {
+        "subject",
+        "title",
+        "goal",
+        "targetUser",
+        "teamSize",
+        "roles",
+        "dueDate",
+        "deliverables",
+    }:
+        return explicit_slot
     return infer_prompted_slot(
         recent_messages=state.get("recent_messages", []),
         selected_message=state.get("selected_message"),
