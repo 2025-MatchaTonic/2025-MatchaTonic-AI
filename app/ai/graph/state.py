@@ -13,6 +13,7 @@ TurnPolicy = Literal[
 
 class AgentState(TypedDict):
     project_id: str
+    project_name: Optional[str]
     user_message: str
     action_type: str
     current_phase: str
@@ -20,6 +21,10 @@ class AgentState(TypedDict):
     recent_messages: List[str]
     selected_message: Optional[str]
     collected_data: CollectedData
+    problem_area: Optional[str]
+    target_facility: Optional[str]
+    current_slot: Optional[str]
+    next_question_field: Optional[str]
     is_sufficient: bool
     ai_message: str
     next_phase: str

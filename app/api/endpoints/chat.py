@@ -37,6 +37,7 @@ class AIChatRequest(BaseModel):
     content: str = ""
     actionType: str = "CHAT"
     currentStatus: str = "EXPLORE"
+    projectName: Optional[str] = None
     rawCollectedData: Dict[str, Any] = Field(default_factory=dict, exclude=True)
     collectedData: CollectedData = Field(default_factory=dict)
     recentMessages: List[str] = Field(default_factory=list)
@@ -66,6 +67,9 @@ class AIChatRequest(BaseModel):
         payload["collectedData"] = normalize_collected_data(
             payload.get("collectedData")
         )
+        payload["projectName"] = normalize_optional_string(
+            payload.get("projectName")
+        ) or normalize_optional_string(payload["collectedData"].get("projectName"))
 
         selected_answers = normalize_string_list(payload.get("selectedAnswers"))
         payload["selectedAnswers"] = selected_answers
@@ -94,6 +98,7 @@ class AIChatRequest(BaseModel):
 class AIChatResponse(BaseModel):
     content: str
     suggestedQuestions: List[str]
+    nextQuestionField: Optional[str] = None
     currentStatus: str
     isSufficient: bool
     collectedData: CollectedData
@@ -236,12 +241,17 @@ async def process_chat(request: AIChatRequest):
             "action_type": request.actionType,
             "current_phase": effective_phase,
             "turn_policy": _derive_turn_policy(request),
+            "project_name": request.projectName,
             "collected_data": request.collectedData,
             "recent_messages": request.recentMessages,
             "selected_message": request.selectedMessage,
+            "problem_area": normalize_optional_string(request.collectedData.get("problemArea")),
+            "target_facility": normalize_optional_string(request.collectedData.get("targetFacility")),
+            "current_slot": None,
             "is_sufficient": False,
             "ai_message": "",
             "next_phase": effective_phase,
+            "next_question_field": None,
             "template_payload": None,
         }
 
@@ -284,6 +294,7 @@ async def process_chat(request: AIChatRequest):
                 rejected_updates=rejected_updates,
                 followup_fields=followup_fields,
             ),
+            nextQuestionField=next_question_field or None,
             currentStatus=response_phase,
             isSufficient=result.get("is_sufficient", False),
             collectedData=response_collected_data,

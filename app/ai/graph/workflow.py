@@ -1,5 +1,6 @@
 from langgraph.graph import StateGraph, END
 from app.ai.graph.collected_data import derive_phase_from_collected_data
+from app.ai.graph.collected_data import apply_collected_data_updates
 from app.ai.graph.state import AgentState
 from app.ai.graph.nodes import (
     _extract_title_updates_for_topic_set,
@@ -31,7 +32,23 @@ def _should_promote_explore_to_topic_set(state: AgentState) -> bool:
     if _normalize_topic_title(_extract_topic_candidate(user_message)):
         return True
 
-    return bool(_extract_direct_fact_updates(user_message))
+    direct_updates = _extract_direct_fact_updates(user_message)
+    if not direct_updates:
+        return False
+    next_data, audit = apply_collected_data_updates(
+        current=state.get("collected_data") or {},
+        candidate=direct_updates,
+        turn_type="provide_fact",
+        current_status=str(state.get("current_phase") or "EXPLORE"),
+        recent_messages=state.get("recent_messages", []),
+        selected_message=state.get("selected_message"),
+        user_message=user_message,
+        candidate_sources={
+            key: {"source": "direct_structured", "value": value}
+            for key, value in direct_updates.items()
+        },
+    )
+    return bool(next_data.get("subject") or next_data.get("title") or audit["approved"].get("subject") or audit["approved"].get("title"))
 
 
 def route_logic(state: AgentState):
