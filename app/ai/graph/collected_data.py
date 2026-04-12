@@ -20,6 +20,13 @@ COLLECTED_DATA_FIELDS: Dict[str, str] = {
 CollectedDataValue: TypeAlias = str | int | list[str]
 CollectedData: TypeAlias = Dict[str, CollectedDataValue]
 
+AUXILIARY_STATE_FIELDS: tuple[str, ...] = (
+    "problemArea",
+    "targetFacility",
+    "projectName",
+    "targetUser",
+)
+
 FIELD_POLICY: Dict[str, dict[str, object]] = {
     "title": {"overwrite": "strict", "source_bias": "context", "allow_additive": False},
     "subject": {"overwrite": "guarded", "source_bias": "context", "allow_additive": False},
@@ -368,7 +375,7 @@ def _normalize_role_label(token: object) -> str:
 
     cleaned = ROLE_VALUE_PREFIX_PATTERN.sub("", cleaned)
     cleaned = ROLE_TRAILING_PARTICLE_PATTERN.sub("", cleaned).strip()
-    cleaned = cleaned.strip(" .,!?:;\"'()[]")
+    cleaned = cleaned.strip(" .,!?:;\"'[]")
     if not cleaned:
         return ""
 
@@ -1007,7 +1014,7 @@ def normalize_roles(value: object) -> list[str] | None:
             return ""
         cleaned = re.sub(r"^\s*(?:역할|구성|멤버|담당)\s*[:：]?\s*", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"(?:으로|로|이가|은|는)$", "", cleaned).strip()
-        cleaned = cleaned.strip(" .,!?:;\"'()[]")
+        cleaned = cleaned.strip(" .,!?:;\"'[]")
         lowered = cleaned.lower()
         mapping = {"pm": "PM", "po": "PO", "ai": "AI", "ios": "iOS"}
         return mapping.get(lowered, cleaned)
@@ -1234,6 +1241,11 @@ def merge_collected_data(
         if value is not None:
             merged[key] = value
 
+    for key in AUXILIARY_STATE_FIELDS:
+        value = sanitized_updates.get(key)
+        if value is not None:
+            merged[key] = value
+
     return merged
 
 
@@ -1382,9 +1394,27 @@ def _looks_like_room_title_metadata(value: object) -> bool:
     if not cleaned:
         return False
     compact = re.sub(r"\s+", "", cleaned).lower()
-    if re.fullmatch(r"promate\d+", compact):
+    if re.fullmatch(r"(?:promate|test)\d+", compact):
         return True
     return _previous_looks_like_room_title_metadata(value)
+
+
+def _normalize_auxiliary_value(key: str, value: object) -> str | None:
+    cleaned = _clean_string(value)
+    if not cleaned or looks_like_non_committal_value(cleaned):
+        return None
+    if key == "projectName":
+        return cleaned
+    return cleaned
+
+
+def _preserve_auxiliary_state_fields(data: Mapping[str, object] | None) -> CollectedData:
+    preserved: CollectedData = {}
+    for key in AUXILIARY_STATE_FIELDS:
+        normalized_value = _normalize_auxiliary_value(key, (data or {}).get(key))
+        if normalized_value is not None:
+            preserved[key] = normalized_value
+    return preserved
 
 
 def normalize_collected_value(
@@ -1411,7 +1441,9 @@ def sanitize_llm_updated_data(raw_updated_data: object) -> CollectedData:
             "deliverables",
             raw_updated_data.get("deliverables"),
         )
-    return _previous_sanitize_llm_updated_data(normalized_payload)
+    sanitized = _previous_sanitize_llm_updated_data(normalized_payload)
+    sanitized.update(_preserve_auxiliary_state_fields(normalized_payload))
+    return sanitized
 
 
 def sanitize_candidate_updates(
@@ -1425,13 +1457,21 @@ def sanitize_candidate_updates(
             "deliverables",
             normalized_payload.get("deliverables"),
         )
-    return _previous_sanitize_candidate_updates(normalized_payload, current_data=current_data)
+    sanitized = _previous_sanitize_candidate_updates(
+        normalized_payload,
+        current_data=current_data,
+    )
+    preserved = _preserve_auxiliary_state_fields(current_data)
+    preserved.update(_preserve_auxiliary_state_fields(normalized_payload))
+    sanitized.update(preserved)
+    return sanitized
 
 
 def sanitize_collected_data(data: Mapping[str, object] | None) -> CollectedData:
     sanitized = _previous_sanitize_collected_data(data)
     if _looks_like_room_title_metadata(sanitized.get("title")):
         sanitized.pop("title", None)
+    sanitized.update(_preserve_auxiliary_state_fields(data))
     return sanitized
 
 
@@ -1740,6 +1780,26 @@ def choose_next_question_field(
     return pending[0] if pending else ""
 
 
+def infer_prompted_slot(
+    *,
+    recent_messages: list[str] | None,
+    selected_message: str | None,
+    current_data: Mapping[str, object] | None = None,
+    current_phase: str = "GATHER",
+    followup_fields: list[str] | None = None,
+    rejected_updates: Mapping[str, object] | None = None,
+) -> str:
+    prompted_slot = _infer_prompted_slot_from_messages(recent_messages, selected_message)
+    if prompted_slot:
+        return prompted_slot
+    return choose_next_question_field(
+        current_data,
+        current_phase=current_phase,
+        followup_fields=followup_fields,
+        rejected_updates=rejected_updates,
+    )
+
+
 def apply_collected_data_updates(
     current: Mapping[str, object] | None,
     candidate: Mapping[str, object] | None,
@@ -1855,6 +1915,24 @@ def apply_collected_data_updates(
                 needs_confirmation.append(key)
 
     next_collected_data = merge_collected_data(current_data, approved_updates)
+    for key in raw_candidate:
+        if key not in REQUIRED_COLLECTED_DATA_FIELDS and key not in AUXILIARY_STATE_FIELDS:
+            continue
+        decision = decisions.get(key)
+        logger.info(
+            "collected_data_decision field=%s candidate=%r decision=%s reason=%s source=%s",
+            key,
+            raw_candidate.get(key),
+            (
+                "approved"
+                if key in approved_updates
+                else "rejected"
+                if key in rejected_reasons
+                else "ignored"
+            ),
+            rejected_reasons.get(key) or (decision.reason if decision is not None else "unchanged_or_auxiliary"),
+            str((candidate_sources or {}).get(key, {}).get("source") or "unknown"),
+        )
     logger.info(
         "apply_collected_data_updates turn=%s phase=%s approved=%s rejected=%s before=%s after=%s",
         turn_type,
@@ -1894,3 +1972,109 @@ def build_approved_collected_data_snapshot(
         snapshot.pop("goal", None)
 
     return snapshot
+
+
+_previous_infer_prompted_slot_from_messages = _infer_prompted_slot_from_messages
+_previous_apply_collected_data_updates = apply_collected_data_updates
+
+
+def _infer_prompted_slot_from_messages(
+    recent_messages: list[str] | None,
+    selected_message: str | None,
+) -> str:
+    prompted_slot = _previous_infer_prompted_slot_from_messages(
+        recent_messages,
+        selected_message,
+    )
+    if prompted_slot:
+        return prompted_slot
+
+    blocks: list[str] = []
+    if selected_message:
+        blocks.append(_clean_string(selected_message))
+    if recent_messages:
+        blocks.extend(_clean_string(message) for message in reversed(recent_messages[-4:]))
+
+    extra_slot_hints = {
+        "subject": ("프로젝트 주제", "어떤 분야", "어떤 문제", "주제로"),
+        "title": ("프로젝트 제목", "제목은", "이름은", "제목으로"),
+        "goal": ("프로젝트 목표", "목표를", "목표는"),
+        "targetUser": ("타겟 사용자", "대상 사용자", "대상은", "어떤 팀", "누구를 위한"),
+        "teamSize": ("총 몇 명", "몇 명", "인원은", "전체 인원"),
+        "roles": ("역할 분담", "필요한 역할", "각자 맡을 역할", "어떤 역할"),
+        "dueDate": ("마감일", "마감", "발표일", "언제까지"),
+        "deliverables": ("산출물", "결과물", "최종 제출물"),
+    }
+    for block in blocks:
+        if not block:
+            continue
+        for key, hints in extra_slot_hints.items():
+            if any(hint in block for hint in hints):
+                return key
+    return ""
+
+
+def apply_collected_data_updates(
+    current: Mapping[str, object] | None,
+    candidate: Mapping[str, object] | None,
+    turn_type: str,
+    current_status: str,
+    recent_messages: list[str] | None = None,
+    selected_message: str | None = None,
+    user_message: str = "",
+    candidate_sources: Mapping[str, Mapping[str, object]] | None = None,
+) -> tuple[CollectedData, dict[str, object]]:
+    next_data, audit = _previous_apply_collected_data_updates(
+        current=current,
+        candidate=candidate,
+        turn_type=turn_type,
+        current_status=current_status,
+        recent_messages=recent_messages,
+        selected_message=selected_message,
+        user_message=user_message,
+        candidate_sources=candidate_sources,
+    )
+
+    current_data = sanitize_collected_data(current)
+    raw_candidate = dict(candidate or {})
+    approved_updates = dict(audit.get("approved", {}))
+    rejected_updates = dict(audit.get("rejected", {}))
+    rejected_reasons = dict(audit.get("rejected_reasons", {}))
+    needs_confirmation = list(audit.get("needs_confirmation", []))
+    decisions = dict(audit.get("decisions", {}))
+
+    for key in AUXILIARY_STATE_FIELDS:
+        if key not in raw_candidate:
+            continue
+        normalized_value = _normalize_auxiliary_value(key, raw_candidate.get(key))
+        if normalized_value is None:
+            rejected_updates[key] = raw_candidate.get(key)
+            rejected_reasons[key] = "invalid_or_empty_candidate"
+            continue
+        if not _allow_storage_for_turn(
+            turn_type=turn_type,
+            key=key,
+            user_message=user_message,
+            recent_messages=recent_messages,
+            selected_message=selected_message,
+        ):
+            rejected_updates[key] = raw_candidate.get(key)
+            rejected_reasons[key] = "turn_type_blocks_storage"
+            if key not in needs_confirmation:
+                needs_confirmation.append(key)
+            continue
+        current_value = _normalize_auxiliary_value(key, current_data.get(key))
+        if current_value == normalized_value:
+            continue
+        approved_updates[key] = normalized_value
+        rejected_updates.pop(key, None)
+        rejected_reasons.pop(key, None)
+
+    next_data = merge_collected_data(current_data, approved_updates)
+    return next_data, {
+        "approved": approved_updates,
+        "rejected": rejected_updates,
+        "rejected_reasons": rejected_reasons,
+        "needs_confirmation": needs_confirmation,
+        "decisions": decisions,
+    }

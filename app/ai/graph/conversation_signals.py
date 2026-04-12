@@ -21,13 +21,18 @@ SIGNAL_CONFIDENCE_THRESHOLD = 0.8
 SIGNAL_CLASSIFICATION_CACHE: dict[str, tuple[str, float]] = {}
 
 NEXT_STEP_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"(?:다음|그다음)(?:\s*으로)?\s*(?:할\s*일|액션|단계|스텝)", re.IGNORECASE),
+    re.compile(
+        r"(?:다음|그다음)(?:\s*으로)?\s*(?:할\s*일|액션|단계|스텝)", re.IGNORECASE
+    ),
     re.compile(r"(?:뭐|무엇)을?\s*(?:하면|해야)", re.IGNORECASE),
     re.compile(r"(?:next\s*step|next\s*steps|action\s*items?)", re.IGNORECASE),
 )
 SUMMARY_STRONG_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\b요약\b", re.IGNORECASE),
-    re.compile(r"(?:지금\s*모인\s*정보|확정된\s*사항|확정된\s*정보|정리된\s*상황|정해진\s*사항)", re.IGNORECASE),
+    re.compile(
+        r"(?:지금\s*모인\s*정보|확정된\s*사항|확정된\s*정보|정리된\s*상황|정해진\s*사항)",
+        re.IGNORECASE,
+    ),
     re.compile(r"(?:현재\s*확정|현재까지|세션\s*요약)", re.IGNORECASE),
 )
 SUMMARY_EXCLUSION_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -41,6 +46,8 @@ HELP_REQUEST_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?:어떻게|왜|이유|설명).*(?:알려|말해|정리)", re.IGNORECASE),
     re.compile(r"(?:도와|가이드).*(?:줘|주세요|주라)?", re.IGNORECASE),
 )
+
+
 def _cache_key(message: str) -> str:
     return _clean_text(strip_mates_mention(message)).lower()
 
