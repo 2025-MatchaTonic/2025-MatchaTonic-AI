@@ -18,6 +18,7 @@ from app.ai.graph.collected_data import (
     evaluate_candidate_update,
     format_collected_value,
     has_role_team_size_conflict,
+    infer_contextual_prompted_slot,
     infer_prompted_slot,
     is_template_ready as _shared_is_template_ready,
     is_valid_collected_value as _shared_is_valid_collected_value,
@@ -27,6 +28,7 @@ from app.ai.graph.collected_data import (
     looks_like_non_committal_value,
     merge_collected_data,
     missing_collected_fields as _shared_missing_collected_fields,
+    normalize_roles,
     sanitize_llm_updated_data,
     sanitize_candidate_updates as _shared_sanitize_candidate_updates,
     sanitize_collected_data as _shared_sanitize_collected_data,
@@ -938,6 +940,20 @@ def _get_active_prompted_slot(
     followup_fields: list[str] | None = None,
     rejected_updates: dict[str, object] | None = None,
 ) -> str:
+    explicit_slot = str(
+        state.get("current_slot") or state.get("next_question_field") or ""
+    ).strip()
+    if explicit_slot in {
+        "subject",
+        "title",
+        "goal",
+        "targetUser",
+        "teamSize",
+        "roles",
+        "dueDate",
+        "deliverables",
+    }:
+        return explicit_slot
     return infer_prompted_slot(
         recent_messages=state.get("recent_messages", []),
         selected_message=state.get("selected_message"),
@@ -946,6 +962,104 @@ def _get_active_prompted_slot(
         followup_fields=followup_fields,
         rejected_updates=rejected_updates,
     )
+
+
+def _get_contextual_prompted_slot(
+    state: AgentState,
+    current_data: dict[str, object],
+) -> str:
+    explicit_slot = str(
+        state.get("current_slot") or state.get("next_question_field") or ""
+    ).strip()
+    if explicit_slot in {
+        "subject",
+        "title",
+        "goal",
+        "targetUser",
+        "teamSize",
+        "roles",
+        "dueDate",
+        "deliverables",
+    }:
+        return explicit_slot
+    return infer_contextual_prompted_slot(
+        recent_messages=state.get("recent_messages", []),
+        selected_message=state.get("selected_message"),
+    )
+
+
+def _looks_like_factual_slot_answer(user_message: str) -> bool:
+    normalized = _clean_text(user_message)
+    if not normalized:
+        return False
+    if (
+        _is_meta_conversation_message(normalized)
+        or _is_request_like_value(normalized)
+        or _is_undecided_value(normalized)
+        or _looks_like_question_line(normalized)
+        or _looks_like_open_question(normalized)
+    ):
+        return False
+    return True
+
+
+def _infer_prompted_slot_updates(
+    *,
+    prompted_slot: str,
+    user_message: str,
+    current_data: dict[str, object],
+) -> dict[str, object]:
+    if prompted_slot not in {
+        "goal",
+        "targetUser",
+        "teamSize",
+        "roles",
+        "dueDate",
+        "deliverables",
+    }:
+        return {}
+
+    normalized_message = _clean_text(_strip_mates_mention(user_message))
+    if not _looks_like_factual_slot_answer(normalized_message):
+        return {}
+
+    updates: dict[str, object] = {}
+    if prompted_slot == "goal":
+        candidate = _extract_goal_candidate_from_message(normalized_message) or _normalize_goal_candidate(
+            normalized_message
+        )
+        if candidate:
+            updates["goal"] = candidate
+    elif prompted_slot == "targetUser":
+        candidate = _normalize_direct_fact_value(normalized_message)
+        if candidate:
+            updates["targetUser"] = candidate
+    elif prompted_slot == "teamSize":
+        candidate = _extract_team_size_from_message(normalized_message)
+        if candidate:
+            updates["teamSize"] = candidate
+    elif prompted_slot == "roles":
+        candidate = _extract_roles_from_message(normalized_message)
+        if candidate:
+            updates["roles"] = candidate
+    elif prompted_slot == "dueDate":
+        candidate = _extract_due_date_candidate_from_message(normalized_message)
+        if candidate:
+            updates["dueDate"] = candidate
+    elif prompted_slot == "deliverables":
+        candidate = _normalize_direct_fact_value(normalized_message)
+        if candidate:
+            updates["deliverables"] = candidate
+
+    if updates:
+        logger.info(
+            "prompted_slot_inference slot=%s message=%r inferred_updates=%s current_data=%s",
+            prompted_slot,
+            normalized_message,
+            updates,
+            current_data,
+        )
+    return updates
 
 
 def _build_slot_help_message(slot: str, current_data: dict[str, object]) -> str:
@@ -1092,87 +1206,150 @@ def _should_offer_goal_guidance(
     return asks_goal and wants_help
 
 
-def _topic_refinement_options(title: str) -> list[str]:
-    normalized = _clean_text(title).lower()
+GUIDED_OPTION_PROFILES: tuple[dict[str, object], ...] = (
+    {
+        "name": "public_facility",
+        "keywords": ("공공시설", "도서관", "공원", "주민센터", "버스터미널", "체육관"),
+        "topic_options": [
+            "실시간 혼잡도와 대기시간 확인",
+            "예약 가능 시간과 절차 간소화",
+            "운영시간·위치·이용 규칙 한눈에 보기",
+            "시설 불편 신고와 개선 요청 빠르게 접수하기",
+        ],
+        "goal_options": [
+            "사용자가 필요한 시설 정보를 빠르게 확인하고 헛걸음을 줄이게 한다",
+            "예약과 신청 과정을 단순화해 이용 완료까지 걸리는 시간을 줄인다",
+            "시설 이용 중 발생하는 불편을 즉시 접수하고 대응 속도를 높인다",
+        ],
+    },
+    {
+        "name": "schedule_collaboration",
+        "keywords": ("팀 프로젝트", "협업", "일정", "과제", "회의", "팀플", "스케줄"),
+        "topic_options": [
+            "역할 분담과 책임 범위 정리",
+            "일정 조율과 마감 리마인드",
+            "진행 상황과 이슈 공유",
+            "회의 기록과 다음 액션 정리",
+        ],
+        "goal_options": [
+            "팀원이 해야 할 일과 마감 일정을 한눈에 파악하게 한다",
+            "협업 중 누락되는 일정과 커뮤니케이션 비용을 줄인다",
+            "회의 이후 다음 액션이 자동으로 정리되도록 만든다",
+        ],
+    },
+    {
+        "name": "weather_outfit",
+        "keywords": ("날씨", "옷", "코디", "옷차림", "패션", "출근룩"),
+        "topic_options": [
+            "기온·강수·바람에 맞는 옷차림 추천",
+            "학교·출근·운동 같은 상황별 코디 제안",
+            "보유 옷장을 기준으로 현실적인 조합 추천",
+            "개인 스타일과 추위 민감도를 반영한 맞춤 안내",
+        ],
+        "goal_options": [
+            "사용자가 매일 날씨에 맞는 옷차림을 빠르게 결정하게 한다",
+            "날씨 변수와 일정에 맞는 코디 추천으로 준비 시간을 줄인다",
+            "개인 옷장과 스타일 취향을 반영해 실용적인 코디 선택을 돕는다",
+        ],
+    },
+    {
+        "name": "mental_health",
+        "keywords": ("우울", "정신건강", "자살", "불안", "청소년", "스트레스", "상담"),
+        "topic_options": [
+            "위험 신호를 빠르게 감지하고 도움 요청 연결하기",
+            "기분 기록과 변화 추세를 꾸준히 관리하기",
+            "상담·자가관리 정보에 쉽게 접근하기",
+            "개인 상태에 맞는 맞춤형 지원 제공하기",
+        ],
+        "goal_options": [
+            "사용자가 자신의 상태 변화를 조기에 인지하고 도움을 요청하게 한다",
+            "정신건강 관리 행동을 꾸준히 이어갈 수 있도록 지원한다",
+            "고위험 상황에서 즉시 연결 가능한 지원 체계를 제공한다",
+        ],
+    },
+    {
+        "name": "environment",
+        "keywords": ("환경", "에너지", "재활용", "탄소", "분리배출"),
+        "topic_options": [
+            "사용량과 절감 효과를 시각화하기",
+            "행동 변화를 유도하는 리마인드 제공",
+            "분리배출과 실천 가이드 안내",
+            "이상 징후를 조기에 감지하기",
+        ],
+        "goal_options": [
+            "사용자가 환경 관련 실천 행동을 더 쉽게 이어가게 한다",
+            "에너지 사용량과 절감 효과를 직관적으로 이해하게 한다",
+            "실천 방법 안내와 알림으로 참여율을 높인다",
+        ],
+    },
+)
 
-    if any(keyword in normalized for keyword in ("공공시설", "시설 이용", "체육시설", "도서관", "공원")):
-        return [
-            "혼잡도 확인",
-            "예약/대기 관리",
-            "운영시간·위치 안내",
-            "불편 신고·접근성 정보",
-        ]
-    if any(keyword in normalized for keyword in ("일정", "스케줄", "팀플", "협업", "과제")):
-        return [
-            "일정 조율",
-            "역할 분담",
-            "마감 리마인드",
-            "진행 상황 공유",
-        ]
-    if any(keyword in normalized for keyword in ("환경", "에너지", "재활용", "탄소")):
-        return [
-            "사용량 시각화",
-            "절감 행동 유도",
-            "분리배출 안내",
-            "이상 징후 알림",
-        ]
 
+def _guidance_context_text(current_data: dict[str, object]) -> str:
+    parts = [
+        _clean_text(_get_topic_anchor(current_data, allow_title_fallback=False)),
+        _clean_text(current_data.get("problemArea")),
+        _clean_text(current_data.get("targetUser")),
+        _clean_text(current_data.get("targetFacility")),
+    ]
+    return " ".join(part for part in parts if part).lower()
+
+
+def _match_guided_option_profile(current_data: dict[str, object]) -> dict[str, object] | None:
+    normalized = _guidance_context_text(current_data)
+    if not normalized:
+        return None
+    for profile in GUIDED_OPTION_PROFILES:
+        keywords = tuple(profile.get("keywords", ()))
+        if any(keyword in normalized for keyword in keywords):
+            return profile
+    return None
+
+
+def _topic_refinement_options(current_data: dict[str, object]) -> list[str]:
+    profile = _match_guided_option_profile(current_data)
+    if profile:
+        return list(profile.get("topic_options", []))
     return [
-        "정보 찾기 쉽게 하기",
-        "예약·신청 흐름 줄이기",
-        "불편 접수 빠르게 하기",
-        "개인 맞춤 안내 제공",
+        "사용자가 가장 먼저 겪는 불편 정리하기",
+        "정보 탐색과 의사결정 과정 단순화하기",
+        "반복되는 신청·입력 절차 줄이기",
+        "개인 상황에 맞는 맞춤형 안내 제공하기",
     ]
 
 
-def _goal_guidance_options(topic_anchor: str) -> list[str]:
-    normalized = _clean_text(topic_anchor).lower()
+def _goal_guidance_options(current_data: dict[str, object]) -> list[str]:
+    profile = _match_guided_option_profile(current_data)
+    if profile:
+        return list(profile.get("goal_options", []))
 
-    if "공공시설" in normalized and "예약" in normalized:
-        return [
-            "사용자가 예약 가능 시간과 절차를 더 빠르게 확인하고 신청할 수 있게 한다",
-            "중복 예약과 대기 불편을 줄여 공공시설 예약 과정을 더 효율적으로 만든다",
-            "전화나 방문 없이 모바일에서 예약과 변경을 간편하게 처리할 수 있게 한다",
-        ]
-    if "공공시설" in normalized:
-        return [
-            "사용자가 필요한 공공시설 정보를 한눈에 확인하고 쉽게 이용할 수 있게 한다",
-            "공공시설 이용 과정에서 반복되는 불편과 정보 부족 문제를 줄인다",
-            "공공시설 접근성과 이용 편의성을 높이는 서비스를 만든다",
-        ]
-    if any(keyword in normalized for keyword in ("예약", "예매", "신청")):
-        return [
-            "사용자가 예약 가능한 시간과 조건을 빠르게 확인하고 신청할 수 있게 한다",
-            "예약 과정의 복잡함과 실패 경험을 줄여 이용 편의성을 높인다",
-            "예약 변경과 취소까지 한 흐름에서 처리할 수 있게 한다",
-        ]
-
+    topic_anchor = _get_topic_anchor(current_data, allow_title_fallback=False) or "이 프로젝트"
     return [
-        f"{topic_anchor} 이용 과정의 핵심 불편을 줄인다",
-        f"{topic_anchor} 관련 정보를 더 쉽게 확인하고 활용할 수 있게 한다",
-        f"{topic_anchor} 사용자 경험을 더 단순하고 편하게 만든다",
+        f"{topic_anchor} 과정에서 반복되는 불편과 시간 낭비를 줄이게 한다",
+        f"{topic_anchor} 관련 정보를 더 빠르고 정확하게 판단하게 한다",
+        f"{topic_anchor} 경험을 더 단순하고 이해하기 쉽게 만든다",
     ]
 
 
 def _build_topic_refinement_message(current_data: dict[str, object]) -> str:
     topic_anchor = _get_topic_anchor(current_data, allow_title_fallback=False) or "이 주제"
-    options = [*_topic_refinement_options(topic_anchor), "아직 모르겠어요. 추천이 더 필요해요"]
+    options = [*_topic_refinement_options(current_data), "아직 모르겠어요. 추천이 더 필요해요"]
     option_lines = "\n".join(f"{index}. {option}" for index, option in enumerate(options, start=1))
     return (
-        f"좋아요. '{topic_anchor}'까지는 잡혔고 아직 구체 문제는 미정이에요. 같이 좁혀볼게요.\n"
+        f"좋아요. '{topic_anchor}'까지는 잡혔고 이제 어떤 문제를 풀지 같이 좁혀볼게요.\n"
         f"{option_lines}\n"
-        "번호로 답하거나 더 끌리는 방향을 한 줄로 적어 주세요."
+        "번호로 답하거나, 더 맞는 방향이 있다면 한 줄로 바로 말해 주세요."
     )
 
 
 def _build_goal_guidance_message(current_data: dict[str, object]) -> str:
     topic_anchor = _get_topic_anchor(current_data, allow_title_fallback=False) or "이 주제"
-    options = _goal_guidance_options(topic_anchor)
+    options = _goal_guidance_options(current_data)
     option_lines = "\n".join(f"{index}. {option}" for index, option in enumerate(options, start=1))
     return (
         f"좋아요. '{topic_anchor}' 기준이면 목표는 이렇게 잡을 수 있어요.\n"
         f"{option_lines}\n"
-        "가장 가까운 번호 하나를 고르거나, 원하는 방향으로 한 줄 수정해 주세요."
+        "가장 가까운 번호 하나를 고르거나, 원하는 방향으로 한 줄 수정해서 말해 주세요."
     )
 
 
@@ -1182,26 +1359,6 @@ def _build_problem_definition_prompt(subject: str) -> str:
         "이제 이 안에서 어떤 문제를 해결하고 싶은지만 정하면 됩니다. "
         "예: 예약 불편, 혼잡도, 접근성 정보 부족"
     )
-
-
-def _refine_subject_from_problem_area(subject: str, problem_area: str) -> str:
-    base_subject = _clean_text(subject)
-    area = _clean_text(problem_area)
-    if not base_subject or not area:
-        return ""
-    if not subject_needs_problem_definition(base_subject):
-        return base_subject
-
-    heuristic_candidate = f"{base_subject} {area}"
-    lowered_area = area.lower()
-    if "예약" in lowered_area and any(token in lowered_area for token in ("불편", "절차", "대기", "신청", "효율")):
-        heuristic_candidate = f"{base_subject} 예약 효율화"
-    elif "혼잡" in lowered_area:
-        heuristic_candidate = f"{base_subject} 혼잡도 안내"
-    elif "접근성" in lowered_area:
-        heuristic_candidate = f"{base_subject} 접근성 개선"
-
-    return _normalize_topic_title_with_llm(heuristic_candidate, field_name="subject")
 
 
 def _looks_like_title_instruction(candidate: str) -> bool:
@@ -1447,6 +1604,28 @@ def _build_target_facility_follow_up(topic_anchor: str, problem_area: str, targe
     )
 
 
+def _build_problem_area_commit_response(
+    *,
+    contextual_data: dict[str, object],
+    topic_anchor: str,
+    problem_area: str,
+    current_phase: str,
+) -> tuple[str, str, bool]:
+    next_phase = derive_phase_from_collected_data(
+        contextual_data,
+        current_phase=current_phase,
+    )
+    is_sufficient = _is_template_ready(contextual_data)
+    follow_up = _build_next_missing_field_prompt(
+        contextual_data,
+        current_phase=next_phase,
+    )
+    base_message = _build_problem_area_follow_up(topic_anchor, problem_area)
+    if follow_up and follow_up not in base_message:
+        return f"{base_message} {follow_up}".strip(), next_phase, is_sufficient
+    return base_message, next_phase, is_sufficient
+
+
 def _trim_subject_candidate_clause(value: str) -> str:
     candidate = _clean_text(value)
     if not candidate:
@@ -1583,6 +1762,12 @@ def _extract_roles_from_message(message: str) -> str:
             if token.strip()
         ]
         roles = [token for token in fallback_tokens if _looks_like_role_token(token)]
+
+    normalized_roles = [
+        role for role in (normalize_roles(candidate) or []) if _looks_like_role_token(role)
+    ]
+    if normalized_roles and len(normalized_roles) > len(roles):
+        roles = normalized_roles
 
     return ", ".join(roles)
 
@@ -2525,10 +2710,14 @@ def _filter_gather_updates(
     *,
     focus_type: str | None,
 ) -> dict[str, object]:
-    if _is_guidance_signal(user_message):
-        return {}
-
     sanitized = _sanitize_gather_updates(updated_data)
+    if _is_guidance_signal(user_message):
+        topical_updates = {
+            key: value
+            for key, value in sanitized.items()
+            if key in {"subject", "title"}
+        }
+        return topical_updates
     if focus_type in UNSUPPORTED_GATHER_TOPICS:
         return {}
     return sanitized
@@ -2921,45 +3110,25 @@ def topic_exists_node(state: AgentState):
             contextual_data or current_data,
             allow_title_fallback=False,
         )
-        if topic_anchor and subject_needs_problem_definition(topic_anchor):
-            refined_subject = _refine_subject_from_problem_area(topic_anchor, problem_area_candidate)
-            if refined_subject:
-                refined_data = merge_collected_data(
-                    contextual_data,
-                    {"subject": refined_subject},
-                )
-                refined_phase = derive_phase_from_collected_data(
-                    refined_data,
-                    current_phase="PROBLEM_DEFINE",
-                )
-                logger.info(
-                    "topic_exists refined_subject before=%s problem_area=%r after=%s next_phase=%s",
-                    current_data,
-                    problem_area_candidate,
-                    refined_data,
-                    refined_phase,
-                )
-                return {
-                    "ai_message": (
-                        f"좋아요. {refined_subject}로 정리할게요. "
-                        "이 프로젝트 목표를 한두 줄로 말해 주세요."
-                    ),
-                    "collected_data": refined_data,
-                    "is_sufficient": _is_template_ready(refined_data),
-                    "next_phase": refined_phase,
-                }
+        ai_message, contextual_phase, contextual_sufficient = _build_problem_area_commit_response(
+            contextual_data=contextual_data,
+            topic_anchor=topic_anchor,
+            problem_area=problem_area_candidate,
+            current_phase="TOPIC_SET",
+        )
         logger.info(
-            "topic_exists problem_area topic=%r problem_area=%r before=%s after=%s",
+            "topic_exists problem_area topic=%r problem_area=%r before=%s after=%s next_phase=%s",
             topic_anchor,
             problem_area_candidate,
             current_data,
-            merged_data,
+            contextual_data,
+            contextual_phase,
         )
         return {
-            "ai_message": _build_problem_area_follow_up(topic_anchor, problem_area_candidate),
+            "ai_message": ai_message,
             "collected_data": contextual_data,
-            "is_sufficient": _is_template_ready(contextual_data),
-            "next_phase": next_phase,
+            "is_sufficient": contextual_sufficient,
+            "next_phase": contextual_phase,
         }
     if turn_type in {
         "request_summary",
@@ -3080,6 +3249,7 @@ def gather_information_node(state: AgentState):
     requested_next_step = _is_next_step_request(user_message)
     focus_type = _infer_conversation_focus(state)
     prompted_slot = _get_active_prompted_slot(state, prefilled_data)
+    contextual_prompted_slot = _get_contextual_prompted_slot(state, prefilled_data)
     direct_updates_raw = {
         key: value
         for key, value in _extract_direct_fact_updates(user_message).items()
@@ -3099,6 +3269,31 @@ def gather_information_node(state: AgentState):
         confirmed_title = _extract_confirmed_title_from_context(state)
         if confirmed_title:
             direct_updates_raw["title"] = confirmed_title
+    preflight_target_facility = _extract_target_facility_candidate(state, prefilled_data)
+    preflight_problem_area = _extract_problem_area_candidate(
+        state,
+        prefilled_data,
+        direct_updates=direct_updates_raw,
+    )
+    contextual_slot_updates = (
+        {}
+        if preflight_target_facility or preflight_problem_area
+        else _infer_prompted_slot_updates(
+            prompted_slot=contextual_prompted_slot,
+            user_message=user_message,
+            current_data=prefilled_data,
+        )
+    )
+    for key, value in contextual_slot_updates.items():
+        if key == "roles" and value:
+            existing_roles = normalize_roles(direct_updates_raw.get("roles"))
+            incoming_roles = normalize_roles(value)
+            if incoming_roles and len(incoming_roles) > len(existing_roles or []):
+                direct_updates_raw[key] = value
+            else:
+                direct_updates_raw.setdefault(key, value)
+            continue
+        direct_updates_raw.setdefault(key, value)
     direct_updates = _shared_sanitize_candidate_updates(
         direct_updates_raw,
         current_data=prefilled_data,
@@ -3293,59 +3488,24 @@ def gather_information_node(state: AgentState):
                 {"problemArea": problem_area_candidate},
             )
             topic_anchor = _get_topic_anchor(prefilled_data, allow_title_fallback=False)
-            if (
-                current_phase == "PROBLEM_DEFINE"
-                and topic_anchor
-                and subject_needs_problem_definition(topic_anchor)
-            ):
-                refined_subject = _refine_subject_from_problem_area(topic_anchor, problem_area_candidate)
-                if refined_subject and (
-                    refined_subject == topic_anchor
-                    or topic_anchor in refined_subject
-                    or any(token in refined_subject for token in problem_area_candidate.split())
-                ):
-                    refined_data = merge_collected_data(
-                        contextual_data,
-                        {"subject": refined_subject},
-                    )
-                    next_phase = derive_phase_from_collected_data(
-                        refined_data,
-                        current_phase="PROBLEM_DEFINE",
-                    )
-                    is_sufficient = _is_template_ready(refined_data)
-                    logger.info(
-                        "gather refined_subject topic=%r problem_area=%r before=%s after=%s next_phase=%s",
-                        topic_anchor,
-                        problem_area_candidate,
-                        prefilled_data,
-                        refined_data,
-                        next_phase,
-                    )
-                    return {
-                        "ai_message": _apply_turn_policy_to_message(
-                            state,
-                            f"좋아요. {refined_subject}로 정리할게요. 이 프로젝트 목표를 한두 줄로 말해 주세요.",
-                        ),
-                        "collected_data": refined_data,
-                        "is_sufficient": is_sufficient,
-                        "next_phase": next_phase,
-                    }
-            next_phase = derive_phase_from_collected_data(prefilled_data, current_phase=current_phase)
-            is_sufficient = _is_template_ready(prefilled_data)
+            ai_message, next_phase, is_sufficient = _build_problem_area_commit_response(
+                contextual_data=contextual_data,
+                topic_anchor=topic_anchor,
+                problem_area=problem_area_candidate,
+                current_phase=current_phase,
+            )
             logger.info(
-                "gather problem_area topic=%r problem_area=%r before=%s next_phase=%s",
+                "gather problem_area topic=%r problem_area=%r before=%s after=%s next_phase=%s",
                 topic_anchor,
                 problem_area_candidate,
                 prefilled_data,
+                contextual_data,
                 next_phase,
             )
             return {
                 "ai_message": _apply_turn_policy_to_message(
                     state,
-                    _build_problem_area_follow_up(
-                        _get_topic_anchor(prefilled_data, allow_title_fallback=False),
-                        problem_area_candidate,
-                    ),
+                    ai_message,
                 ),
                 "collected_data": contextual_data,
                 "is_sufficient": is_sufficient,
