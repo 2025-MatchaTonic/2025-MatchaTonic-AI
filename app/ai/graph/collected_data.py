@@ -1162,8 +1162,100 @@ def subject_needs_problem_definition(subject: object) -> bool:
     return not any(token in normalized for token in ("문제", "기능", "대상", "사용자", "프로젝트"))
 
 
+def has_problem_definition_context(data: Mapping[str, object] | None) -> bool:
+    sanitized = sanitize_collected_data(data)
+    return bool(
+        _normalize_auxiliary_value("problemArea", sanitized.get("problemArea"))
+        or _normalize_auxiliary_value("targetFacility", sanitized.get("targetFacility"))
+    )
+
+
 def has_any_collected_fact(data: Mapping[str, object] | None) -> bool:
     return bool(sanitize_collected_data(data))
+
+
+def build_phase_derivation_trace(
+    data: Mapping[str, object] | None,
+    *,
+    current_phase: str = "EXPLORE",
+) -> dict[str, object]:
+    sanitized = sanitize_collected_data(data)
+    subject = _clean_string(sanitized.get("subject"))
+    title = _clean_string(sanitized.get("title"))
+    problem_area = _clean_string(sanitized.get("problemArea"))
+    target_facility = _clean_string(sanitized.get("targetFacility"))
+    execution_fact_keys = [
+        key
+        for key in ("goal", "teamSize", "roles", "dueDate", "deliverables")
+        if is_valid_collected_value(
+            key,
+            sanitized.get(key),
+            team_size=sanitized.get("teamSize"),
+        )
+    ]
+    subject_needs_refinement = bool(subject and subject_needs_problem_definition(subject))
+    has_problem_context = has_problem_definition_context(sanitized)
+
+    derived = "EXPLORE"
+    reason = "no_committed_data"
+    if is_template_ready(sanitized):
+        derived = "READY"
+        reason = "all_required_fields_committed"
+    elif subject:
+        if execution_fact_keys:
+            derived = "GATHER"
+            reason = "execution_fields_available"
+        elif subject_needs_refinement and not has_problem_context:
+            derived = "PROBLEM_DEFINE"
+            reason = "broad_subject_requires_problem_definition"
+        else:
+            derived = "GATHER"
+            if subject_needs_refinement and has_problem_context:
+                reason = "problem_definition_context_available"
+            else:
+                reason = "concrete_subject_available"
+    elif title:
+        derived = "GATHER" if execution_fact_keys else "TOPIC_SET"
+        reason = (
+            "title_plus_execution_fields_available"
+            if execution_fact_keys
+            else "title_available_without_subject"
+        )
+    elif sanitized:
+        derived = "TOPIC_SET"
+        reason = "partial_committed_data_without_topic_anchor"
+
+    returned_phase = derived
+    if derived == "EXPLORE" and current_phase == "TOPIC_SET":
+        returned_phase = "TOPIC_SET"
+        reason = "keep_topic_set_without_committed_topic"
+    elif (
+        derived == "PROBLEM_DEFINE"
+        and current_phase in {"GATHER", "READY"}
+        and subject
+        and not title
+        and not execution_fact_keys
+    ):
+        returned_phase = "PROBLEM_DEFINE"
+        reason = "fall_back_to_problem_define_due_to_missing_execution_fields"
+    elif PHASE_ORDER.get(derived, 0) < PHASE_ORDER.get(current_phase, 0):
+        returned_phase = current_phase
+        reason = f"keep_existing_phase_{current_phase.lower()}"
+
+    return {
+        "current_phase": current_phase,
+        "derived_phase": derived,
+        "returned_phase": returned_phase,
+        "reason": reason,
+        "has_subject": bool(subject),
+        "has_title": bool(title),
+        "subject_needs_problem_definition": subject_needs_refinement,
+        "has_problem_definition_context": has_problem_context,
+        "problem_area": problem_area,
+        "target_facility": target_facility,
+        "execution_fact_keys": execution_fact_keys,
+        "sanitized_keys": sorted(sanitized.keys()),
+    }
 
 
 def derive_phase_from_collected_data(
@@ -1171,51 +1263,8 @@ def derive_phase_from_collected_data(
     *,
     current_phase: str = "EXPLORE",
 ) -> str:
-    sanitized = sanitize_collected_data(data)
-    subject = sanitized.get("subject")
-    has_execution_fact = any(
-        is_valid_collected_value(
-            key,
-            sanitized.get(key),
-            team_size=sanitized.get("teamSize"),
-        )
-        for key in ("goal", "teamSize", "roles", "dueDate", "deliverables")
-    )
-    derived = "EXPLORE"
-    if is_template_ready(sanitized):
-        derived = "READY"
-    elif has_subject(sanitized):
-        if has_execution_fact:
-            derived = "GATHER"
-        elif subject_needs_problem_definition(subject):
-            derived = "PROBLEM_DEFINE"
-        else:
-            derived = "GATHER"
-    elif has_title(sanitized):
-        derived = "GATHER" if has_execution_fact else "TOPIC_SET"
-    elif sanitized:
-        derived = "TOPIC_SET"
-
-    if derived == "EXPLORE" and current_phase == "TOPIC_SET":
-        return "TOPIC_SET"
-    if (
-        derived == "PROBLEM_DEFINE"
-        and current_phase in {"GATHER", "READY"}
-        and has_subject(sanitized)
-        and not has_title(sanitized)
-        and not any(
-            is_valid_collected_value(
-                key,
-                sanitized.get(key),
-                team_size=sanitized.get("teamSize"),
-            )
-            for key in ("goal", "teamSize", "roles", "dueDate", "deliverables")
-        )
-    ):
-        return "PROBLEM_DEFINE"
-    if PHASE_ORDER.get(derived, 0) >= PHASE_ORDER.get(current_phase, 0):
-        return derived
-    return current_phase
+    trace = build_phase_derivation_trace(data, current_phase=current_phase)
+    return str(trace["returned_phase"])
 
 
 def build_collected_data_guide() -> str:
@@ -1763,6 +1812,7 @@ def choose_next_question_field(
         current_phase in {"EXPLORE", "TOPIC_SET", "PROBLEM_DEFINE"}
         and subject
         and subject_needs_problem_definition(subject)
+        and not has_problem_definition_context(sanitized)
         and "subject" not in seen
     ):
         pending.append("subject")
@@ -1798,6 +1848,14 @@ def infer_prompted_slot(
         followup_fields=followup_fields,
         rejected_updates=rejected_updates,
     )
+
+
+def infer_contextual_prompted_slot(
+    *,
+    recent_messages: list[str] | None,
+    selected_message: str | None,
+) -> str:
+    return _infer_prompted_slot_from_messages(recent_messages, selected_message)
 
 
 def apply_collected_data_updates(
@@ -1970,6 +2028,31 @@ def build_approved_collected_data_snapshot(
     subject = _clean_string(snapshot.get("subject"))
     if goal and subject and goal == subject:
         snapshot.pop("goal", None)
+
+    return snapshot
+
+
+def build_public_update_snapshot(
+    updates: Mapping[str, object] | None,
+    *,
+    current_data: Mapping[str, object] | None = None,
+) -> CollectedData:
+    sanitized_updates = sanitize_candidate_updates(
+        updates,
+        current_data=current_data,
+    )
+    snapshot: CollectedData = {}
+
+    for key in REQUIRED_COLLECTED_DATA_FIELDS:
+        if key not in sanitized_updates:
+            continue
+        value = sanitized_updates.get(key)
+        if is_valid_collected_value(
+            key,
+            value,
+            team_size=sanitized_updates.get("teamSize", (current_data or {}).get("teamSize")),
+        ):
+            snapshot[key] = value
 
     return snapshot
 

@@ -14,6 +14,9 @@ from app.ai.graph.text_support import (
 )
 from app.ai.graph.collected_data import (
     CollectedData,
+    build_approved_collected_data_snapshot,
+    build_public_update_snapshot,
+    build_phase_derivation_trace,
     choose_next_question_field,
     derive_phase_from_collected_data,
     missing_collected_fields,
@@ -303,6 +306,10 @@ def _build_suggested_questions(
 async def process_chat(request: AIChatRequest):
     try:
         effective_phase = _derive_effective_phase(request)
+        request_phase_trace = build_phase_derivation_trace(
+            request.collectedData,
+            current_phase=request.currentStatus,
+        )
         logger.info(
             "chat request room=%s project_id=%s action=%s current_status=%s effective_phase=%s content=%r raw_collected_keys=%s normalized_collected_keys=%s collected_data=%s recent_count=%d selected_message=%r",
             request.roomId,
@@ -316,6 +323,11 @@ async def process_chat(request: AIChatRequest):
             request.collectedData,
             len(request.recentMessages),
             request.selectedMessage,
+        )
+        logger.info(
+            "chat phase_trace room=%s stage=request trace=%s",
+            request.roomId,
+            request_phase_trace,
         )
         initial_state = {
             "project_id": str(request.roomId),
@@ -339,16 +351,33 @@ async def process_chat(request: AIChatRequest):
 
         result = await asyncio.to_thread(ai_app.invoke, initial_state)
         response_phase = result.get("next_phase", effective_phase)
-        response_collected_data = result.get("collected_data", request.collectedData)
-        approved_updates = result.get("approved_updates", {})
-        rejected_updates = result.get("rejected_updates", {})
-        rejected_reasons = result.get("rejected_reasons", {})
+        internal_response_collected_data = result.get("collected_data", request.collectedData)
+        response_collected_data = build_approved_collected_data_snapshot(
+            internal_response_collected_data
+        )
+        approved_updates = build_public_update_snapshot(
+            result.get("approved_updates", {}),
+            current_data=request.collectedData,
+        )
+        rejected_updates = build_public_update_snapshot(
+            result.get("rejected_updates", {}),
+            current_data=request.collectedData,
+        )
+        rejected_reasons = {
+            key: value
+            for key, value in dict(result.get("rejected_reasons", {})).items()
+            if key in rejected_updates
+        }
         followup_fields = result.get("followup_fields", [])
         next_question_field = _normalize_slot_name(result.get("next_question_field")) or choose_next_question_field(
             response_collected_data,
             current_phase=response_phase,
             followup_fields=followup_fields,
             rejected_updates=rejected_updates,
+        )
+        response_phase_trace = build_phase_derivation_trace(
+            internal_response_collected_data,
+            current_phase=request.currentStatus,
         )
         logger.info(
             "chat decision room=%s phase=%s approved_updates=%s rejected_updates=%s rejected_reasons=%s next_question_field=%s",
@@ -360,10 +389,17 @@ async def process_chat(request: AIChatRequest):
             next_question_field,
         )
         logger.info(
-            "chat response room=%s next_phase=%s is_sufficient=%s collected_data=%s ai_message=%r",
+            "chat phase_trace room=%s stage=response trace=%s node_phase=%s",
+            request.roomId,
+            response_phase_trace,
+            response_phase,
+        )
+        logger.info(
+            "chat response room=%s next_phase=%s is_sufficient=%s collected_data=%s public_collected_data=%s ai_message=%r",
             request.roomId,
             response_phase,
             result.get("is_sufficient", False),
+            internal_response_collected_data,
             response_collected_data,
             result.get("ai_message", ""),
         )
