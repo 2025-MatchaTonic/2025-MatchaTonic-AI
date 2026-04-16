@@ -1267,6 +1267,55 @@ def derive_phase_from_collected_data(
     return str(trace["returned_phase"])
 
 
+def build_decision_context(
+    data: Mapping[str, object] | None,
+    *,
+    current_phase: str = "GATHER",
+    prompted_slot: str = "",
+    recent_messages: list[str] | None = None,
+    user_message: str = "",
+) -> dict[str, object]:
+    sanitized = sanitize_collected_data(data)
+    phase_trace = build_phase_derivation_trace(
+        sanitized,
+        current_phase=current_phase,
+    )
+    confirmed_facts = {
+        key: sanitized[key]
+        for key in REQUIRED_COLLECTED_DATA_FIELDS
+        if key in sanitized
+    }
+    problem_context = {
+        "problemArea": _clean_string(sanitized.get("problemArea")),
+        "targetFacility": _clean_string(sanitized.get("targetFacility")),
+        "targetUser": _clean_string(sanitized.get("targetUser")),
+    }
+    open_slots = list(missing_collected_fields(sanitized))
+    subject = _clean_string(sanitized.get("subject"))
+    if (
+        subject
+        and subject_needs_problem_definition(subject)
+        and not has_problem_definition_context(sanitized)
+        and "problemArea" not in open_slots
+    ):
+        open_slots.insert(0, "problemArea")
+
+    return {
+        "current_phase": current_phase,
+        "effective_phase": str(phase_trace["returned_phase"]),
+        "prompted_slot": prompted_slot,
+        "topic_anchor": subject or _clean_string(sanitized.get("title")),
+        "confirmed_facts": confirmed_facts,
+        "problem_definition_context": {
+            key: value for key, value in problem_context.items() if value
+        },
+        "open_slots": open_slots,
+        "recent_messages": [_clean_string(message) for message in (recent_messages or []) if _clean_string(message)],
+        "recent_user_message": _clean_string(user_message),
+        "phase_trace": phase_trace,
+    }
+
+
 def build_collected_data_guide() -> str:
     return ", ".join(f'"{key}" ({label})' for key, label in COLLECTED_DATA_FIELDS.items())
 

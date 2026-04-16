@@ -10,6 +10,7 @@ from app.ai.graph.collected_data import (
     FIELD_POLICY,
     CandidateDecision,
     apply_collected_data_updates,
+    build_decision_context,
     build_collected_data_json_example,
     build_role_team_size_conflict_message,
     choose_next_question_field,
@@ -399,16 +400,6 @@ def _extract_title_updates_for_topic_set(
         return {}
 
     direct_updates = dict(direct_updates or _extract_direct_fact_updates(user_message))
-    normalized_message = _clean_text(_strip_mates_mention(user_message))
-    has_explicit_topic_prefix = bool(
-        normalized_message
-        and (
-            "주제" in normalized_message
-            or "subject" in normalized_message.lower()
-            or "topic" in normalized_message.lower()
-            or TITLE_EXPLICIT_PATTERN.match(normalized_message)
-        )
-    )
     fresh_topic_candidate = _extract_fresh_topic_submission_candidate(
         state,
         current_data,
@@ -426,9 +417,7 @@ def _extract_title_updates_for_topic_set(
     if "title" in direct_updates:
         return {"title": direct_updates["title"]}
 
-    if _is_non_storable_freeform_message(user_message) and not has_explicit_topic_prefix:
-        return {}
-    if _is_summary_request(user_message) or _is_fill_remaining_request(user_message, current_data):
+    if _is_storage_control_message(user_message, current_data):
         return {}
 
     choice_title = _extract_choice_based_title(state)
@@ -471,28 +460,27 @@ def _extract_fresh_topic_submission_candidate(
     normalized_message = _clean_text(user_message)
     if not normalized_message:
         return ""
-    if _is_non_storable_freeform_message(normalized_message):
-        return ""
-    if _is_summary_request(normalized_message) or _is_fill_remaining_request(normalized_message, current_data):
+
+    direct_updates = dict(direct_updates or {})
+    explicit_topic_candidate = str(
+        direct_updates.get("subject") or direct_updates.get("title") or ""
+    ).strip()
+    if explicit_topic_candidate and explicit_topic_candidate != current_anchor:
+        return explicit_topic_candidate
+
+    if _is_storage_control_message(normalized_message, current_data):
         return ""
     if _extract_choice_based_title(state):
         return ""
     if _is_awaiting_target_facility(state):
         return ""
 
-    direct_updates = dict(direct_updates or {})
-    explicit_topic_candidate = str(
-        direct_updates.get("subject") or direct_updates.get("title") or ""
-    ).strip()
     heuristic_candidate = _normalize_topic_title(_extract_topic_candidate(normalized_message))
     candidate = explicit_topic_candidate or heuristic_candidate
     if not candidate:
         return ""
     if candidate == current_anchor:
         return ""
-
-    if explicit_topic_candidate:
-        return candidate
 
     compact_candidate = re.sub(r"\s+", "", candidate)
     if len(compact_candidate) < 8 and len(candidate.split()) < 2:
@@ -513,16 +501,7 @@ def _looks_like_open_question(text: str) -> bool:
     cleaned = _clean_text(text)
     if not cleaned:
         return False
-    lowered = cleaned.lower()
-    if "?" in lowered:
-        return True
-    return bool(
-        re.search(
-            r"(?:무엇|뭐|뭘|어떻게|어떤|왜|언제|누가).*(?:하지|할지|할까|해야\s*하지|해야\s*할지|좋을까|좋을지|아니었나)\s*$",
-            lowered,
-            re.IGNORECASE,
-        )
-    )
+    return "?" in cleaned or "？" in cleaned
 
 
 def _has_structured_fact_updates(direct_updates: dict[str, object] | None) -> bool:
@@ -1143,9 +1122,23 @@ def _is_non_storable_freeform_message(user_message: str) -> bool:
         or looks_like_non_committal_value(normalized)
         or _is_guidance_signal(normalized)
         or _is_meta_conversation_message(normalized)
-        or _looks_like_question_line(normalized)
-        or _looks_like_open_question(normalized)
     )
+
+
+def _is_storage_control_message(
+    user_message: str,
+    current_data: dict[str, object] | None = None,
+) -> bool:
+    normalized = _clean_text(user_message)
+    if not normalized:
+        return False
+    if _matches_topic_presence_button_message(normalized):
+        return True
+    if _is_summary_request(normalized):
+        return True
+    if _is_fill_remaining_request(normalized, current_data or {}):
+        return True
+    return _is_non_storable_freeform_message(normalized)
 
 
 def _should_offer_topic_guidance(
@@ -1206,159 +1199,359 @@ def _should_offer_goal_guidance(
     return asks_goal and wants_help
 
 
-GUIDED_OPTION_PROFILES: tuple[dict[str, object], ...] = (
-    {
-        "name": "public_facility",
-        "keywords": ("공공시설", "도서관", "공원", "주민센터", "버스터미널", "체육관"),
-        "topic_options": [
-            "실시간 혼잡도와 대기시간 확인",
-            "예약 가능 시간과 절차 간소화",
-            "운영시간·위치·이용 규칙 한눈에 보기",
-            "시설 불편 신고와 개선 요청 빠르게 접수하기",
-        ],
-        "goal_options": [
-            "사용자가 필요한 시설 정보를 빠르게 확인하고 헛걸음을 줄이게 한다",
-            "예약과 신청 과정을 단순화해 이용 완료까지 걸리는 시간을 줄인다",
-            "시설 이용 중 발생하는 불편을 즉시 접수하고 대응 속도를 높인다",
-        ],
-    },
-    {
-        "name": "schedule_collaboration",
-        "keywords": ("팀 프로젝트", "협업", "일정", "과제", "회의", "팀플", "스케줄"),
-        "topic_options": [
-            "역할 분담과 책임 범위 정리",
-            "일정 조율과 마감 리마인드",
-            "진행 상황과 이슈 공유",
-            "회의 기록과 다음 액션 정리",
-        ],
-        "goal_options": [
-            "팀원이 해야 할 일과 마감 일정을 한눈에 파악하게 한다",
-            "협업 중 누락되는 일정과 커뮤니케이션 비용을 줄인다",
-            "회의 이후 다음 액션이 자동으로 정리되도록 만든다",
-        ],
-    },
-    {
-        "name": "weather_outfit",
-        "keywords": ("날씨", "옷", "코디", "옷차림", "패션", "출근룩"),
-        "topic_options": [
-            "기온·강수·바람에 맞는 옷차림 추천",
-            "학교·출근·운동 같은 상황별 코디 제안",
-            "보유 옷장을 기준으로 현실적인 조합 추천",
-            "개인 스타일과 추위 민감도를 반영한 맞춤 안내",
-        ],
-        "goal_options": [
-            "사용자가 매일 날씨에 맞는 옷차림을 빠르게 결정하게 한다",
-            "날씨 변수와 일정에 맞는 코디 추천으로 준비 시간을 줄인다",
-            "개인 옷장과 스타일 취향을 반영해 실용적인 코디 선택을 돕는다",
-        ],
-    },
-    {
-        "name": "mental_health",
-        "keywords": ("우울", "정신건강", "자살", "불안", "청소년", "스트레스", "상담"),
-        "topic_options": [
-            "위험 신호를 빠르게 감지하고 도움 요청 연결하기",
-            "기분 기록과 변화 추세를 꾸준히 관리하기",
-            "상담·자가관리 정보에 쉽게 접근하기",
-            "개인 상태에 맞는 맞춤형 지원 제공하기",
-        ],
-        "goal_options": [
-            "사용자가 자신의 상태 변화를 조기에 인지하고 도움을 요청하게 한다",
-            "정신건강 관리 행동을 꾸준히 이어갈 수 있도록 지원한다",
-            "고위험 상황에서 즉시 연결 가능한 지원 체계를 제공한다",
-        ],
-    },
-    {
-        "name": "environment",
-        "keywords": ("환경", "에너지", "재활용", "탄소", "분리배출"),
-        "topic_options": [
-            "사용량과 절감 효과를 시각화하기",
-            "행동 변화를 유도하는 리마인드 제공",
-            "분리배출과 실천 가이드 안내",
-            "이상 징후를 조기에 감지하기",
-        ],
-        "goal_options": [
-            "사용자가 환경 관련 실천 행동을 더 쉽게 이어가게 한다",
-            "에너지 사용량과 절감 효과를 직관적으로 이해하게 한다",
-            "실천 방법 안내와 알림으로 참여율을 높인다",
-        ],
-    },
-)
+def _build_problem_definition_prompt(subject: str) -> str:
+    return (
+        f"좋아요. 주제 방향은 '{subject}'로 정리해둘게요. "
+        f"{_build_contextual_slot_question({'subject': subject}, 'problemArea')}"
+    )
 
 
-def _guidance_context_text(current_data: dict[str, object]) -> str:
-    parts = [
-        _clean_text(_get_topic_anchor(current_data, allow_title_fallback=False)),
-        _clean_text(current_data.get("problemArea")),
-        _clean_text(current_data.get("targetUser")),
-        _clean_text(current_data.get("targetFacility")),
+GUIDED_PROMPT_SLOT_META: dict[str, dict[str, str]] = {
+    "problemArea": {
+        "intro": "좋아요. '{topic_anchor}' 기준으로 어떤 문제를 먼저 풀지 같이 좁혀볼게요.",
+        "cta": "번호로 답하거나, 더 맞는 방향이 있다면 한 줄로 바로 말해 주세요.",
+        "fallback": "좋아요. '{topic_anchor}' 기준으로 사용자가 가장 먼저 겪는 불편을 한 줄로 말해 주세요.",
+    },
+    "goal": {
+        "intro": "좋아요. '{topic_anchor}' 기준이면 목표는 이렇게 잡아볼 수 있어요.",
+        "cta": "가장 가까운 번호 하나를 고르거나, 원하는 방향으로 한 줄 수정해서 말해 주세요.",
+        "fallback": "좋아요. '{topic_anchor}' 기준으로 이 프로젝트가 만들고 싶은 변화를 한 줄로 말해 주세요.",
+    },
+    "roles": {
+        "intro": "좋아요. '{topic_anchor}' 기준으로 필요한 역할은 이렇게 생각해볼 수 있어요.",
+        "cta": "가까운 번호를 고르거나, 필요한 역할 후보를 직접 적어 주세요.",
+        "fallback": "좋아요. '{topic_anchor}' 기준으로 필요한 역할 후보만 먼저 적어 주세요.",
+    },
+    "deliverables": {
+        "intro": "좋아요. '{topic_anchor}' 기준으로 산출물은 이렇게 정리해볼 수 있어요.",
+        "cta": "가까운 번호를 고르거나, 만들 결과물을 직접 적어 주세요.",
+        "fallback": "좋아요. '{topic_anchor}' 기준으로 최종 산출물을 한 줄로 적어 주세요.",
+    },
+}
+
+
+def _build_contextual_slot_question(
+    current_data: dict[str, object],
+    slot: str,
+    *,
+    current_phase: str = "GATHER",
+) -> str:
+    context = build_decision_context(
+        current_data,
+        current_phase=current_phase,
+        prompted_slot=slot,
+    )
+    topic_anchor = _clean_text(context.get("topic_anchor"))
+    problem_context = dict(context.get("problem_definition_context") or {})
+    problem_area = _clean_text(problem_context.get("problemArea"))
+    target_user = _clean_text(problem_context.get("targetUser"))
+    target_facility = _clean_text(problem_context.get("targetFacility"))
+
+    if slot == "subject":
+        return "최근에 불편했던 점이나 만들고 싶은 아이디어를 한 줄로 말해 주세요."
+    if slot == "problemArea":
+        if topic_anchor and target_facility:
+            return f"좋아요. '{topic_anchor}' 중 '{target_facility}' 기준으로 어떤 문제를 해결하고 싶은지, 사용자가 가장 먼저 겪는 문제를 한 줄로 말해 주세요."
+        if topic_anchor:
+            return f"좋아요. '{topic_anchor}'에서 어떤 문제를 해결하고 싶은지, 사용자가 가장 먼저 겪는 문제를 한 줄로 말해 주세요."
+        return "어떤 문제를 해결하고 싶은지, 사용자가 가장 먼저 겪는 문제를 한 줄로 말해 주세요."
+    if slot == "goal":
+        if topic_anchor and problem_area:
+            return f"좋아요. '{topic_anchor}'에서 '{problem_area}' 문제를 줄이기 위해 만들고 싶은 변화를 한 줄로 말해 주세요."
+        if topic_anchor:
+            return f"좋아요. '{topic_anchor}' 기준으로 이 프로젝트가 만들고 싶은 변화를 한 줄로 말해 주세요."
+        return "이 프로젝트가 만들고 싶은 변화를 한 줄로 말해 주세요."
+    if slot == "roles":
+        if topic_anchor and problem_area:
+            return f"좋아요. '{topic_anchor}'에서 '{problem_area}' 문제를 풀려면 어떤 역할이 필요할지 후보만 먼저 적어 주세요."
+        if topic_anchor:
+            return f"좋아요. '{topic_anchor}' 기준으로 필요한 역할 후보를 먼저 적어 주세요."
+        return "필요한 역할 후보를 먼저 적어 주세요."
+    if slot == "deliverables":
+        if topic_anchor and problem_area:
+            return f"좋아요. '{topic_anchor}'에서 '{problem_area}' 문제를 풀기 위해 최종적으로 만들 산출물을 한 줄로 적어 주세요."
+        if topic_anchor:
+            return f"좋아요. '{topic_anchor}' 기준으로 최종 산출물을 한 줄로 적어 주세요."
+        return "최종 산출물을 한 줄로 적어 주세요."
+    if slot == "dueDate":
+        if topic_anchor:
+            return f"좋아요. '{topic_anchor}' 기준으로 마감일이나 발표일을 한 줄로 적어 주세요."
+        return "마감일이나 발표일을 한 줄로 적어 주세요."
+    if slot == "teamSize":
+        if topic_anchor:
+            return f"좋아요. '{topic_anchor}'를 진행하는 팀 인원을 몇 명으로 생각하는지 적어 주세요. 예: 4명, 5명"
+        return "팀 인원을 몇 명으로 생각하는지 적어 주세요. 예: 4명, 5명"
+    if slot == "title":
+        if topic_anchor:
+            return f"좋아요. 지금까지 정한 '{topic_anchor}' 방향을 바탕으로 프로젝트 제목을 한 줄로 적어 주세요."
+        return "프로젝트 제목을 한 줄로 적어 주세요."
+    if slot == "targetUser":
+        if topic_anchor:
+            return f"좋아요. '{topic_anchor}' 문제를 가장 먼저 겪는 대상을 한 줄로 적어 주세요."
+        return "이 문제를 가장 먼저 겪는 대상을 한 줄로 적어 주세요."
+    return GATHER_FIELD_GUIDE.get(slot, {}).get("question", "")
+
+
+def _coerce_guided_prompt_result(
+    raw_result: object,
+    *,
+    target_slot: str,
+    topic_anchor: str,
+) -> dict[str, object]:
+    fallback_question = _build_next_missing_field_prompt(
+        {"subject": topic_anchor} if topic_anchor else {},
+        current_phase="GATHER",
+    )
+    if not isinstance(raw_result, dict):
+        return {
+            "slot": target_slot,
+            "question": "",
+            "options": [],
+            "fallback_question": fallback_question,
+            "generation_reason": "invalid_llm_payload",
+        }
+
+    options: list[str] = []
+    if isinstance(raw_result.get("options"), list):
+        for item in raw_result["options"]:
+            candidate = _clean_text(item)
+            if (
+                not candidate
+                or candidate in options
+                or _looks_like_question_line(candidate)
+                or _looks_like_multi_option_block(candidate)
+            ):
+                continue
+            options.append(candidate)
+            if len(options) >= 4:
+                break
+
+    return {
+        "slot": target_slot,
+        "question": _clean_text(raw_result.get("question")),
+        "options": options,
+        "fallback_question": _clean_text(raw_result.get("fallback_question")) or fallback_question,
+        "generation_reason": _clean_text(raw_result.get("generation_reason")) or "llm_generated",
+    }
+
+
+def _build_guided_prompt_fallback_payload(
+    *,
+    target_slot: str,
+    topic_anchor: str,
+) -> dict[str, object]:
+    fallback_template = GUIDED_PROMPT_SLOT_META.get(target_slot, {}).get("fallback", "")
+    fallback_question = (
+        fallback_template.format(topic_anchor=topic_anchor)
+        if fallback_template and topic_anchor
+        else GATHER_FIELD_GUIDE.get(target_slot, {}).get("question", "")
+    )
+    return {
+        "slot": target_slot,
+        "question": "",
+        "options": [],
+        "fallback_question": fallback_question,
+        "generation_reason": "llm_failed_fallback",
+    }
+
+
+def _build_guided_prompt_prompt(
+    *,
+    context: dict[str, object],
+    target_slot: str,
+) -> str:
+    topic_anchor = _clean_text(context.get("topic_anchor")) or "현재 주제"
+    return f"""
+    You are assisting a team-project decision support workflow.
+    Respond in Korean and output JSON only.
+
+    Goal:
+    - Generate a short follow-up prompt for the next decision slot.
+    - Base the suggestions on the current confirmed facts.
+    - Do not reuse canned domain templates or fixed category lists.
+    - Suggest only options that fit the current topic and problem context.
+    - If context is weak, return options as an empty array and write a direct fallback_question.
+
+    Output JSON schema:
+    {{
+      "slot": "{target_slot}",
+      "question": "short guidance question",
+      "options": ["specific option 1", "specific option 2", "specific option 3"],
+      "fallback_question": "short direct question",
+      "generation_reason": "why these options fit"
+    }}
+
+    Rules:
+    - Keep options to 2-4 items.
+    - Each option must be concise and specific to the topic.
+    - Avoid broad labels unless the current topic clearly implies them.
+    - Never output facts as already decided.
+    - Never rewrite subject/title in this step.
+
+    [Topic anchor]
+    {topic_anchor}
+
+    [Decision context]
+    {json.dumps(context, ensure_ascii=False)}
+    """
+
+
+def _generate_guided_prompt_payload(
+    *,
+    current_data: dict[str, object],
+    target_slot: str,
+    current_phase: str = "GATHER",
+    recent_messages: list[str] | None = None,
+    user_message: str = "",
+) -> dict[str, object]:
+    context = build_decision_context(
+        current_data,
+        current_phase=current_phase,
+        prompted_slot=target_slot,
+        recent_messages=recent_messages,
+        user_message=user_message,
+    )
+    logger.info(
+        "guided_prompt_context target_slot=%s phase=%s confirmed=%s open_slots=%s problem_context=%s recent_user_message=%r",
+        target_slot,
+        context.get("effective_phase"),
+        context.get("confirmed_facts"),
+        context.get("open_slots"),
+        context.get("problem_definition_context"),
+        context.get("recent_user_message"),
+    )
+
+    topic_anchor = _clean_text(context.get("topic_anchor"))
+    if not topic_anchor and target_slot in {"problemArea", "goal"}:
+        return _build_guided_prompt_fallback_payload(
+            target_slot=target_slot,
+            topic_anchor=topic_anchor,
+        )
+
+    try:
+        response = _invoke_llm(
+            conversation_llm,
+            _build_guided_prompt_prompt(context=context, target_slot=target_slot),
+            label="guided_prompt_generator",
+        )
+        payload = _coerce_guided_prompt_result(
+            json.loads(getattr(response, "content", "")),
+            target_slot=target_slot,
+            topic_anchor=topic_anchor,
+        )
+    except Exception as exc:
+        logger.info(
+            "guided_prompt_fallback target_slot=%s reason=llm_failed error=%s",
+            target_slot,
+            exc,
+        )
+        payload = _build_guided_prompt_fallback_payload(
+            target_slot=target_slot,
+            topic_anchor=topic_anchor,
+        )
+
+    logger.info(
+        "guided_prompt_generated target_slot=%s options=%s generation_reason=%s fallback_question=%r",
+        target_slot,
+        payload.get("options"),
+        payload.get("generation_reason"),
+        payload.get("fallback_question"),
+    )
+    return payload
+
+
+def _format_guided_prompt_message(
+    payload: dict[str, object],
+    *,
+    current_data: dict[str, object],
+    target_slot: str,
+) -> str:
+    topic_anchor = _get_topic_anchor(current_data, allow_title_fallback=False) or "이 주제"
+    slot_meta = GUIDED_PROMPT_SLOT_META.get(target_slot, {})
+    intro = slot_meta.get("intro", "").format(topic_anchor=topic_anchor).strip()
+    question = _clean_text(payload.get("question"))
+    options = [
+        _clean_text(option)
+        for option in (payload.get("options") or [])
+        if _clean_text(option)
     ]
-    return " ".join(part for part in parts if part).lower()
+    if not options:
+        return _clean_text(payload.get("fallback_question")) or _build_next_missing_field_prompt(
+            current_data
+        )
+
+    lines: list[str] = []
+    if intro:
+        lines.append(intro)
+    if question and question not in intro:
+        lines.append(question)
+    lines.append("\n".join(f"{index}. {option}" for index, option in enumerate(options, start=1)))
+    cta = slot_meta.get("cta", "").strip()
+    if cta:
+        lines.append(cta)
+    return "\n".join(line for line in lines if line).strip()
 
 
-def _match_guided_option_profile(current_data: dict[str, object]) -> dict[str, object] | None:
-    normalized = _guidance_context_text(current_data)
-    if not normalized:
-        return None
-    for profile in GUIDED_OPTION_PROFILES:
-        keywords = tuple(profile.get("keywords", ()))
-        if any(keyword in normalized for keyword in keywords):
-            return profile
-    return None
-
-
-def _topic_refinement_options(current_data: dict[str, object]) -> list[str]:
-    profile = _match_guided_option_profile(current_data)
-    if profile:
-        return list(profile.get("topic_options", []))
-    return [
-        "사용자가 가장 먼저 겪는 불편 정리하기",
-        "정보 탐색과 의사결정 과정 단순화하기",
-        "반복되는 신청·입력 절차 줄이기",
-        "개인 상황에 맞는 맞춤형 안내 제공하기",
-    ]
-
-
-def _goal_guidance_options(current_data: dict[str, object]) -> list[str]:
-    profile = _match_guided_option_profile(current_data)
-    if profile:
-        return list(profile.get("goal_options", []))
-
-    topic_anchor = _get_topic_anchor(current_data, allow_title_fallback=False) or "이 프로젝트"
-    return [
-        f"{topic_anchor} 과정에서 반복되는 불편과 시간 낭비를 줄이게 한다",
-        f"{topic_anchor} 관련 정보를 더 빠르고 정확하게 판단하게 한다",
-        f"{topic_anchor} 경험을 더 단순하고 이해하기 쉽게 만든다",
-    ]
+def _build_guided_prompt_message(
+    *,
+    current_data: dict[str, object],
+    target_slot: str,
+    current_phase: str = "GATHER",
+    recent_messages: list[str] | None = None,
+    user_message: str = "",
+) -> str:
+    payload = _generate_guided_prompt_payload(
+        current_data=current_data,
+        target_slot=target_slot,
+        current_phase=current_phase,
+        recent_messages=recent_messages,
+        user_message=user_message,
+    )
+    return _format_guided_prompt_message(
+        payload,
+        current_data=current_data,
+        target_slot=target_slot,
+    )
 
 
 def _build_topic_refinement_message(current_data: dict[str, object]) -> str:
-    topic_anchor = _get_topic_anchor(current_data, allow_title_fallback=False) or "이 주제"
-    options = [*_topic_refinement_options(current_data), "아직 모르겠어요. 추천이 더 필요해요"]
-    option_lines = "\n".join(f"{index}. {option}" for index, option in enumerate(options, start=1))
-    return (
-        f"좋아요. '{topic_anchor}'까지는 잡혔고 이제 어떤 문제를 풀지 같이 좁혀볼게요.\n"
-        f"{option_lines}\n"
-        "번호로 답하거나, 더 맞는 방향이 있다면 한 줄로 바로 말해 주세요."
+    return _build_guided_prompt_message(
+        current_data=current_data,
+        target_slot="problemArea",
     )
 
 
 def _build_goal_guidance_message(current_data: dict[str, object]) -> str:
-    topic_anchor = _get_topic_anchor(current_data, allow_title_fallback=False) or "이 주제"
-    options = _goal_guidance_options(current_data)
-    option_lines = "\n".join(f"{index}. {option}" for index, option in enumerate(options, start=1))
-    return (
-        f"좋아요. '{topic_anchor}' 기준이면 목표는 이렇게 잡을 수 있어요.\n"
-        f"{option_lines}\n"
-        "가장 가까운 번호 하나를 고르거나, 원하는 방향으로 한 줄 수정해서 말해 주세요."
+    return _build_guided_prompt_message(
+        current_data=current_data,
+        target_slot="goal",
     )
 
 
-def _build_problem_definition_prompt(subject: str) -> str:
-    return (
-        f"좋아요. 주제 방향은 '{subject}'로 정리해둘게요. "
-        "이제 이 안에서 어떤 문제를 해결하고 싶은지만 정하면 됩니다. "
-        "예: 예약 불편, 혼잡도, 접근성 정보 부족"
+def _build_slot_help_message(
+    slot: str,
+    current_data: dict[str, object],
+    *,
+    current_phase: str = "GATHER",
+    recent_messages: list[str] | None = None,
+    user_message: str = "",
+) -> str:
+    if slot in {"goal", "roles", "deliverables"}:
+        return _build_guided_prompt_message(
+            current_data=current_data,
+            target_slot=slot,
+            current_phase=current_phase,
+            recent_messages=recent_messages,
+            user_message=user_message,
+        )
+    question = _build_contextual_slot_question(
+        current_data,
+        slot,
+        current_phase=current_phase,
     )
+    if question:
+        return question
+    return _build_next_missing_field_prompt(current_data, current_phase=current_phase)
 
 
 def _looks_like_title_instruction(candidate: str) -> bool:
@@ -1546,14 +1739,17 @@ def _extract_problem_area_candidate(
     requested_focus = _detect_requested_gather_focus(normalized)
     if requested_focus in {"goal", "teamSize", "roles", "dueDate", "deliverables"}:
         return ""
-    if _looks_like_question_line(normalized):
-        return ""
 
     choice_candidate = _extract_choice_based_title(state)
     if choice_candidate:
         recent_context = "\n".join(str(msg or "") for msg in state.get("recent_messages", [])[-4:])
         selected_message = str(state.get("selected_message") or "")
         if "같이 좁혀볼게요" in recent_context or "같이 좁혀볼게요" in selected_message:
+            logger.info(
+                "guided_choice_interpretation slot=problemArea choice=%s mapped_candidate=%r source=generated_prompt",
+                _extract_choice_index(user_message),
+                choice_candidate,
+            )
             return choice_candidate
 
     trimmed = _trim_subject_candidate_clause(normalized)
@@ -1570,11 +1766,13 @@ def _extract_problem_area_candidate(
         return ""
     if trimmed == topic_anchor:
         return ""
-    if _is_non_storable_freeform_message(trimmed):
+    if _is_storage_control_message(trimmed):
         return ""
     if _looks_like_title_instruction(trimmed):
         return ""
     if _extract_due_date_candidate_from_message(trimmed):
+        return ""
+    if _looks_like_open_question(trimmed):
         return ""
     return trimmed
 
@@ -1916,23 +2114,28 @@ def _build_next_missing_field_prompt(
 ) -> str:
     normalized = _prune_collected_data(current_data)
     subject = str(normalized.get("subject") or "").strip()
+    if subject and subject_needs_problem_definition(subject) and not _clean_text(
+        normalized.get("problemArea")
+    ):
+        return _build_contextual_slot_question(
+            normalized,
+            "problemArea",
+            current_phase=current_phase,
+        )
     next_field = choose_next_question_field(
         normalized,
         current_phase=current_phase,
         followup_fields=followup_fields,
         rejected_updates=rejected_updates,
     )
-    if next_field == "subject" and not subject:
-        return "먼저 어떤 분야나 문제를 다루는 프로젝트인지 한 줄로 정해볼까요?"
-    if subject and subject_needs_problem_definition(subject):
-        return (
-            f"좋아요. '{subject}' 쪽으로 가면 "
-            "그 안에서 어떤 문제를 해결하고 싶은지 한 줄로 말해 주세요."
+    if next_field:
+        question = _build_contextual_slot_question(
+            normalized,
+            next_field,
+            current_phase=current_phase,
         )
-    if next_field == "title":
-        return "다음으로 프로젝트 제목을 한 줄로 정해볼까요?"
-    if next_field and next_field in GATHER_FIELD_GUIDE:
-        return GATHER_FIELD_GUIDE[next_field]["question"]
+        if question:
+            return question
     return ""
 
 
@@ -2069,7 +2272,11 @@ def _finalize_committed_response(
                 followup_fields=followup_fields,
                 rejected_updates=rejected_updates,
             )
-        return _build_slot_help_message(slot, merged_data)
+        return _build_slot_help_message(
+            slot,
+            merged_data,
+            current_phase=current_phase,
+        )
     if turn_type in {"request_refine_topic", "request_guided_exploration"}:
         subject = str(merged_data.get("subject") or "").strip()
         if subject and not subject_needs_problem_definition(subject):
@@ -2501,7 +2708,7 @@ def _extract_direct_fact_updates(user_message: str) -> dict[str, object]:
         or TITLE_EXPLICIT_PATTERN.match(message)
     )
     skip_topic_value_extraction = _matches_topic_presence_button_message(message) or (
-        _is_non_storable_freeform_message(message) and not has_explicit_topic_prefix
+        _is_storage_control_message(message) and not has_explicit_topic_prefix
     )
 
     if not skip_topic_value_extraction:
@@ -2620,6 +2827,11 @@ def _extract_choice_based_goal(state: AgentState) -> str:
 
             candidate = _normalize_goal_candidate(_trim_option_description(line_match.group(2)))
             if candidate and not _is_non_storable_freeform_message(candidate):
+                logger.info(
+                    "guided_choice_interpretation slot=goal choice=%s mapped_candidate=%r source=generated_prompt",
+                    choice_index,
+                    candidate,
+                )
                 return candidate
 
         if matched_line_option:
@@ -2631,6 +2843,11 @@ def _extract_choice_based_goal(state: AgentState) -> str:
 
             candidate = _normalize_goal_candidate(_trim_option_description(inline_match.group(2)))
             if candidate and not _is_non_storable_freeform_message(candidate):
+                logger.info(
+                    "guided_choice_interpretation slot=goal choice=%s mapped_candidate=%r source=generated_prompt",
+                    choice_index,
+                    candidate,
+                )
                 return candidate
 
     return ""
@@ -2701,7 +2918,10 @@ def _build_current_goal_response(
     follow_up = _build_next_missing_field_prompt(current_data, current_phase=current_phase)
     if follow_up:
         return f"아직 확정된 목표는 없어요. {follow_up}"
-    return f"아직 확정된 목표는 없어요. {GATHER_FIELD_GUIDE['goal']['question']}"
+    return (
+        "아직 확정된 목표는 없어요. "
+        + _build_contextual_slot_question(current_data, "goal", current_phase=current_phase)
+    )
 
 
 def _filter_gather_updates(
@@ -3358,7 +3578,13 @@ def gather_information_node(state: AgentState):
                 prefilled_data,
                 current_phase=current_phase,
             )
-            help_message = _build_slot_help_message(help_slot, prefilled_data)
+            help_message = _build_slot_help_message(
+                help_slot,
+                prefilled_data,
+                current_phase=current_phase,
+                recent_messages=state.get("recent_messages", []),
+                user_message=user_message,
+            )
         next_phase = derive_phase_from_collected_data(prefilled_data, current_phase=current_phase)
         is_sufficient = _is_template_ready(prefilled_data)
         return {
@@ -3930,8 +4156,6 @@ def _extract_goal_candidate_from_message(message: str) -> str:
         not normalized_message
         or _is_meta_conversation_message(normalized_message)
         or _is_current_goal_query(normalized_message)
-        or _looks_like_question_line(normalized_message)
-        or _looks_like_open_question(normalized_message)
     ):
         return ""
 
@@ -3961,7 +4185,12 @@ def _extract_goal_candidate_from_message(message: str) -> str:
             "로정할게요",
         }:
             continue
-        if candidate and not _is_non_storable_freeform_message(candidate):
+        if (
+            candidate
+            and not _is_non_storable_freeform_message(candidate)
+            and not _looks_like_question_line(candidate)
+            and not _looks_like_open_question(candidate)
+        ):
             return candidate
     return ""
 
@@ -4110,7 +4339,6 @@ def _extract_problem_area_candidate(
         if (
             not normalized_message
             or _is_meta_conversation_message(normalized_message)
-            or _looks_like_question_line(normalized_message)
             or _looks_like_open_question(normalized_message)
         ):
             return ""
@@ -4287,11 +4515,7 @@ def _extract_direct_fact_updates(user_message: str) -> dict[str, object]:
         if target_user and not _is_non_storable_freeform_message(target_user):
             updates["targetUser"] = target_user
             break
-    if (
-        _looks_like_question_line(normalized_message)
-        or _looks_like_open_question(normalized_message)
-        or _is_meta_conversation_message(normalized_message)
-    ):
+    if _is_meta_conversation_message(normalized_message):
         updates.pop("subject", None)
         updates.pop("goal", None)
         updates.pop("deliverables", None)
@@ -4323,3 +4547,150 @@ def _is_summary_request(user_message: str) -> bool:
         return False
 
     return _signal_is_summary_request(user_message)
+
+
+_final_goal_candidate_extractor = _extract_goal_candidate_from_message
+_final_problem_area_candidate_extractor = _extract_problem_area_candidate
+
+
+def _extract_goal_candidate_from_message(message: str) -> str:
+    normalized_message = _clean_text(message)
+    if (
+        not normalized_message
+        or _is_meta_conversation_message(normalized_message)
+        or _is_current_goal_query(normalized_message)
+    ):
+        return ""
+
+    candidate = _final_goal_candidate_extractor(normalized_message)
+    if not candidate:
+        return ""
+    compact = re.sub(r"\s+", "", candidate)
+    if compact in {"로하자", "로할게", "로정하자", "로정할게", "이걸", "그걸", "저걸"}:
+        return ""
+    if _looks_like_question_line(candidate) or _looks_like_open_question(candidate):
+        return ""
+    return candidate
+
+
+def _extract_problem_area_candidate(
+    state: AgentState,
+    current_data: dict[str, object] | None = None,
+    *,
+    direct_updates: dict[str, object] | None = None,
+) -> str:
+    normalized_message = _clean_text(_effective_user_message(state))
+    candidate = _final_problem_area_candidate_extractor(
+        state,
+        current_data,
+        direct_updates=direct_updates,
+    )
+    if candidate:
+        if normalized_message and (
+            _looks_like_question_line(normalized_message)
+            or _looks_like_open_question(normalized_message)
+        ):
+            return ""
+        return candidate
+
+    if (
+        not normalized_message
+        or _is_meta_conversation_message(normalized_message)
+        or _looks_like_question_line(normalized_message)
+        or _looks_like_open_question(normalized_message)
+        or _is_storage_control_message(normalized_message, current_data or {})
+    ):
+        return ""
+
+    fallback_match = re.search(
+        r"(.+?문제)(?:를|가)?\s*(?:해결하고|줄이고|개선하고)",
+        normalized_message,
+    )
+    if not fallback_match:
+        return ""
+
+    candidate = _clean_text(fallback_match.group(1))
+    if (
+        not candidate
+        or candidate == _get_topic_anchor(current_data or {}, allow_title_fallback=False)
+        or _looks_like_question_line(candidate)
+        or _looks_like_open_question(candidate)
+        or _is_storage_control_message(candidate, current_data or {})
+        or _extract_due_date_candidate_from_message(candidate)
+        or _looks_like_title_instruction(candidate)
+    ):
+        return ""
+
+    compact = re.sub(r"\s+", "", candidate)
+    if TARGET_FACILITY_NOUN_PATTERN.search(candidate) and len(compact) <= 10:
+        return ""
+    return candidate
+
+
+def _extract_direct_fact_updates(user_message: str) -> dict[str, object]:
+    updates = dict(_final_extract_direct_fact_updates(user_message))
+    normalized_message = _clean_text(_strip_mates_mention(user_message))
+    if re.search(r"^\s*(?:이거|이걸|그거|그걸|저거|저걸)\s*목표로\s*(?:하자|할게|정하자|정할게)$", normalized_message):
+        updates.pop("goal", None)
+
+    target_user_patterns = (
+        r"^\s*(?:타겟\s*사용자|대상\s*사용자)\s*(?:은|는|가|:)\s*(.+)$",
+        r"^\s*(.+?)\s*(?:이|가)?\s*대상\s*사용자(?:예요|입니다)?\s*$",
+    )
+    for pattern in target_user_patterns:
+        match = re.search(pattern, normalized_message, flags=re.IGNORECASE)
+        if not match:
+            continue
+        target_user = _normalize_direct_fact_value(match.group(1))
+        if target_user and not _is_non_storable_freeform_message(target_user):
+            updates["targetUser"] = target_user
+            break
+
+    if _is_meta_conversation_message(normalized_message):
+        updates.pop("subject", None)
+        updates.pop("goal", None)
+        updates.pop("deliverables", None)
+        updates.pop("dueDate", None)
+    if "목표" in normalized_message and _is_current_goal_query(normalized_message):
+        updates.pop("goal", None)
+    if (
+        _detect_requested_gather_focus(normalized_message) == "deliverables"
+        and (_looks_like_question_line(normalized_message) or _looks_like_open_question(normalized_message))
+    ):
+        updates.pop("deliverables", None)
+
+    goal_candidate = _extract_goal_candidate_from_message(normalized_message)
+    if goal_candidate:
+        if goal_candidate.endswith(("를", "을")):
+            goal_candidate = goal_candidate[:-1].rstrip()
+        updates["goal"] = goal_candidate
+    if str(updates.get("goal") or "").strip() in {"로 하자", "로 할게", "로 정하자", "로 정할게"}:
+        updates.pop("goal", None)
+    return _sanitize_gather_updates(updates)
+
+
+_final_fresh_topic_submission_candidate_extractor = _extract_fresh_topic_submission_candidate
+
+
+def _extract_fresh_topic_submission_candidate(
+    state: AgentState,
+    current_data: dict[str, object] | None = None,
+    *,
+    direct_updates: dict[str, object] | None = None,
+) -> str:
+    candidate = _final_fresh_topic_submission_candidate_extractor(
+        state,
+        current_data,
+        direct_updates=direct_updates,
+    )
+    if not candidate:
+        return ""
+
+    candidate = _postprocess_explicit_title_value(candidate)
+    candidate = re.sub(
+        r"\s*(?:으로|로)\s*(?:바꿀게|바꿀래|바꾸자|수정할게|수정하자|변경할게|변경하자)\s*$",
+        "",
+        candidate,
+        flags=re.IGNORECASE,
+    ).strip(" .,!?:;\"'")
+    return candidate
