@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(python -m py_compile \"d:/MatchaTonic/MatchaTonic-dev/2025-MatchaTonic-AI/app/ai/graph/nodes.py\")",
+      "Bash(python -m py_compile app/ai/graph/nodes.py)"
+    ]
+  }
+}
