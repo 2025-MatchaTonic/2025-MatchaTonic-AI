@@ -104,7 +104,7 @@ def _should_try_llm_signal_classification(message: str) -> bool:
         return False
     if len(normalized) > 240:
         return False
-    return False
+    return True
 
 
 def _llm_signal_label(message: str) -> tuple[str | None, float]:

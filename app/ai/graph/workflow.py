@@ -80,7 +80,7 @@ def route_logic(state: AgentState):
         if phase in ["GATHER", "READY"]:
             return "gather_node"
 
-    return END
+    return "explore_node"
 
 
 workflow = StateGraph(AgentState)
