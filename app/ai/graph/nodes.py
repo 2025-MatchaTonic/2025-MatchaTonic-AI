@@ -3655,7 +3655,11 @@ def topic_exists_node(state: AgentState):
 # ----------------------------------------------------
 def gather_information_node(state: AgentState):
     if _is_initial_button_selection(state):
-        return _build_initial_button_reset_response(state)
+        # subject가 이미 확정된 상태에서 topic_presence 신호가 오면 리셋하지 않음.
+        # GATHER 단계에서의 "도와줘", "모르겠어" 같은 발화를 no_topic으로 오분류해도 보호.
+        _pruned_for_guard = _prune_collected_data(state.get("collected_data") or {})
+        if not _is_meaningful_fact(_pruned_for_guard.get("subject")):
+            return _build_initial_button_reset_response(state)
 
     user_message = _effective_user_message(state)
     turn_policy = _get_turn_policy(state)
@@ -3755,7 +3759,9 @@ def gather_information_node(state: AgentState):
     )
     if prompted_slot and not direct_updates_raw and (
         _is_undecided_value(user_message) or _is_guidance_signal(user_message)
-    ):
+    ) and not _is_help_request(user_message):
+        # "명세서 작성 도와줘"처럼 구체적 작업이 담긴 help_request는 제외.
+        # 이런 메시지는 LLM fallback에서 실제 답변을 생성하도록 흐름을 유지.
         turn_type = "request_help_needed"
     (
         direct_approved_updates,
