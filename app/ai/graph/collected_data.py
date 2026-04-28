@@ -979,6 +979,19 @@ def evaluate_candidate_update(
             conflict_severity=conflict_severity.value,
         )
 
+    # teamSize는 숫자 필드 특성상, 사용자가 직접 다른 숫자를 말하면 수정 의도가 명확하므로 허용
+    if key == "teamSize" and source == "direct_structured" and current_normalized is not None:
+        return CandidateDecision(
+            key=key,
+            approved=True,
+            normalized_value=normalized_incoming,
+            reason="teamSize_direct_numeric_overwrite",
+            overwrite_mode=overwrite_mode.value,
+            source=source,
+            requires_followup_question=requires_followup_question,
+            conflict_severity=conflict_severity.value,
+        )
+
     if overwrite_mode in {OverwriteMode.EXPLICIT, OverwriteMode.STRONG_RESTATEMENT}:
         return CandidateDecision(
             key=key,
@@ -2100,6 +2113,9 @@ def build_approved_collected_data_snapshot(
     subject = _clean_string(snapshot.get("subject"))
     if goal and subject and goal == subject:
         snapshot.pop("goal", None)
+
+    if "title" not in snapshot and subject:
+        snapshot["title"] = subject
 
     return snapshot
 
