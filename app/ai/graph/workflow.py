@@ -22,17 +22,18 @@ def _should_promote_explore_to_topic_set(state: AgentState) -> bool:
     if _has_any_collected_fact(state):
         return True
 
-    if _extract_title_updates_for_topic_set(state):
-        return True
-
     user_message = str(state.get("user_message") or "").strip()
     if not user_message:
         return False
 
+    direct_updates = _extract_direct_fact_updates(user_message)
+
+    if _extract_title_updates_for_topic_set(state, direct_updates=direct_updates):
+        return True
+
     if _normalize_topic_title(_extract_topic_candidate(user_message)):
         return True
 
-    direct_updates = _extract_direct_fact_updates(user_message)
     if not direct_updates:
         return False
     next_data, audit = apply_collected_data_updates(

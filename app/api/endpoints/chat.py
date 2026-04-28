@@ -23,7 +23,6 @@ from app.ai.graph.collected_data import (
 )
 from app.ai.graph.state import TurnPolicy
 from app.ai.graph.workflow import ai_app
-from app.api.schemas.template import NotionTemplatePayload
 from app.core.request_normalization import (
     normalize_action_type,
     normalize_collected_data,
@@ -182,15 +181,9 @@ class AIChatRequest(BaseModel):
 class AIChatResponse(BaseModel):
     content: str
     suggestedQuestions: List[str]
-    nextQuestionField: Optional[str] = None
     currentStatus: str
     isSufficient: bool
     collectedData: CollectedData
-    approvedUpdates: Dict[str, Any] = Field(default_factory=dict)
-    rejectedUpdates: Dict[str, Any] = Field(default_factory=dict)
-    rejectedReasons: Dict[str, Any] = Field(default_factory=dict)
-    followupFields: List[str] = Field(default_factory=list)
-    notionTemplatePayload: Optional[NotionTemplatePayload] = None
 
 
 QUESTION_BY_FIELD = {
@@ -377,7 +370,7 @@ async def process_chat(request: AIChatRequest):
         )
         response_phase_trace = build_phase_derivation_trace(
             internal_response_collected_data,
-            current_phase=request.currentStatus,
+            current_phase=response_phase,
         )
         logger.info(
             "chat decision room=%s phase=%s approved_updates=%s rejected_updates=%s rejected_reasons=%s next_question_field=%s",
@@ -413,15 +406,9 @@ async def process_chat(request: AIChatRequest):
                 followup_fields=followup_fields,
                 next_field_override=next_question_field,
             ),
-            nextQuestionField=next_question_field or None,
             currentStatus=response_phase,
             isSufficient=result.get("is_sufficient", False),
             collectedData=response_collected_data,
-            approvedUpdates=approved_updates,
-            rejectedUpdates=rejected_updates,
-            rejectedReasons=rejected_reasons,
-            followupFields=followup_fields,
-            notionTemplatePayload=result.get("template_payload"),
         )
     except Exception as exc:
         logger.exception("AI chat processing failed: %s", exc)
