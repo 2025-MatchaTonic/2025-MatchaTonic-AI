@@ -1028,6 +1028,7 @@ def _looks_like_factual_slot_answer(user_message: str) -> bool:
         _is_meta_conversation_message(normalized)
         or _is_request_like_value(normalized)
         or _is_undecided_value(normalized)
+        or _is_guidance_signal(normalized)
         or _looks_like_question_line(normalized)
         or _looks_like_open_question(normalized)
     ):
@@ -3331,9 +3332,6 @@ def topic_exists_node(state: AgentState):
         confirmed_title = _extract_confirmed_title_from_context(state)
         if confirmed_title:
             direct_updates_raw["title"] = confirmed_title
-    turn_type = _interpret_turn_type(
-        state, current_data, direct_updates=direct_updates_raw
-    )
     prompted_slot = _get_active_prompted_slot(state, current_data)
     problem_area_candidate = _extract_problem_area_candidate(
         state,
@@ -3755,7 +3753,9 @@ def gather_information_node(state: AgentState):
     turn_type = _interpret_turn_type(
         state, current_data, direct_updates=direct_updates_raw
     )
-    if prompted_slot and not direct_updates_raw and "잘 모르겠" in user_message:
+    if prompted_slot and not direct_updates_raw and (
+        _is_undecided_value(user_message) or _is_guidance_signal(user_message)
+    ):
         turn_type = "request_help_needed"
     (
         direct_approved_updates,

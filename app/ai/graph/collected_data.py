@@ -132,7 +132,7 @@ REQUEST_LIKE_VALUE_KEYWORDS: tuple[str, ...] = (
 NON_COMMITTAL_VALUE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^\s*(?:아니|아니야|아뇨)\s*(?:도와(?:줘|주세요)|추천해(?:줘|주세요)|정해(?:줘|주세요))?\s*$"),
     re.compile(r"^\s*(?:그게\s+아니라|다시|잠깐)\s*$"),
-    re.compile(r"^\s*(?:잘\s*)?모르겠(?:어|어요|네|다)?\s*$"),
+    re.compile(r"^\s*(?:잘\s*)?모르(?:겠|게)(?:어|어요|네|다)?\s*$"),
     re.compile(r"^\s*(?:잘\s*)?모르겠.*(?:도와|추천해|정해|같이)\S*\s*$"),
     re.compile(r"^\s*.*잘\s*모르겠.*(?:도와|추천해|정해|같이)\S*\s*$"),
     re.compile(r"^\s*도와(?:줘|주세요|주라)\s*$"),
@@ -141,14 +141,21 @@ NON_COMMITTAL_VALUE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^\s*같이\s*(?:정하|해보)\S*\s*$"),
     re.compile(r"^\s*아직\s*(?:고민\s*중|못\s*정했|미정)\S*\s*$"),
     re.compile(r"^\s*(?:뭘|뭐를|무엇을|어떤\s*걸?)\s*(?:해야|만들어야|하고\s*싶은지)\s*잘\s*모르겠.*\s*$"),
+    # "[주제] 잘 모르겠어/모르게어" 형태 — 앞에 명사구가 붙은 불확실 표현
+    re.compile(r"^.+\s+(?:잘\s*)?모르(?:겠|게)(?:어|어요|네|다)?\s*$"),
+    re.compile(r"^.+\s+(?:잘\s*)?모르겠(?:는데|는지|겠어)\s*$"),
 )
 
 NEGATIVE_VALUE_KEYWORDS: tuple[str, ...] = (
     "모르겠",
+    "모르게어",
     "모름",
     "없음",
     "없어",
     "미정",
+    "글쎄",      # 글쎄요, 글쎄 — 비확정 표현, 유효한 필드 값에 절대 등장 안 함
+    "뭐가 좋",   # 뭐가 좋은지, 뭐가 좋을지 — 질문형, 유효한 필드 값에 등장 안 함
+    "감이 안",   # 감이 안 와, 감이 안 잡혀 — 불확실 표현
     "tbd",
     "unknown",
     "not sure",
@@ -844,6 +851,22 @@ def evaluate_candidate_update(
             source=source,
             requires_followup_question=False,
         )
+
+    # user_message 전체가 비확정 패턴에 해당하면 텍스트 슬롯 커밋 차단
+    # substring 방식이 아닌 anchored 패턴으로만 검사해 오탐 방지
+    _TEXT_SLOT_KEYS = {"goal", "targetUser", "deliverables"}
+    if key in _TEXT_SLOT_KEYS and user_message:
+        _cleaned_msg = _clean_string(user_message)
+        if any(p.match(_cleaned_msg) for p in NON_COMMITTAL_VALUE_PATTERNS):
+            return CandidateDecision(
+                key=key,
+                approved=False,
+                normalized_value=None,
+                reason="undecided_user_message",
+                overwrite_mode=overwrite_mode.value,
+                source=source,
+                requires_followup_question=False,
+            )
 
     if not is_valid_collected_value(key, normalized_incoming, team_size=team_size_for_key):
         return CandidateDecision(
