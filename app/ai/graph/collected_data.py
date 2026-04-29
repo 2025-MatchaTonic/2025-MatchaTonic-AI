@@ -419,6 +419,27 @@ def _number_duplicate_roles(roles: list[str]) -> list[str]:
     return normalized
 
 
+def _format_roles_for_backend(value: object) -> str:
+    roles = normalize_roles(value)
+    if not roles:
+        return _clean_string(value)
+
+    counts: dict[str, int] = {}
+    order: list[str] = []
+    for role in roles:
+        base = re.sub(r"\s+\d+$", "", role).strip()
+        if not base:
+            continue
+        if base not in counts:
+            order.append(base)
+        counts[base] = counts.get(base, 0) + 1
+
+    return ", ".join(
+        f"{role} x{counts[role]}" if counts[role] > 1 else role
+        for role in order
+    )
+
+
 def _split_role_tokens(text: str) -> list[str]:
     stripped = ROLE_VALUE_PREFIX_PATTERN.sub("", text).strip()
     if not stripped:
@@ -979,8 +1000,12 @@ def evaluate_candidate_update(
             conflict_severity=conflict_severity.value,
         )
 
-    # teamSize는 숫자 필드 특성상, 사용자가 직접 다른 숫자를 말하면 수정 의도가 명확하므로 허용
-    if key == "teamSize" and source == "direct_structured" and current_normalized is not None:
+    # Numeric team-size answers are explicit enough to replace the prior value.
+    if (
+        key == "teamSize"
+        and source == "direct_structured"
+        and current_normalized is not None
+    ):
         return CandidateDecision(
             key=key,
             approved=True,
@@ -1067,6 +1092,32 @@ def normalize_roles(value: object) -> list[str] | None:
     if not cleaned:
         return None
 
+    shared_count_match = re.fullmatch(
+        r"(.+?)\s+(?:각각\s*)?(\d{1,2})\s*명\s*씩(?:\s*(?:으로|로.*)?)?",
+        cleaned,
+    ) or re.fullmatch(
+        r"(.+?)\s+각각\s+(\d{1,2})\s*명(?:\s*(?:으로|로.*)?)?",
+        cleaned,
+    )
+    if shared_count_match:
+        roles_text = shared_count_match.group(1)
+        count = int(shared_count_match.group(2))
+        role_tokens = [
+            token.strip()
+            for token in re.split(
+                r"\s*(?:,|/|\s+그리고\s+|\s+및\s+|(?<=[가-힣])와\s+|(?<=[가-힣])과\s+|\s+와\s+|\s+과\s+)\s*",
+                roles_text,
+            )
+            if token.strip()
+        ]
+        shared_roles = [_clean_role_label(token) for token in role_tokens]
+        cleaned_shared_roles = [role for role in shared_roles if role]
+        if cleaned_shared_roles and count > 0:
+            expanded_roles: list[str] = []
+            for role in cleaned_shared_roles:
+                expanded_roles.extend([role] * count)
+            return _number_duplicate_roles(expanded_roles) or None
+
     tokens = [
         token.strip()
         for token in re.split(r"\s*(?:,|/| 그리고 | 및 | 와 | 과 )\s*", cleaned)
@@ -1076,6 +1127,8 @@ def normalize_roles(value: object) -> list[str] | None:
     if tokens:
         for token in tokens:
             match = re.fullmatch(r"(.+?)\s+(\d{1,2})\s*명(?:씩)?(?:\s*(?:으로|로.*)?)?", token)
+            if not match:
+                match = re.fullmatch(r"(.+?)\s*[xX]\s*(\d{1,2})", token)
             if not match:
                 parsed_counts = []
                 break
@@ -2107,15 +2160,12 @@ def build_approved_collected_data_snapshot(
             value,
             team_size=sanitized.get("teamSize"),
         ):
-            snapshot[key] = value
+            snapshot[key] = _format_roles_for_backend(value) if key == "roles" else value
 
     goal = _clean_string(snapshot.get("goal"))
     subject = _clean_string(snapshot.get("subject"))
     if goal and subject and goal == subject:
         snapshot.pop("goal", None)
-
-    if "title" not in snapshot and subject:
-        snapshot["title"] = subject
 
     return snapshot
 

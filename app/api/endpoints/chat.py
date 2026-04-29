@@ -348,6 +348,9 @@ async def process_chat(request: AIChatRequest):
         response_collected_data = build_approved_collected_data_snapshot(
             internal_response_collected_data
         )
+        response_subject = response_collected_data.get("subject")
+        if "title" not in response_collected_data and isinstance(response_subject, str):
+            response_collected_data["title"] = response_subject
         approved_updates = build_public_update_snapshot(
             result.get("approved_updates", {}),
             current_data=request.collectedData,

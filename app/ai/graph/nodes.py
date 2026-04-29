@@ -881,7 +881,8 @@ def _interpret_turn_type(
     if signal == "meta_conversation":
         return "meta_request"
     if signal == "summary_request":
-        return "request_summary"
+        if _is_summary_request(user_message):
+            return "request_summary"
     if _is_fill_remaining_request(user_message, current_data):
         return "request_fill_missing"
     if _has_structured_fact_updates(direct_updates):
@@ -900,8 +901,6 @@ def _interpret_turn_type(
     if problem_area_candidate:
         return "provide_problem_area"
     if signal in {"help_request", "guidance_signal"}:
-        if prompted_slot:
-            return "request_help_needed"
         if _should_offer_goal_guidance(
             current_data, user_message, direct_updates=direct_updates
         ):
@@ -910,6 +909,10 @@ def _interpret_turn_type(
             current_data, user_message, direct_updates=direct_updates
         ):
             return "request_guided_exploration"
+        if _should_route_to_prompted_slot_help(user_message, prompted_slot):
+            return "request_help_needed"
+        if _is_help_request(user_message):
+            return "general"
         return "request_next_step"
     if _should_offer_goal_guidance(
         current_data, user_message, direct_updates=direct_updates
@@ -1176,10 +1179,51 @@ def _is_non_storable_freeform_message(user_message: str) -> bool:
         return False
     return (
         _is_request_like_value(normalized)
+        or _is_help_request(normalized)
         or _is_undecided_value(normalized)
         or looks_like_non_committal_value(normalized)
-        or _is_guidance_signal(normalized)
         or _is_meta_conversation_message(normalized)
+    )
+
+
+def _is_generic_slot_help_request(user_message: str) -> bool:
+    normalized = _clean_text(_strip_mates_mention(user_message))
+    if not normalized:
+        return False
+    generic_patterns = (
+        r"^(?:좀\s*)?도와(?:줘|주세요|주라)?$",
+        r"^(?:좀\s*)?추천해(?:줘|주세요|주라)?$",
+        r"^(?:좀\s*)?정해(?:줘|주세요|주라)?$",
+        r"^같이\s*(?:정하|골라|좁혀)\S*$",
+        r"^(?:뭐가\s*좋(?:을까|아)?|어떻게\s*하지)\??$",
+    )
+    return any(
+        re.match(pattern, normalized, re.IGNORECASE)
+        for pattern in generic_patterns
+    )
+
+
+def _should_route_to_prompted_slot_help(
+    user_message: str,
+    prompted_slot: str | None,
+) -> bool:
+    if not prompted_slot:
+        return False
+
+    normalized = _clean_text(user_message)
+    if not normalized:
+        return False
+
+    requested_focus = _detect_requested_gather_focus(normalized)
+    if requested_focus and requested_focus != prompted_slot:
+        return False
+    if requested_focus == prompted_slot:
+        if _is_help_request(normalized) and not _is_undecided_value(normalized):
+            return False
+        return _is_undecided_value(normalized) or _is_guidance_signal(normalized)
+
+    return _is_undecided_value(normalized) or _is_generic_slot_help_request(
+        normalized
     )
 
 
@@ -3757,11 +3801,9 @@ def gather_information_node(state: AgentState):
     turn_type = _interpret_turn_type(
         state, current_data, direct_updates=direct_updates_raw
     )
-    if prompted_slot and not direct_updates_raw and (
-        _is_undecided_value(user_message) or _is_guidance_signal(user_message)
-    ) and not _is_help_request(user_message):
-        # "명세서 작성 도와줘"처럼 구체적 작업이 담긴 help_request는 제외.
-        # 이런 메시지는 LLM fallback에서 실제 답변을 생성하도록 흐름을 유지.
+    if prompted_slot and not direct_updates_raw and _is_undecided_value(user_message):
+        # Only true undecided answers should force slot help. Broader guidance
+        # signals may be concrete facts or actionable requests for the LLM path.
         turn_type = "request_help_needed"
     (
         direct_approved_updates,
@@ -4669,7 +4711,7 @@ def _looks_like_advice_request(user_message: str) -> bool:
     if not normalized:
         return False
     help_tokens = ("알려줘", "도와줘", "정리해줘", "써줘", "만들어줘", "추천해줘")
-    advice_topics = ("형태", "문장", "논리", "구조", "예시", "발표용", "산출물")
+    advice_topics = ("형태", "문장", "논리", "구조", "예시", "발표용", "산출물", "할 일", "실행", "계획")
     return any(token in normalized for token in help_tokens) and any(
         topic in normalized for topic in advice_topics
     )
