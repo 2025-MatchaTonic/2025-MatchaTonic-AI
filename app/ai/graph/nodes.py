@@ -2359,6 +2359,8 @@ def _build_fact_confirmation_message(
         confirmations.append(f"제목은 '{merged_data['title']}'")
     if "goal" in accepted_updates and merged_data.get("goal"):
         confirmations.append(f"목표는 '{merged_data['goal']}'")
+    if "targetUser" in accepted_updates and merged_data.get("targetUser"):
+        confirmations.append(f"주 사용자는 '{merged_data['targetUser']}'")
     if "teamSize" in accepted_updates and merged_data.get("teamSize"):
         confirmations.append(
             f"팀 인원은 {format_collected_value('teamSize', merged_data['teamSize'])}명"
@@ -2481,6 +2483,8 @@ def _build_fact_confirmation_message(
         confirmations.append(f"제목은 '{merged_data['title']}'")
     if "goal" in accepted_updates and merged_data.get("goal"):
         confirmations.append(f"목표는 '{merged_data['goal']}'")
+    if "targetUser" in accepted_updates and merged_data.get("targetUser"):
+        confirmations.append(f"주 사용자는 '{merged_data['targetUser']}'")
     if "teamSize" in accepted_updates and merged_data.get("teamSize"):
         confirmations.append(
             f"팀 인원은 {format_collected_value('teamSize', merged_data['teamSize'])}명"
@@ -5138,6 +5142,8 @@ def _extract_problem_area_candidate(
     direct_updates: dict[str, object] | None = None,
 ) -> str:
     normalized_message = _clean_text(_effective_user_message(state))
+    if re.match(r"^\s*(?:주\s*사용자|주요\s*사용자)\s*(?:은|는|이|가|:)", normalized_message):
+        return ""
     candidate = _final_problem_area_candidate_extractor(
         state,
         current_data,
@@ -5186,6 +5192,23 @@ def _extract_problem_area_candidate(
     return candidate
 
 
+def _normalize_target_user_candidate(value: str) -> str:
+    candidate = _normalize_direct_fact_value(value)
+    candidate = re.split(
+        r"(?:야|예요|이에요|입니다)\s+(?=시험|과제|이\s*앱|이\s*서비스|해당\s*문제|문제를\s*줄이기|문제를\s*해결)",
+        candidate,
+        maxsplit=1,
+    )[0]
+    candidate = _normalize_direct_fact_value(candidate)
+    candidate = re.sub(
+        r"\s*(?:이고|이며|이고요)?\s*전공(?:은|는|이|가|:)?\s*",
+        " ",
+        candidate,
+    )
+    candidate = re.sub(r"\s+", " ", candidate).strip(" .,!?:;\"'")
+    return _normalize_direct_fact_value(candidate)
+
+
 def _extract_direct_fact_updates(user_message: str) -> dict[str, object]:
     updates = dict(_final_extract_direct_fact_updates(user_message))
     normalized_message = _clean_text(_strip_mates_mention(user_message))
@@ -5196,14 +5219,14 @@ def _extract_direct_fact_updates(user_message: str) -> dict[str, object]:
         updates.pop("goal", None)
 
     target_user_patterns = (
-        r"^\s*(?:타겟\s*사용자|대상\s*사용자)\s*(?:은|는|가|:)\s*(.+)$",
+        r"^\s*(?:주\s*사용자|주요\s*사용자|타겟\s*사용자|대상\s*사용자)\s*(?:은|는|이|가|:)\s*(.+)$",
         r"^\s*(.+?)\s*(?:이|가)?\s*대상\s*사용자(?:예요|입니다)?\s*$",
     )
     for pattern in target_user_patterns:
         match = re.search(pattern, normalized_message, flags=re.IGNORECASE)
         if not match:
             continue
-        target_user = _normalize_direct_fact_value(match.group(1))
+        target_user = _normalize_target_user_candidate(match.group(1))
         if target_user and not _is_non_storable_freeform_message(target_user):
             updates["targetUser"] = target_user
             break
