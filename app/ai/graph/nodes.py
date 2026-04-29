@@ -1067,7 +1067,9 @@ def _infer_prompted_slot_updates(
         if candidate:
             updates["goal"] = candidate
     elif prompted_slot == "targetUser":
-        candidate = _normalize_direct_fact_value(normalized_message)
+        candidate = _extract_target_user_candidate_from_message(
+            normalized_message
+        ) or _normalize_direct_fact_value(normalized_message)
         if candidate:
             updates["targetUser"] = candidate
     elif prompted_slot == "teamSize":
@@ -1131,6 +1133,13 @@ def _build_missing_field_summary(current_data: dict[str, str]) -> str:
 def _build_gather_focus_instruction(focus_type: str | None) -> str:
     if focus_type in GATHER_FIELD_GUIDE:
         focus_info = GATHER_FIELD_GUIDE[focus_type]
+        if focus_type == "dueDate":
+            return (
+                f'최근 대화의 초점은 "{focus_info["label"]}" 입니다. '
+                "중간발표나 최종제출처럼 특정 마일스톤을 팀 상황과 무관하게 고르라고 하지 마세요. "
+                "사용자가 관리하려는 일정 기준(과제 제출일, 시험일, 팀 내부 목표일 등)과 "
+                f'정해진 날짜가 있는지를 "{focus_info["question"]}"처럼 한 가지 질문으로 이어가세요.'
+            )
         return (
             f'최근 대화의 초점은 "{focus_info["label"]}" 입니다. '
             "우선 이 항목을 중심으로 답하되, 사용자가 다른 필드의 확정 사실을 함께 말하면 "
@@ -1385,8 +1394,8 @@ def _build_contextual_slot_question(
         return "최종 산출물을 한 줄로 적어 주세요."
     if slot == "dueDate":
         if topic_anchor:
-            return f"좋아요. '{topic_anchor}' 기준으로 마감일이나 발표일을 한 줄로 적어 주세요."
-        return "마감일이나 발표일을 한 줄로 적어 주세요."
+            return f"좋아요. '{topic_anchor}'에서 관리할 마감 기준과 정해진 날짜가 있으면 한 줄로 적어 주세요."
+        return "관리할 마감 기준과 정해진 날짜가 있으면 한 줄로 적어 주세요."
     if slot == "teamSize":
         if topic_anchor:
             return f"좋아요. '{topic_anchor}'를 진행하는 팀 인원을 몇 명으로 생각하는지 적어 주세요. 예: 4명, 5명"
@@ -1642,6 +1651,158 @@ def _build_goal_guidance_message(current_data: dict[str, object]) -> str:
         current_data=current_data,
         target_slot="goal",
     )
+
+
+GOAL_SETTING_GUIDANCE_MARKERS = (
+    "목표는 보통",
+    "목표를 잡을 때는",
+    "목표 후보",
+    "목표는 이렇게 잡아볼 수 있어요",
+    "최근에 불편했던 상황이나 만들고 싶은 방향",
+)
+
+
+def _is_goal_setting_help_request(user_message: str) -> bool:
+    normalized = _clean_text(_strip_mates_mention(user_message))
+    if not normalized or "목표" not in normalized:
+        return False
+    if _is_current_goal_query(normalized):
+        return False
+    help_tokens = (
+        "모르겠",
+        "어떻게",
+        "세우",
+        "잡",
+        "정하",
+        "추천",
+        "후보",
+        "예시",
+        "도와",
+        "가이드",
+        "감이 안",
+    )
+    return any(token in normalized for token in help_tokens)
+
+
+def _was_goal_setting_guidance_context(state: AgentState) -> bool:
+    blocks = [str(state.get("selected_message") or "")]
+    blocks.extend(str(message or "") for message in state.get("recent_messages", [])[-4:])
+    return any(
+        marker in block
+        for block in blocks
+        for marker in GOAL_SETTING_GUIDANCE_MARKERS
+    )
+
+
+def _looks_like_problem_material(user_message: str) -> bool:
+    normalized = _clean_text(_strip_mates_mention(user_message))
+    if not normalized:
+        return False
+    if _looks_like_question_line(normalized) or _looks_like_open_question(normalized):
+        return False
+    problem_tokens = (
+        "어려",
+        "힘들",
+        "불편",
+        "문제",
+        "귀찮",
+        "헷갈",
+        "복잡",
+        "오래 걸",
+        "번거",
+        "놓치",
+        "누락",
+        "부족",
+        "안 돼",
+        "안되",
+    )
+    return any(token in normalized for token in problem_tokens)
+
+
+def _goal_material_text(user_message: str) -> str:
+    material = _clean_text(_strip_mates_mention(user_message))
+    material = re.sub(r"^\s*(?:최근에|요즘|나는|저는|내가|제가)\s*", "", material)
+    material = re.sub(r"\s*(?:했어|했어요|였어|였어요|더라|더라고|같아|같아요)\s*$", "", material)
+    return material.strip(" .,!?:;\"'") or "사용자가 겪는 불편"
+
+
+def _extract_target_user_candidate_from_message(user_message: str) -> str:
+    normalized = _clean_text(_strip_mates_mention(user_message))
+    if not normalized:
+        return ""
+
+    patterns = (
+        r"(?:문제를\s*)?(?:가장\s*먼저\s*)?(?:겪는\s*)?(?:대상|타겟|사용자)(?:은|는|이|가|:)\s*(.+?)(?:이고|이며|이고요|입니다|예요|야|이고\s*해당|,\s*해당|\.|$)",
+        r"(.+?)(?:이|가)?\s*(?:문제를\s*)?(?:가장\s*먼저\s*)?(?:겪는\s*)?(?:대상|타겟|사용자)(?:입니다|예요|야)?(?:이고|이며|\.|$)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, normalized, flags=re.IGNORECASE)
+        if not match:
+            continue
+        candidate = _normalize_direct_fact_value(match.group(1))
+        candidate = re.split(
+            r"\s*(?:이고|이며|그리고|또|해당\s*문제|그\s*문제|문제를\s*줄이기|문제를\s*해결)",
+            candidate,
+            maxsplit=1,
+        )[0].strip(" .,!?:;\"'")
+        compact = re.sub(r"\s+", "", candidate)
+        if candidate and 1 < len(compact) <= 20 and not _looks_like_open_question(candidate):
+            return candidate
+    return ""
+
+
+def _build_goal_setting_method_message(current_data: dict[str, object]) -> str:
+    topic_anchor = _get_topic_anchor(current_data, allow_title_fallback=False)
+    prefix = (
+        f"'{topic_anchor}' 기준으로 "
+        if topic_anchor
+        else ""
+    )
+    return (
+        f"목표는 보통 {prefix}'누가 겪는 어떤 문제를 어떤 상태로 바꿀 것인가'로 잡으면 좋아요.\n"
+        "예: 팀원이 반복해서 하던 일을 줄인다, 사용자가 필요한 정보를 더 빨리 찾게 한다.\n"
+        "최근에 불편했던 상황이나 만들고 싶은 방향을 한 줄로 말해 주세요. 그걸 바탕으로 목표 후보를 제안할게요."
+    )
+
+
+def _build_goal_candidate_message(
+    current_data: dict[str, object],
+    user_message: str,
+) -> str:
+    topic_anchor = _get_topic_anchor(current_data, allow_title_fallback=False)
+    material = _goal_material_text(user_message)
+    scope = topic_anchor or material
+    return (
+        f"그 문제라면 목표는 이렇게 잡아볼 수 있어요.\n\n"
+        f"1. {scope} 과정에서 사용자가 겪는 불편을 줄이고 필요한 결정을 더 빠르게 내리게 한다.\n"
+        f"2. {material} 상황에서 반복되는 확인과 조율을 줄여 핵심 작업에 집중하게 한다.\n"
+        f"3. {scope}와 관련된 정보와 진행 상태를 한곳에서 확인해 누락을 줄인다.\n\n"
+        "가장 가까운 번호 하나를 고르거나, 원하는 방향으로 한 줄 수정해서 말해 주세요."
+    )
+
+
+def _build_topic_goal_candidate_message(current_data: dict[str, object]) -> str:
+    topic_anchor = (
+        _get_topic_anchor(current_data, allow_title_fallback=False) or "이 주제"
+    )
+    return (
+        f"'{topic_anchor}' 기준이면 목표는 이렇게 잡아볼 수 있어요.\n\n"
+        f"1. {topic_anchor} 과정에서 사용자가 겪는 불편을 줄인다.\n"
+        f"2. {topic_anchor}와 관련된 정보를 한곳에서 확인해 누락과 혼선을 줄인다.\n"
+        f"3. {topic_anchor} 업무를 더 빠르게 처리할 수 있도록 확인, 기록, 공유 과정을 단순화한다.\n\n"
+        "가장 가까운 번호 하나를 고르거나, 원하는 방향으로 한 줄 수정해서 말해 주세요."
+    )
+
+
+def _build_goal_guidance_response(
+    current_data: dict[str, object],
+    user_message: str = "",
+) -> str:
+    if _looks_like_problem_material(user_message):
+        return _build_goal_candidate_message(current_data, user_message)
+    if _get_topic_anchor(current_data, allow_title_fallback=False):
+        return _build_topic_goal_candidate_message(current_data)
+    return _build_goal_setting_method_message(current_data)
 
 
 def _build_slot_help_message(
@@ -2167,6 +2328,13 @@ def _build_next_missing_field_prompt(current_data: dict[str, object]) -> str:
     if not subject:
         return "먼저 어떤 분야나 문제를 다루는 프로젝트인지 한 줄로 정해볼까요?"
     if subject_needs_problem_definition(subject):
+        if _is_valid_collected_value("goal", normalized.get("goal")):
+            for key in ("roles", "teamSize", "dueDate", "deliverables", "title"):
+                if _is_valid_collected_value(key, normalized.get(key)):
+                    continue
+                if key == "title":
+                    return "다음으로 프로젝트 제목을 한 줄로 정해볼까요?"
+                return GATHER_FIELD_GUIDE[key]["question"]
         return (
             f"좋아요. '{subject}' 쪽으로 갈게요. "
             "이 안에서 어떤 문제를 해결하고 싶은지 한 줄로 말해 주세요."
@@ -2232,7 +2400,7 @@ def _finalize_committed_response(
             return follow_up
         return _build_collected_data_summary(merged_data)
     if turn_type == "request_goal_guidance":
-        return _build_goal_guidance_message(merged_data)
+        return _build_goal_guidance_response(merged_data)
     if turn_type in {"request_refine_topic", "request_guided_exploration"}:
         subject = str(merged_data.get("subject") or "").strip()
         if subject and not subject_needs_problem_definition(subject):
@@ -2274,6 +2442,7 @@ def _build_next_missing_field_prompt(
         subject
         and subject_needs_problem_definition(subject)
         and not _clean_text(normalized.get("problemArea"))
+        and not _is_valid_collected_value("goal", normalized.get("goal"))
     ):
         return _build_contextual_slot_question(
             normalized,
@@ -3294,11 +3463,14 @@ def explore_problem_node(state: AgentState):
         "request_summary",
         "request_fill_missing",
         "request_next_step",
+        "request_goal_guidance",
     }:
         return {
             "ai_message": _apply_turn_policy_to_message(
                 state,
-                _finalize_committed_response(
+                _build_goal_guidance_response(current_data, user_message)
+                if latest_intent == "request_goal_guidance"
+                else _finalize_committed_response(
                     turn_type=latest_intent,
                     merged_data=current_data,
                     accepted_updates={},
@@ -3371,6 +3543,26 @@ def topic_exists_node(state: AgentState):
     user_message = _effective_user_message(state)
     raw_current_data = dict(state.get("collected_data") or {})
     current_data = _prune_collected_data(raw_current_data)
+
+    if _was_goal_setting_guidance_context(state) and _looks_like_problem_material(
+        user_message
+    ):
+        next_phase = derive_phase_from_collected_data(
+            current_data,
+            current_phase="GATHER",
+        )
+        return {
+            "ai_message": _apply_turn_policy_to_message(
+                state,
+                _build_goal_candidate_message(current_data, user_message),
+            ),
+            "collected_data": raw_current_data,
+            "is_sufficient": _is_template_ready(current_data),
+            "next_phase": next_phase,
+            "followup_fields": ["goal"],
+            "next_question_field": "goal",
+        }
+
     direct_updates_raw = _extract_direct_fact_updates(user_message)
     if "title" not in direct_updates_raw:
         confirmed_title = _extract_confirmed_title_from_context(state)
@@ -3712,6 +3904,26 @@ def gather_information_node(state: AgentState):
     current_data = _prune_collected_data(raw_current_data)
     prefilled_data = dict(current_data)
     was_ready = _is_template_ready(current_data)
+
+    if _was_goal_setting_guidance_context(state) and _looks_like_problem_material(
+        user_message
+    ):
+        next_phase = derive_phase_from_collected_data(
+            prefilled_data,
+            current_phase=current_phase,
+        )
+        return {
+            "ai_message": _apply_turn_policy_to_message(
+                state,
+                _build_goal_candidate_message(prefilled_data, user_message),
+            ),
+            "collected_data": raw_current_data,
+            "is_sufficient": was_ready,
+            "next_phase": next_phase,
+            "followup_fields": ["goal"],
+            "next_question_field": "goal",
+        }
+
     if _is_current_goal_query(user_message):
         next_phase = derive_phase_from_collected_data(
             prefilled_data, current_phase=current_phase
@@ -3753,7 +3965,10 @@ def gather_information_node(state: AgentState):
         and user_message
         and not _is_non_storable_freeform_message(user_message)
     ):
-        direct_updates_raw["targetUser"] = _normalize_direct_fact_value(user_message)
+        direct_updates_raw["targetUser"] = (
+            _extract_target_user_candidate_from_message(user_message)
+            or _normalize_direct_fact_value(user_message)
+        )
     choice_goal = _extract_choice_based_goal(state) if prompted_slot == "goal" else ""
     if choice_goal:
         direct_updates_raw["goal"] = choice_goal
@@ -4724,12 +4939,19 @@ def _interpret_turn_type(
     *,
     direct_updates: dict[str, object] | None = None,
 ) -> str:
+    user_message = _effective_user_message(state)
+    if _is_goal_setting_help_request(user_message):
+        return "request_goal_guidance"
+    if _was_goal_setting_guidance_context(state) and _looks_like_problem_material(
+        user_message
+    ):
+        return "request_goal_guidance"
+
     turn_type = _prior_interpret_turn_type(
         state,
         current_data,
         direct_updates=direct_updates,
     )
-    user_message = _effective_user_message(state)
     direct_updates = dict(direct_updates or {})
 
     if turn_type == "request_next_step" and _looks_like_advice_request(user_message):
