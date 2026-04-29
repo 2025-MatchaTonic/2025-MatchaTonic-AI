@@ -1256,6 +1256,7 @@ def has_problem_definition_context(data: Mapping[str, object] | None) -> bool:
     return bool(
         _normalize_auxiliary_value("problemArea", sanitized.get("problemArea"))
         or _normalize_auxiliary_value("targetFacility", sanitized.get("targetFacility"))
+        or _normalize_auxiliary_value("targetUser", sanitized.get("targetUser"))
     )
 
 
@@ -1670,6 +1671,12 @@ REQUIRED_COLLECTED_DATA_FIELDS: tuple[str, ...] = (
     "roles",
     "dueDate",
     "deliverables",
+)
+
+PUBLIC_AUXILIARY_COLLECTED_DATA_FIELDS: tuple[str, ...] = (
+    "problemArea",
+    "targetFacility",
+    "targetUser",
 )
 
 NEXT_FIELD_PRIORITY_BY_PHASE: dict[str, tuple[str, ...]] = {
@@ -2162,6 +2169,11 @@ def build_approved_collected_data_snapshot(
         ):
             snapshot[key] = _format_roles_for_backend(value) if key == "roles" else value
 
+    for key in PUBLIC_AUXILIARY_COLLECTED_DATA_FIELDS:
+        value = _normalize_auxiliary_value(key, sanitized.get(key))
+        if value is not None:
+            snapshot[key] = value
+
     goal = _clean_string(snapshot.get("goal"))
     subject = _clean_string(snapshot.get("subject"))
     if goal and subject and goal == subject:
@@ -2190,6 +2202,13 @@ def build_public_update_snapshot(
             value,
             team_size=sanitized_updates.get("teamSize", (current_data or {}).get("teamSize")),
         ):
+            snapshot[key] = value
+
+    for key in PUBLIC_AUXILIARY_COLLECTED_DATA_FIELDS:
+        if key not in sanitized_updates:
+            continue
+        value = _normalize_auxiliary_value(key, sanitized_updates.get(key))
+        if value is not None:
             snapshot[key] = value
 
     return snapshot

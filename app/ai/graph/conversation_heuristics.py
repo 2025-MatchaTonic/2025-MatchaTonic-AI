@@ -100,7 +100,7 @@ GATHER_FIELD_GUIDE = {
     },
     "dueDate": {
         "label": "마감일",
-        "question": "중간발표나 최종제출 기준으로 생각하는 마감일은 언제인가요?",
+        "question": "어떤 일정 기준으로 마감일을 잡으면 좋을까요? 정해진 날짜가 있으면 함께 말해 주세요.",
     },
     "deliverables": {
         "label": "산출물",
