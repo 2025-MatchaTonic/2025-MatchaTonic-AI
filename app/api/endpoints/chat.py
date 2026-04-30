@@ -45,6 +45,12 @@ _VALID_SLOT_FIELDS = {
     "deliverables",
 }
 
+_TOP_LEVEL_COLLECTED_FIELDS = _VALID_SLOT_FIELDS | {
+    "problemArea",
+    "targetFacility",
+    "targetUser",
+}
+
 _ASSISTANT_MESSAGE_PREFIXES = (
     "좋아요",
     "좋습니다",
@@ -129,6 +135,15 @@ class AIChatRequest(BaseModel):
             payload["roomId"] = payload["projectId"]
 
         raw_collected_data = payload.get("collectedData")
+        if not isinstance(raw_collected_data, dict):
+            raw_collected_data = {}
+        raw_collected_data = dict(raw_collected_data)
+
+        for field in _TOP_LEVEL_COLLECTED_FIELDS:
+            if field in payload and field not in raw_collected_data:
+                raw_collected_data[field] = payload[field]
+
+        payload["collectedData"] = raw_collected_data
         payload["rawCollectedData"] = (
             dict(raw_collected_data) if isinstance(raw_collected_data, dict) else {}
         )

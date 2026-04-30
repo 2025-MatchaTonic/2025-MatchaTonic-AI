@@ -185,7 +185,7 @@ PLACEHOLDER_VALUE_KEYWORDS: tuple[str, ...] = (
 )
 
 META_CONVERSATION_VALUE_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"^\s*(?:아니|아니요|그게 아니라|다시|잠깐)\b"),
+    re.compile(r"^\s*(?:아니|아니요|그게 아니라|잠깐)\b"),
     re.compile(r"^\s*(?:왜|뭔 말|무슨 말|이게 무슨)\b"),
     re.compile(r"^\s*(?:엥|에엥)\b"),
     re.compile(r"^\s*(?:엥|에엥)\s*(?:무슨|뭔)\s*소리"),
@@ -1480,11 +1480,36 @@ def looks_like_non_committal_value(value: object) -> bool:
     )
 
 
+def _looks_like_guidance_placeholder(key: str, value: object) -> bool:
+    cleaned = _clean_string(value)
+    if not cleaned:
+        return False
+
+    if key == "goal":
+        return any(
+            marker in cleaned
+            for marker in (
+                "목표는 이렇게 잡아볼 수 있어요",
+                "이렇게 잡아볼 수 있어요",
+                "그 문제라면 목표는",
+            )
+        )
+
+    if key == "problemArea":
+        return bool(
+            re.match(r"^\s*(?:주\s*사용자|주요\s*사용자)\s*(?:은|는|이|가|:)", cleaned)
+        )
+
+    return False
+
+
 def is_valid_collected_value(key: str, value: object, *, team_size: object = None) -> bool:
     if not _original_is_valid_collected_value(key, value, team_size=team_size):
         return False
 
     cleaned = _clean(key, value)
+    if _looks_like_guidance_placeholder(key, cleaned):
+        return False
     if key == "goal" and (is_request_like_value(cleaned) or is_undecided_value(cleaned)):
         return False
     return True
@@ -1590,6 +1615,8 @@ def _looks_like_room_title_metadata(value: object) -> bool:
 def _normalize_auxiliary_value(key: str, value: object) -> str | None:
     cleaned = _clean_string(value)
     if not cleaned or looks_like_non_committal_value(cleaned):
+        return None
+    if _looks_like_guidance_placeholder(key, cleaned):
         return None
     if key == "projectName":
         return cleaned
@@ -1948,7 +1975,7 @@ def choose_next_question_field(
             pending.append(field)
             seen.add(field)
     for field in (rejected_updates or {}).keys():
-        if field and field not in seen:
+        if field and field not in seen and field not in sanitized:
             pending.append(field)
             seen.add(field)
 
@@ -2116,6 +2143,16 @@ def apply_collected_data_updates(
             rejected_reasons[key] = decision.reason
             if decision.requires_followup_question and key not in needs_confirmation:
                 needs_confirmation.append(key)
+
+    for key, raw_value in raw_candidate.items():
+        if key not in AUXILIARY_STATE_FIELDS:
+            continue
+        normalized_value = _normalize_auxiliary_value(key, raw_value)
+        if normalized_value is None:
+            rejected_updates[key] = raw_value
+            rejected_reasons[key] = "invalid_or_empty_candidate"
+            continue
+        approved_updates[key] = normalized_value
 
     next_collected_data = merge_collected_data(current_data, approved_updates)
     for key in raw_candidate:

@@ -103,6 +103,9 @@ from app.ai.graph.topic_presence import (
     _normalize_button_token,
 )
 from app.core.config import settings
+from app.core.request_normalization import (
+    normalize_collected_data as _normalize_request_collected_data,
+)
 from app.rag.retriever import get_rag_context
 
 logger = logging.getLogger(__name__)
@@ -806,7 +809,7 @@ def _is_valid_collected_value(key: str, value: object) -> bool:
 
 
 def _prune_collected_data(data: dict[str, str]) -> dict[str, str]:
-    return _shared_sanitize_collected_data(data)
+    return _normalize_request_collected_data(data)
 
 
 def _detect_gather_focus(text: str) -> str | None:
@@ -1017,9 +1020,9 @@ def _get_contextual_prompted_slot(
         "deliverables",
     }:
         return explicit_slot
-    return infer_contextual_prompted_slot(
-        recent_messages=state.get("recent_messages", []),
-        selected_message=state.get("selected_message"),
+    return choose_next_question_field(
+        current_data,
+        current_phase=str(state.get("current_phase") or "GATHER"),
     )
 
 
@@ -1694,6 +1697,16 @@ def _was_goal_setting_guidance_context(state: AgentState) -> bool:
     )
 
 
+def _is_goal_choice_prompt_context(state: AgentState) -> bool:
+    blocks = [str(state.get("selected_message") or "")]
+    blocks.extend(str(message or "") for message in state.get("recent_messages", [])[-4:])
+    return any(
+        ("목표" in block or "단기적 목표" in block)
+        and ("가장 가까운 번호" in block or "아래 중 선택" in block)
+        for block in blocks
+    )
+
+
 def _looks_like_problem_material(user_message: str) -> bool:
     normalized = _clean_text(_strip_mates_mention(user_message))
     if not normalized:
@@ -2180,6 +2193,10 @@ def _extract_team_size_from_message(message: str) -> str:
     )
     if explicit_fallback:
         return explicit_fallback.group(1).strip()
+
+    leading_count = re.match(r"^(\d{1,2})\s*명이고", message)
+    if leading_count:
+        return leading_count.group(1).strip()
 
     generic_matches = list(TEAM_SIZE_GENERIC_PATTERN.finditer(message))
     if not generic_matches:
@@ -3909,8 +3926,10 @@ def gather_information_node(state: AgentState):
     prefilled_data = dict(current_data)
     was_ready = _is_template_ready(current_data)
 
-    if _was_goal_setting_guidance_context(state) and _looks_like_problem_material(
-        user_message
+    if (
+        _was_goal_setting_guidance_context(state)
+        and _looks_like_problem_material(user_message)
+        and not _is_goal_choice_prompt_context(state)
     ):
         next_phase = derive_phase_from_collected_data(
             prefilled_data,
@@ -3921,7 +3940,7 @@ def gather_information_node(state: AgentState):
                 state,
                 _build_goal_candidate_message(prefilled_data, user_message),
             ),
-            "collected_data": raw_current_data,
+            "collected_data": prefilled_data,
             "is_sufficient": was_ready,
             "next_phase": next_phase,
             "followup_fields": ["goal"],
@@ -3940,7 +3959,7 @@ def gather_information_node(state: AgentState):
                     prefilled_data, current_phase=current_phase
                 ),
             ),
-            "collected_data": raw_current_data,
+            "collected_data": prefilled_data,
             "is_sufficient": is_sufficient,
             "next_phase": next_phase,
         }
