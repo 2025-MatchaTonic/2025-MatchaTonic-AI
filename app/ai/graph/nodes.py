@@ -5134,6 +5134,51 @@ _final_goal_candidate_extractor = _extract_goal_candidate_from_message
 _final_problem_area_candidate_extractor = _extract_problem_area_candidate
 
 
+def _strip_goal_candidate_suffix(candidate: str) -> str:
+    normalized = _normalize_goal_candidate(candidate)
+    if not normalized:
+        return ""
+    for suffix in ("으로", "로", "을", "를"):
+        if normalized.endswith(suffix) and len(normalized) > len(suffix) + 1:
+            normalized = normalized[: -len(suffix)].strip(" .,!?:;\"'")
+            break
+    compact = "".join(normalized.split())
+    if compact in {"이거", "이걸", "그거", "그걸", "저거", "저걸"}:
+        return ""
+    return normalized
+
+
+def _extract_goal_change_candidate_without_regex(message: str) -> str:
+    normalized_message = _clean_text(message)
+    if "목표" not in normalized_message:
+        return ""
+
+    before, _, after = normalized_message.rpartition("목표")
+    before = before.strip()
+    after = after.strip(" .,!?:;\"'")
+    if not before or not after:
+        return ""
+
+    change_tokens = (
+        "바꿀래",
+        "바꿀게",
+        "바꾸자",
+        "변경할래",
+        "변경할게",
+        "변경하자",
+        "수정할래",
+        "수정할게",
+        "수정하자",
+        "정할래",
+        "정할게",
+        "정하자",
+    )
+    if not any(token in after for token in change_tokens):
+        return ""
+
+    return _strip_goal_candidate_suffix(before)
+
+
 def _extract_goal_candidate_from_message(message: str) -> str:
     normalized_message = _clean_text(message)
     if (
@@ -5142,6 +5187,10 @@ def _extract_goal_candidate_from_message(message: str) -> str:
         or _is_current_goal_query(normalized_message)
     ):
         return ""
+
+    change_candidate = _extract_goal_change_candidate_without_regex(normalized_message)
+    if change_candidate:
+        return change_candidate
 
     candidate = _final_goal_candidate_extractor(normalized_message)
     if not candidate:
@@ -5161,6 +5210,10 @@ def _extract_problem_area_candidate(
     direct_updates: dict[str, object] | None = None,
 ) -> str:
     normalized_message = _clean_text(_effective_user_message(state))
+    if state.get("current_phase") == "READY" and not (direct_updates or {}):
+        ready_problem_tokens = ("문제", "불편", "해결", "개선", "줄이고", "줄이기")
+        if not any(token in normalized_message for token in ready_problem_tokens):
+            return ""
     if re.match(r"^\s*(?:주\s*사용자|주요\s*사용자)\s*(?:은|는|이|가|:)", normalized_message):
         return ""
     candidate = _final_problem_area_candidate_extractor(

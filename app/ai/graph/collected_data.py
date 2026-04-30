@@ -564,6 +564,41 @@ def _strong_restatement_matches_key(key: str, user_message: str) -> bool:
     return any(pattern.search(user_message) for pattern in patterns)
 
 
+def _has_explicit_update_intent(key: str, user_message: str) -> bool:
+    cleaned = _clean_string(user_message)
+    if not cleaned:
+        return False
+
+    shared_tokens = (
+        "바꿀래",
+        "바꿀게",
+        "바꾸자",
+        "바꿔줘",
+        "변경할래",
+        "변경할게",
+        "변경하자",
+        "변경해줘",
+        "수정할래",
+        "수정할게",
+        "수정하자",
+        "수정해줘",
+    )
+    if any(token in cleaned for token in shared_tokens):
+        return True
+
+    field_tokens = {
+        "goal": ("목표",),
+        "subject": ("주제",),
+        "title": ("제목",),
+        "dueDate": ("마감", "데드라인"),
+        "deliverables": ("산출물", "결과물"),
+        "roles": ("역할",),
+    }
+    return any(token in cleaned for token in field_tokens.get(key, ())) and any(
+        token in cleaned for token in ("다시", "말고", "정확히는")
+    )
+
+
 def detect_overwrite_mode(
     *,
     key: str,
@@ -1171,6 +1206,8 @@ def detect_overwrite_mode(
     if not cleaned_message:
         return OverwriteMode.NONE
     if is_explicit_correction_message(cleaned_message):
+        return OverwriteMode.EXPLICIT
+    if _has_explicit_update_intent(key, cleaned_message):
         return OverwriteMode.EXPLICIT
     if key in {"subject", "title", "goal", "dueDate", "deliverables", "roles"} and re.match(
         r"^\s*(?:주제|제목|목표|마감|산출물|결과물|역할)\s*[:：]",
@@ -2191,6 +2228,35 @@ def apply_collected_data_updates(
     }
 
 
+_DISPLAY_SPEECH_ENDING_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"\s*거예요\s*$"), " 것"),
+    (re.compile(r"\s*거에요\s*$"), " 것"),
+    (re.compile(r"\s*이에요\s*$"), ""),
+    (re.compile(r"\s*이예요\s*$"), ""),
+    (re.compile(r"\s*예요\s*$"), ""),
+    (re.compile(r"\s*에요\s*$"), ""),
+    (re.compile(r"\s*입니다\s*$"), ""),
+    (re.compile(r"\s*습니다\s*$"), ""),
+]
+_DISPLAY_SPEECH_ENDING_FIELDS: frozenset[str] = frozenset(
+    {"goal", "subject", "title", "deliverables"}
+)
+
+
+def _strip_display_endings(field: str, value: object) -> object:
+    if field not in _DISPLAY_SPEECH_ENDING_FIELDS:
+        return value
+    if isinstance(value, str):
+        for pattern, replacement in _DISPLAY_SPEECH_ENDING_PATTERNS:
+            cleaned = pattern.sub(replacement, value)
+            if cleaned != value:
+                return cleaned.strip()
+        return value
+    if isinstance(value, list):
+        return [_strip_display_endings(field, item) for item in value]
+    return value
+
+
 def build_approved_collected_data_snapshot(
     data: Mapping[str, object] | None,
 ) -> CollectedData:
@@ -2204,7 +2270,10 @@ def build_approved_collected_data_snapshot(
             value,
             team_size=sanitized.get("teamSize"),
         ):
-            snapshot[key] = _format_roles_for_backend(value) if key == "roles" else value
+            if key == "roles":
+                snapshot[key] = _format_roles_for_backend(value)
+            else:
+                snapshot[key] = _strip_display_endings(key, value)
 
     for key in PUBLIC_AUXILIARY_COLLECTED_DATA_FIELDS:
         value = _normalize_auxiliary_value(key, sanitized.get(key))
