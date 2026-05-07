@@ -13,7 +13,7 @@ from app.ai.graph.collected_data import (
     derive_phase_from_collected_data,
     missing_collected_fields,
 )
-from app.ai.graph.llm_clients import structured_llm
+from app.ai.graph.llm_clients import invoke_llm, structured_llm
 from app.ai.graph.nodes import _fetch_rag_context, _get_rag_filters
 from app.ai.graph.state import AgentState
 from app.ai.graph.template_support import (
@@ -192,9 +192,22 @@ def _run_template_generation(request: TemplateGenerateRequest) -> tuple[dict, di
 def generate_template_from_state(state: AgentState, *, action_type: str) -> dict:
     mode_config = get_template_mode_config(action_type)
     default_sections = build_default_template_sections(state, mode=mode_config["mode"])
+    fallback_payload = build_notion_template_payload(state, default_sections)
+    fallback_summary = mode_config["summary_fallback"]
     template_content_example = build_template_content_example()
     rag_filter_key = "READY_DEV" if action_type == "BTN_DEV" else "READY_PLAN"
-    rag_context = _fetch_rag_context(state, phase="READY", **_get_rag_filters(rag_filter_key))
+    try:
+        rag_context = _fetch_rag_context(
+            state,
+            phase="READY",
+            **_get_rag_filters(rag_filter_key),
+        )
+    except Exception:
+        logger.exception(
+            "template generation RAG failed; continuing without RAG project_id=%s",
+            state.get("project_id"),
+        )
+        rag_context = "(reference context unavailable)"
     recent_context = build_recent_context(state)
     template_input_summary = build_template_input_summary(state)
     collected_data = state.get("collected_data", {})
@@ -255,15 +268,39 @@ def generate_template_from_state(state: AgentState, *, action_type: str) -> dict
     }}
     """
 
-    response = structured_llm.invoke(prompt, response_format={"type": "json_object"})
+    response = invoke_llm(
+        structured_llm,
+        prompt,
+        label=f"template_generation mode={mode_config['mode']}",
+        response_format={"type": "json_object"},
+    )
+    if response is None:
+        logger.warning(
+            "template generation LLM unavailable; returning default template payload project_id=%s",
+            state.get("project_id"),
+        )
+        return {
+            "ai_message": fallback_summary,
+            "template_payload": fallback_payload,
+            "next_phase": "DONE",
+            "is_sufficient": True,
+        }
+
     try:
         raw_result = json.loads(response.content)
         result = TemplateContentLLMResponse.model_validate(raw_result)
     except (JSONDecodeError, ValidationError) as exc:
-        raise RuntimeError(
-            f"failed to parse template JSON from LLM response: {exc}\n"
-            f"raw output:\n{response.content}"
+        logger.exception(
+            "failed to parse template JSON from LLM response; returning default template payload project_id=%s raw_output=%r",
+            state.get("project_id"),
+            getattr(response, "content", ""),
         )
+        return {
+            "ai_message": fallback_summary,
+            "template_payload": fallback_payload,
+            "next_phase": "DONE",
+            "is_sufficient": True,
+        }
 
     template_sections = merge_template_sections(default_sections, result.to_merged_dict())
     template_payload = build_notion_template_payload(state, template_sections)
