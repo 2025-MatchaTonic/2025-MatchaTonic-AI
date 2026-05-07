@@ -19,7 +19,6 @@ from app.ai.graph.collected_data import (
     build_phase_derivation_trace,
     choose_next_question_field,
     derive_phase_from_collected_data,
-    missing_collected_fields,
 )
 from app.ai.graph.state import TurnPolicy
 from app.ai.graph.workflow import ai_app
@@ -166,12 +165,20 @@ class AIChatRequest(BaseModel):
 
         recent_messages = normalize_string_list(payload.get("recentMessages"))
         if not recent_messages and selected_answers:
-            recent_messages = list(selected_answers)
+            # AI가 생성한 버튼 텍스트가 사용자 발화로 오염되지 않도록 필터링.
+            # 필터 후 빈 경우 원본 유지(백엔드가 이미 구분해서 보낸 경우).
+            user_authored = [a for a in selected_answers if not _looks_like_assistant_authored_message(a)]
+            recent_messages = user_authored if user_authored else list(selected_answers)
         payload["recentMessages"] = recent_messages
 
         selected_message = normalize_optional_string(payload.get("selectedMessage"))
         if selected_message is None and selected_answers:
-            selected_message = selected_answers[-1]
+            # 마지막 선택지를 selectedMessage로 승격할 때도 AI 텍스트 제외.
+            user_answer = next(
+                (a for a in reversed(selected_answers) if not _looks_like_assistant_authored_message(a)),
+                selected_answers[-1],
+            )
+            selected_message = user_answer
         payload["selectedMessage"] = selected_message
         payload["currentSlot"] = _normalize_slot_name(payload.get("currentSlot"))
         payload["nextQuestionField"] = _normalize_slot_name(payload.get("nextQuestionField"))
@@ -201,20 +208,21 @@ class AIChatResponse(BaseModel):
     collectedData: CollectedData
 
 
-QUESTION_BY_FIELD = {
-    "subject": "프로젝트 주제를 한 줄로 적어주세요.",
-    "title": "프로젝트 제목은 어떻게 정할까요?",
-    "goal": "이 프로젝트 목표를 한 줄로 말해 주세요.",
-    "teamSize": "현재 팀원은 총 몇 명인가요?",
-    "roles": "각자 맡을 역할을 짧게 적어주세요.",
-    "dueDate": "마감일이나 발표일은 언제인가요?",
-    "deliverables": "최종 산출물은 무엇인가요?",
-}
-
 PHASE_FIELD_PRIORITY = {
     "PROBLEM_DEFINE": ["subject", "goal", "title"],
     "GATHER": ["teamSize", "roles", "dueDate", "deliverables", "goal"],
     "READY": ["goal", "teamSize", "roles", "dueDate", "deliverables"],
+}
+
+SUGGESTED_QUESTIONS_BY_FIELD = {
+    "subject": ["어떤 주제로 진행할까요?"],
+    "title": ["프로젝트 제목을 한 줄로 적어주세요."],
+    "goal": ["이 프로젝트 목표를 한 줄로 말해 주세요."],
+    "targetUser": ["주요 사용자는 누구인가요?"],
+    "teamSize": ["현재 팀원은 총 몇 명인가요?", "3명", "4명", "5명 이상"],
+    "roles": ["각자 맡을 역할을 짧게 적어주세요."],
+    "dueDate": ["마감일이나 발표일은 언제인가요?", "1주 안", "2주 안"],
+    "deliverables": ["최종 산출물은 무엇인가요?", "기획서", "MVP", "발표 자료"],
 }
 
 
@@ -257,57 +265,19 @@ def _derive_turn_policy(request: AIChatRequest) -> TurnPolicy:
 
 def _build_suggested_questions(
     *,
-    phase: str,
-    collected_data: CollectedData,
-    rejected_updates: Dict[str, Any] | None,
-    followup_fields: List[str] | None,
-    next_field_override: str | None = None,
+    phase: str = "GATHER",
+    collected_data: Dict[str, Any] | None = None,
+    rejected_updates: Dict[str, Any] | None = None,
+    followup_fields: List[str] | None = None,
+    next_question_field: str | None = None,
 ) -> List[str]:
-    suggestions: List[str] = []
-    seen_fields: set[str] = set()
-
-    next_field = next_field_override or choose_next_question_field(
-        collected_data,
+    field = _normalize_slot_name(next_question_field) or choose_next_question_field(
+        collected_data or {},
         current_phase=phase,
         followup_fields=followup_fields or [],
         rejected_updates=rejected_updates or {},
     )
-    if next_field:
-        seen_fields.add(next_field)
-        question = QUESTION_BY_FIELD.get(next_field)
-        if question:
-            suggestions.append(question)
-
-    priority_fields: List[str] = []
-    for field in followup_fields or []:
-        if field not in seen_fields:
-            priority_fields.append(field)
-            seen_fields.add(field)
-    for field in (rejected_updates or {}).keys():
-        if field not in seen_fields:
-            priority_fields.append(field)
-            seen_fields.add(field)
-
-    missing_fields = missing_collected_fields(collected_data)
-    for field in PHASE_FIELD_PRIORITY.get(phase, PHASE_FIELD_PRIORITY.get("GATHER", [])):
-        if field in missing_fields and field not in seen_fields:
-            priority_fields.append(field)
-            seen_fields.add(field)
-    if phase == "READY":
-        for field in missing_fields:
-            if field not in seen_fields:
-                priority_fields.append(field)
-                seen_fields.add(field)
-
-    for field in priority_fields:
-        question = QUESTION_BY_FIELD.get(field)
-        if not question:
-            continue
-        suggestions.append(question)
-        if len(suggestions) == 3:
-            break
-
-    return suggestions
+    return list(SUGGESTED_QUESTIONS_BY_FIELD.get(field, []))
 
 
 @router.post("/", response_model=AIChatResponse)
@@ -422,7 +392,7 @@ async def process_chat(request: AIChatRequest):
                 collected_data=response_collected_data,
                 rejected_updates=rejected_updates,
                 followup_fields=followup_fields,
-                next_field_override=next_question_field,
+                next_question_field=next_question_field,
             ),
             currentStatus=response_phase,
             isSufficient=result.get("is_sufficient", False),

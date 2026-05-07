@@ -1,4 +1,4 @@
-from typing import Dict, List, Literal
+from typing import Any, Dict, List, Literal
 
 from pydantic import BaseModel, Field
 
@@ -26,6 +26,40 @@ class GatherLLMResponse(BaseModel):
             if isinstance(value, str) and value.strip():
                 normalized[key] = value.strip()
         return normalized
+
+
+class ConversationFieldUpdate(BaseModel):
+    field: Literal[
+        "subject",
+        "title",
+        "goal",
+        "targetUser",
+        "teamSize",
+        "roles",
+        "dueDate",
+        "deliverables",
+    ]
+    value: Any = ""
+    raw_evidence: str = ""
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    is_user_provided_fact: bool = False
+
+
+class ConversationLLMDecision(BaseModel):
+    intent: Literal[
+        "provide_info",
+        "ask_help",
+        "ask_summary",
+        "request_next_step",
+        "correct_info",
+        "meta",
+        "other",
+    ] = "other"
+    response_mode: Literal["answer", "answer_then_ask", "ask_only"] = "answer_then_ask"
+    ai_message: str = ""
+    updates: List[ConversationFieldUpdate] = Field(default_factory=list)
+    next_field: str | None = ""
+    needs_clarification: bool = False
 
 
 class TemplateProblemDefinitionItem(BaseModel):
