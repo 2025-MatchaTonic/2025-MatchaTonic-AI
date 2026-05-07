@@ -520,7 +520,15 @@ def normalize_collected_value(
         return normalized_roles or None
 
     cleaned = _clean_string(value)
-    return cleaned or None
+    if not cleaned:
+        return None
+
+    if key == "dueDate":
+        date_match = re.search(r"\d{4}-\d{2}-\d{2}", cleaned)
+        if date_match:
+            return date_match.group()
+
+    return cleaned
 
 
 def _clean(key: str, value: object) -> str:
@@ -540,20 +548,32 @@ def _effective_team_size(
     return normalize_team_size((current_data or {}).get("teamSize"))
 
 
+_AI_PROPOSAL_FIELD_MARKERS: tuple[str, ...] = (
+    "제안:", "제안 :", "권장 마감", "권장:",
+    "확정해 주세요", "확정해주세요",
+    "마감일:", "마감일 :", "산출물:", "산출물 :",
+)
+
+
 def _looks_like_guidance_placeholder(key: str, value: object) -> bool:
     cleaned = _clean_string(value)
     if not cleaned:
         return False
 
     if key == "goal":
-        return any(
+        if any(
             marker in cleaned
             for marker in (
                 "목표는 이렇게 잡아볼 수 있어요",
                 "이렇게 잡아볼 수 있어요",
                 "그 문제라면 목표는",
             )
-        )
+        ):
+            return True
+        return any(marker in cleaned for marker in _AI_PROPOSAL_FIELD_MARKERS)
+
+    if key in {"dueDate", "deliverables"}:
+        return any(marker in cleaned for marker in _AI_PROPOSAL_FIELD_MARKERS)
 
     if key == "problemArea":
         return bool(
@@ -625,6 +645,15 @@ def sanitize_collected_data(data: Mapping[str, object] | None) -> CollectedData:
     if _looks_like_room_title_metadata(sanitized.get("title")):
         sanitized.pop("title", None)
     sanitized.update(_preserve_auxiliary_state_fields(data))
+
+    # Drop title/subject if they match projectName (Spring injects room name as title)
+    _proj_name = _clean_string((data or {}).get("projectName"))
+    if _proj_name:
+        if _clean_string(sanitized.get("title")) == _proj_name:
+            sanitized.pop("title", None)
+        if _clean_string(sanitized.get("subject")) == _proj_name:
+            sanitized.pop("subject", None)
+
     return sanitized
 
 
@@ -717,6 +746,15 @@ def evaluate_candidate_update(
                 reason="llm_missing_raw_evidence", overwrite_mode="NONE", source=source,
                 requires_followup_question=False,
             )
+        # raw_evidence가 user_message에 없는데 confidence가 높지 않으면 거부
+        # (AI 자신의 이전 제안을 evidence로 재사용하는 경우 차단)
+        if user_message and raw_evidence.lower() not in user_message.lower():
+            if confidence_value < 0.85:
+                return CandidateDecision(
+                    key=key, approved=False, normalized_value=None,
+                    reason="llm_evidence_not_in_user_message", overwrite_mode="NONE", source=source,
+                    requires_followup_question=False,
+                )
 
     if key in {"roles", "teamSize"}:
         conflict_roles = normalized_incoming if key == "roles" else (candidate_updates or {}).get("roles", (current_data or {}).get("roles"))
