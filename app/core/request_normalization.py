@@ -183,17 +183,27 @@ def _looks_like_room_title_metadata(value: str) -> bool:
     return 1 <= len(suffix) <= 3 and prefix in ROOM_TITLE_METADATA_PREFIXES
 
 
+_AI_PROPOSAL_MARKERS: tuple[str, ...] = (
+    "제안:", "제안 :", "권장 마감", "권장:",
+    "확정해 주세요", "확정해주세요",
+    "마감일:", "마감일 :", "산출물:", "산출물 :",
+)
+
+
 def _looks_like_unconfirmed_goal(value: str) -> bool:
     compact = "".join(value.split())
     lowered = value.lower()
-    return (
+    if (
         "정하지못했" in compact
         or "못정했" in compact
         or "이렇게 잡아볼 수 있어요" in value
         or lowered in {"help", "recommend", "suggest"}
         or value.endswith("도와줘")
         or value.endswith("추천해줘")
-    )
+    ):
+        return True
+    # AI가 제안 형태로 돌려준 텍스트가 goal에 그대로 들어오는 경우 차단
+    return any(marker in value for marker in _AI_PROPOSAL_MARKERS)
 
 
 def _looks_like_embedded_user_context(field: str, value: str) -> bool:
@@ -219,6 +229,8 @@ def _normalize_text_field(field: str, value: Any) -> str | None:
     if field in {"subject", "title"} and _looks_like_room_title_metadata(cleaned):
         return None
     if field == "goal" and _looks_like_unconfirmed_goal(cleaned):
+        return None
+    if field in {"dueDate", "deliverables"} and any(m in cleaned for m in _AI_PROPOSAL_MARKERS):
         return None
     if _looks_like_embedded_user_context(field, cleaned):
         return None
