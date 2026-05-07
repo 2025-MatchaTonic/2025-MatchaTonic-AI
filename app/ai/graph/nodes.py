@@ -80,8 +80,9 @@ _PHASE_CONTEXT: dict[str, str] = {
         "???꾨줈?앺듃濡?????ㅼ젣濡?留뚮뱾怨??띠? 寃껋쓣 ??以꾨줈 ?뚯뼱?댁꽭??"
     ),
     "GATHER": (
-        "二쇱슂 ?뺣낫瑜??섏쭛?섎뒗 ?④퀎?낅땲?? "
-        "teamSize, roles, dueDate, deliverables 以?鍮꾩뼱?덈뒗 ??ぉ???먯뿰?ㅻ읇寃?臾쇱뼱蹂댁꽭??"
+        "팀이 실행 계획을 함께 세워나가는 단계입니다. "
+        "빈 필드를 채우는 게 목적이 아니라, 팀이 인원·역할·일정·결과물에 대한 결정을 내릴 수 있도록 돕는 게 목적입니다. "
+        "질문은 필드가 비어서가 아니라, 팀이 그 결정을 잘 내릴 수 있도록 이끄는 것임을 명심하세요."
     ),
     "READY": (
         "?꾩슂???뺣낫媛 嫄곗쓽 ??紐⑥씤 ?④퀎?낅땲?? "
@@ -324,7 +325,7 @@ def _is_template_ready(current_data: dict[str, object]) -> bool:
 
 def _build_missing_field_summary(current_data: dict[str, object]) -> str:
     missing = [
-        f'- {key}: {meta["label"]}'
+        f'- {meta["question"]}'
         for key, meta in GATHER_FIELD_GUIDE.items()
         if not _is_valid_collected_value(key, current_data.get(key))
     ]
@@ -453,8 +454,9 @@ def _call_llm_decision(
         else "吏덈Ц? ?섏? 留먭퀬 ?듬?留??섏꽭??"
     )
 
-    prompt = f"""?뱀떊? ?쒓뎅?대? ?곕뒗 ?뚰봽?몄썾?????AI ?꾨줈?앺듃 留ㅻ땲??낅땲??
-?ъ슜??硫붿떆吏???먯뿰?ㅻ읇怨??ㅼ슜?곸쑝濡??듯븯?몄슂.
+    prompt = f"""당신은 초보 대학생 팀의 프로젝트 의사결정을 돕는 코치입니다.
+팀이 스스로 결론에 이를 수 있도록 자연스럽게 대화를 이끌어 주세요.
+데이터 수집은 대화의 부산물입니다. 먼저 팀이 결정을 내릴 수 있도록 도와주세요.
 
 [?꾩옱 ?④퀎: {phase}]
 {phase_guidance}
@@ -462,7 +464,7 @@ def _call_llm_decision(
 [?꾩옱 ?섏쭛???뺣낫]
 {json.dumps(current_data, ensure_ascii=False, indent=2)}
 
-[?꾩쭅 ?꾩슂???뺣낫]
+[팀이 아직 결정하지 않은 것들]
 {missing_summary}
 
 [理쒓렐 ???
@@ -486,7 +488,7 @@ def _call_llm_decision(
 - 吏덈Ц, ?꾩? ?붿껌, 異붿쿇 ?붿껌, ?붿빟 ?붿껌? updates???ｌ? 留덉꽭??
 - raw_evidence?먮뒗 ?ㅼ젣 ?ъ슜??硫붿떆吏?먯꽌 洹쇨굅媛 ?섎뒗 吏㏃? ?먮Ц???ｌ쑝?몄슂.
 - confidence媛 ??굅???ъ떎 ?쒓났???꾨땲硫?is_user_provided_fact=false濡??먯꽭??
-- next_field: ?ㅼ쓬???뺤씤???꾨뱶 ?대쫫. ?놁쑝硫?鍮?臾몄옄??
+- next_field: 팀이 다음에 결정해야 할 항목 이름. 없으면 빈 문자열
   (subject/title/goal/targetUser/teamSize/roles/dueDate/deliverables 以??섎굹)
 - ?꾨뱶 蹂??紐낆쓣 ?멸툒?섏? ?딆쓣 寃?JSON 異쒕젰 (?ㅻⅨ ?띿뒪???놁씠 JSON留?:
 {{
