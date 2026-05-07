@@ -1,6 +1,7 @@
 # app/ai/graph/nodes.py
 import json
 import logging
+import re
 from json import JSONDecodeError
 from time import perf_counter
 
@@ -65,6 +66,13 @@ _VALID_NEXT_FIELDS = {
     "deliverables",
 }
 
+_ACCEPT_RECOMMENDATION_PATTERN = re.compile(
+    r"(?:추천(?:하는)?\s*대로|이대로|그걸로|그걸로\s*할게|확정|b\s*로|B\s*로)",
+    re.IGNORECASE,
+)
+_QUOTED_RECOMMENDATION_PATTERN = re.compile(r"'([^']{10,180})'")
+_OPTION_B_PATTERN = re.compile(r"B\)\s*([^\n]+)")
+
 _PHASE_CONTEXT: dict[str, str] = {
     "EXPLORE": (
         "?ъ슜?먭? ?꾩쭅 援ъ껜?곸씤 二쇱젣媛 ?놁뒿?덈떎. "
@@ -121,6 +129,56 @@ def _is_meaningful_fact(value: object) -> bool:
         kw in normalized
         for kw in ("모르겠", "모름", "없음", "없어", "미정", "tbd", "unknown")
     )
+
+
+def _looks_like_accept_recommendation(message: str) -> bool:
+    return bool(_ACCEPT_RECOMMENDATION_PATTERN.search(str(message or "")))
+
+
+def _extract_recent_goal_recommendation(state: AgentState) -> str:
+    recent = [
+        _strip_mates_mention(msg)
+        for msg in state.get("recent_messages", [])
+        if _strip_mates_mention(msg)
+    ]
+    selected = _strip_mates_mention(state.get("selected_message"))
+    context = "\n".join([*recent[-6:], selected]).strip()
+    if not context:
+        return ""
+
+    option_b_matches = [match.strip() for match in _OPTION_B_PATTERN.findall(context)]
+    for candidate in reversed(option_b_matches):
+        if 10 <= len(candidate) <= 180:
+            return candidate.strip(" .")
+
+    quoted_matches = [match.strip() for match in _QUOTED_RECOMMENDATION_PATTERN.findall(context)]
+    for candidate in reversed(quoted_matches):
+        if any(keyword in candidate for keyword in ("프로토타입", "앱", "알림", "일정", "추천")):
+            return candidate.strip(" .")
+    return ""
+
+
+def _build_acceptance_updates(
+    state: AgentState,
+    current_data: dict[str, object],
+) -> tuple[dict[str, object], dict[str, dict[str, object]]]:
+    user_message = _effective_user_message(state)
+    if not _looks_like_accept_recommendation(user_message):
+        return {}, {}
+    if _is_valid_collected_value("goal", current_data.get("goal")):
+        return {}, {}
+
+    accepted_goal = _extract_recent_goal_recommendation(state)
+    if not accepted_goal:
+        return {}, {}
+
+    return {"goal": accepted_goal}, {
+        "goal": {
+            "source": "accepted_recommendation",
+            "raw_evidence": user_message,
+            "intent": "correct_info",
+        }
+    }
 
 
 def _is_initial_button_selection(state: AgentState) -> bool:
@@ -476,21 +534,23 @@ def _call_llm_decision(
 [?ъ슜??硫붿떆吏]
 {user_message}
 
-?듬? 洹쒖튃:
-- ?ъ슜???붿껌??癒쇱? 吏곸젒 ?듯븯?몄슂. 200???대궡濡?媛꾧껐?섍쾶.
-- 怨좉컼吏??留먰닾媛 ?꾨땶 ?ㅼ슜?곸씤 PM 留먰닾瑜??ъ슜?섏꽭??
-- '醫뗭븘??, '?뚭쿋?듬땲??, '諛섏쁺?좉쾶??, '?뺣━?좉쾶??, '?뺤씤?좉쾶?? 媛숈? 愿?⑷뎄濡??쒖옉?섏? 留덉꽭??
-- ?댁쟾 硫붿떆吏? ?숈씪?섍굅???좎궗???댁슜??諛섎났?섏? 留덉꽭??
+응답 규칙:
+- 답변은 2~4문장 이내. 한 번에 하나의 항목만 다룬다. 다른 미결정 항목은 이번 턴에 먼저 언급하지 않는다.
+- 추천이 필요하면 최대 1개를 기본값으로 제시한다. A/B/C 선택지를 나열하지 않는다.
+- 마지막 문장은 반드시 '응', '그걸로', '수정할게' 정도로 답할 수 있는 확인 질문 하나만 둔다.
+- 고객님 말투가 아닌 친근한 코치 말투를 사용하세요.
+- '좋아요', '알겠습니다', '반영하겠습니다' 같은 앞구문으로 시작하지 마세요.
+- 이전 메시지와 동일하거나 유사한 내용을 반복하지 마세요.
 - {ask_rule}
-- updates: ?대쾲 ??붿뿉???ъ슜?먭? 紐낆떆?곸쑝濡??쒓났???ъ떎留??ы븿?섏꽭??
-- value???ъ슜???먮Ц??洹몃?濡?蹂듭궗?섏? 留먭퀬 臾몄꽌???ㅼ뼱媛????덈뒗 以묐┰?곸씠怨?紐낇솗???쒗쁽?쇰줈 rephrase?섏꽭??
-- ?ъ슜?먭? 留먰븯吏 ?딆? ?ъ떎??異붽??섏? 留덉꽭??
-- 吏덈Ц, ?꾩? ?붿껌, 異붿쿇 ?붿껌, ?붿빟 ?붿껌? updates???ｌ? 留덉꽭??
-- raw_evidence?먮뒗 ?ㅼ젣 ?ъ슜??硫붿떆吏?먯꽌 洹쇨굅媛 ?섎뒗 吏㏃? ?먮Ц???ｌ쑝?몄슂.
-- confidence媛 ??굅???ъ떎 ?쒓났???꾨땲硫?is_user_provided_fact=false濡??먯꽭??
+- updates: 이번 턴에서 사용자가 명시적으로 공유한 사실만 포함하세요.
+- value에 사용자 문장을 그대로 복사하지 말고 문서에 어울리는 중립적이고 명확한 표현으로 rephrase하세요.
+- 사용자가 말하지 않은 사실은 추가하지 마세요.
+- 질문, 요약 요청, 추천 요청, 확인 요청은 updates에 넣지 마세요.
+- raw_evidence에는 실제 사용자 메시지에서 근거가 있는 짧은 인용문을 넣으세요.
+- confidence가 높은 사실 공유가 아니면 is_user_provided_fact=false로 하세요.
 - next_field: 팀이 다음에 결정해야 할 항목 이름. 없으면 빈 문자열
-  (subject/title/goal/targetUser/teamSize/roles/dueDate/deliverables 以??섎굹)
-- ?꾨뱶 蹂??紐낆쓣 ?멸툒?섏? ?딆쓣 寃?JSON 異쒕젰 (?ㅻⅨ ?띿뒪???놁씠 JSON留?:
+  (subject/title/goal/targetUser/teamSize/roles/dueDate/deliverables 중 하나)
+- 필드 이름을 언급하지 말 것. JSON만 출력 (다른 텍스트 없이 JSON만):
 {{
   "intent": "provide_info | ask_help | ask_summary | request_next_step | correct_info | meta | other",
   "response_mode": "answer | answer_then_ask | ask_only",
@@ -647,6 +707,10 @@ def _apply_llm_updates(
     user_message = _effective_user_message(state)
     raw_data_updates = dict(llm_result.get("data_updates") or {})
     candidate_sources = dict(llm_result.get("update_sources") or {})
+    acceptance_updates, acceptance_sources = _build_acceptance_updates(state, current_data)
+    for key, value in acceptance_updates.items():
+        raw_data_updates.setdefault(key, value)
+        candidate_sources.setdefault(key, acceptance_sources.get(key, {}))
     for key, value in raw_data_updates.items():
         candidate_sources.setdefault(
             key,

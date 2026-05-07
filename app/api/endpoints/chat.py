@@ -7,7 +7,10 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, root_validator
 
-from app.ai.graph.topic_presence import _matches_topic_presence_button_message
+from app.ai.graph.topic_presence import (
+    _is_topic_presence_negative_message,
+    _matches_topic_presence_button_message,
+)
 from app.ai.graph.text_support import (
     strip_mates_mention as _strip_mates_mention,
     truncate_message as _truncate_content,
@@ -32,6 +35,9 @@ from app.core.request_normalization import (
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+CHAT_RESPONSE_MAX_CHARS = 900
+_EXECUTION_FACT_FIELDS = {"goal", "teamSize", "roles", "dueDate", "deliverables"}
 
 _VALID_SLOT_FIELDS = {
     "subject",
@@ -110,6 +116,81 @@ def _should_promote_selected_message_to_content(action_type: str, message: str |
     return True
 
 
+def _normalize_chat_collected_data(data: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(normalize_collected_data(data))
+
+    # Spring currently sends the chat room/project display name as collectedData.title.
+    # In chat collection, subject is the reliable topic anchor; title-only payloads
+    # should not make the AI think the user already has a project topic.
+    subject = normalize_optional_string(normalized.get("subject"))
+    if subject:
+        normalized["title"] = subject
+        return normalized
+
+    if "title" in normalized and not any(field in normalized for field in _EXECUTION_FACT_FIELDS):
+        normalized.pop("title", None)
+
+    return normalized
+
+
+def _build_initial_button_message(content: str, next_phase: str) -> str:
+    if next_phase == "EXPLORE" or _is_topic_presence_negative_message(content):
+        return (
+            "괜찮아요. 아직 주제가 없어도 됩니다. 관심 분야나 최근에 불편했던 경험을 "
+            "한 줄로 말해 주세요."
+        )
+    return "좋아요. 준비한 프로젝트 주제를 한 줄로 알려주세요."
+
+
+def _resolve_next_question_field(
+    *,
+    phase: str,
+    collected_data: Dict[str, Any],
+    approved_updates: Dict[str, Any],
+    rejected_updates: Dict[str, Any],
+    followup_fields: List[str],
+    proposed_field: str | None,
+) -> str:
+    if phase == "GATHER" and "goal" not in collected_data and "goal" not in approved_updates:
+        return "goal"
+    if "goal" in approved_updates and "roles" not in collected_data:
+        return "roles"
+    return _normalize_slot_name(proposed_field) or choose_next_question_field(
+        collected_data,
+        current_phase=phase,
+        followup_fields=followup_fields,
+        rejected_updates=rejected_updates,
+    )
+
+
+def _postprocess_ai_message(
+    *,
+    message: str,
+    phase: str,
+    approved_updates: Dict[str, Any],
+    collected_data: Dict[str, Any],
+    next_question_field: str,
+    content: str,
+) -> str:
+    cleaned = str(message or "").strip()
+    if not cleaned and phase in {"EXPLORE", "TOPIC_SET"} and _matches_topic_presence_button_message(content):
+        return _build_initial_button_message(content, phase)
+
+    if "goal" in approved_updates and next_question_field == "roles":
+        team_size = collected_data.get("teamSize")
+        suffix = (
+            f" {team_size}인 기준으로 각자 맡을 역할을 알려주세요."
+            if team_size
+            else " 다음으로 역할 분담을 알려주세요."
+        )
+        return "목표를 확정했습니다." + suffix
+
+    if "teamSize" in approved_updates and next_question_field == "goal":
+        return f"팀 인원 {approved_updates['teamSize']}명 확인했습니다. 다음으로 프로젝트 목표를 한 줄로 정해 주세요."
+
+    return cleaned
+
+
 class AIChatRequest(BaseModel):
     roomId: int
     content: str = ""
@@ -153,7 +234,7 @@ class AIChatRequest(BaseModel):
         payload["currentStatus"] = normalize_phase(
             payload.get("currentStatus"), default="EXPLORE"
         )
-        payload["collectedData"] = normalize_collected_data(
+        payload["collectedData"] = _normalize_chat_collected_data(
             payload.get("collectedData")
         )
         payload["projectName"] = normalize_optional_string(
@@ -350,11 +431,21 @@ async def process_chat(request: AIChatRequest):
             if key in rejected_updates
         }
         followup_fields = result.get("followup_fields", [])
-        next_question_field = _normalize_slot_name(result.get("next_question_field")) or choose_next_question_field(
-            response_collected_data,
-            current_phase=response_phase,
-            followup_fields=followup_fields,
+        next_question_field = _resolve_next_question_field(
+            phase=response_phase,
+            collected_data=response_collected_data,
+            approved_updates=approved_updates,
             rejected_updates=rejected_updates,
+            followup_fields=followup_fields,
+            proposed_field=result.get("next_question_field"),
+        )
+        response_message = _postprocess_ai_message(
+            message=result.get("ai_message", ""),
+            phase=response_phase,
+            approved_updates=approved_updates,
+            collected_data=response_collected_data,
+            next_question_field=next_question_field,
+            content=request.content,
         )
         response_phase_trace = build_phase_derivation_trace(
             internal_response_collected_data,
@@ -382,11 +473,11 @@ async def process_chat(request: AIChatRequest):
             result.get("is_sufficient", False),
             internal_response_collected_data,
             response_collected_data,
-            result.get("ai_message", ""),
+            response_message,
         )
 
         return AIChatResponse(
-            content=_truncate_content(result.get("ai_message", "")),
+            content=_truncate_content(response_message, max_chars=CHAT_RESPONSE_MAX_CHARS),
             suggestedQuestions=_build_suggested_questions(
                 phase=response_phase,
                 collected_data=response_collected_data,
