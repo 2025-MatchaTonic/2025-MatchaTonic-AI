@@ -45,7 +45,11 @@ def invoke_llm(
     try:
         response = llm.invoke(prompt, **kwargs)
     except Exception:
-        logger.exception("%s failed in %.2fs", label, perf_counter() - started_at)
+        logger.exception(
+            "%s failed in %.2fs — LLM unavailable, caller will use fallback",
+            label,
+            perf_counter() - started_at,
+        )
         return None
     if cache_key is not None:
         if len(LLM_RESPONSE_CACHE) >= LLM_RESPONSE_CACHE_MAX_ITEMS:

@@ -45,11 +45,7 @@ FIELD_POLICY: Dict[str, dict[str, object]] = {
     },
 }
 
-
-class OverwriteMode(str, Enum):
-    NONE = "NONE"
-    EXPLICIT = "EXPLICIT"
-    STRONG_RESTATEMENT = "STRONG_RESTATEMENT"
+LLM_DECISION_MIN_CONFIDENCE = 0.65
 
 
 class ConflictSeverity(str, Enum):
@@ -212,70 +208,11 @@ ROLE_VALUE_PREFIX_PATTERN = re.compile(
     re.IGNORECASE,
 )
 ROLE_VALUE_SPLIT_PATTERN = re.compile(r"\s*(?:,|/| 및 | 와 | 과 | 그리고 )\s*")
-ROLE_COUNT_TOKEN_PATTERN = re.compile(
-    r"^\s*(.+?)\s+(\d{1,2})\s*명(?:\s*씩)?(?:\s*(?:으로|로).*)?\s*$"
-)
 ROLE_TRAILING_PARTICLE_PATTERN = re.compile(r"(?:으로|로|은|는|이|가)$")
-
-
-EXPLICIT_CORRECTION_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"\b(?:아니|아니요|아니고|아니라|정정하면|수정하면|수정할게|수정은)\b"),
-    re.compile(r"\b(?:다시|바꾸면|바꿀게|정확히는|말고)\b"),
-)
-STRONG_RESTATEMENT_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
-    "__all__": (
-        re.compile(r"정리하면"),
-        re.compile(r"최종적으로"),
-        re.compile(r"최종안은"),
-        re.compile(r"확정하면"),
-    ),
-    "dueDate": (
-        re.compile(r"마감은"),
-        re.compile(r"데드라인은"),
-    ),
-    "goal": (
-        re.compile(r"목표는"),
-    ),
-    "deliverables": (
-        re.compile(r"산출물은"),
-        re.compile(r"결과물은"),
-    ),
-    "roles": (
-        re.compile(r"역할은"),
-        re.compile(r"역할 구성이"),
-    ),
-}
-STRONG_RESTATEMENT_ENDINGS: tuple[re.Pattern[str], ...] = (
-    re.compile(r".+로 잡았어요"),
-    re.compile(r".+입니다(?:\s*\.?)?$"),
-)
-APPROXIMATE_DUE_DATE_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"쯤"),
-    re.compile(r"정도"),
-    re.compile(r"예정"),
-    re.compile(r"아마"),
-    re.compile(r"중순"),
-    re.compile(r"초[에쯤]?"),
-    re.compile(r"말[쯤]?"),
-)
 
 
 def _clean_string(value: object) -> str:
     return value.strip() if isinstance(value, str) else ""
-
-
-def is_placeholder_value(value: object) -> bool:
-    if value is None:
-        return True
-    if isinstance(value, (list, tuple, set)):
-        return len(value) == 0 or all(is_placeholder_value(item) for item in value)
-
-    cleaned = _clean_string(value)
-    if not cleaned:
-        return True
-
-    normalized = cleaned.lower()
-    return normalized in PLACEHOLDER_VALUE_KEYWORDS
 
 
 def is_request_like_value(value: object) -> bool:
@@ -283,7 +220,10 @@ def is_request_like_value(value: object) -> bool:
     if not cleaned:
         return False
     normalized = cleaned.lower()
-    return any(keyword in normalized for keyword in REQUEST_LIKE_VALUE_KEYWORDS)
+    if any(keyword in normalized for keyword in REQUEST_LIKE_VALUE_KEYWORDS):
+        return True
+    extra_keywords = ("도와줘", "도와 줘", "도움 필요", "같이 정하자")
+    return any(keyword in normalized for keyword in extra_keywords)
 
 
 def is_undecided_value(value: object) -> bool:
@@ -293,7 +233,12 @@ def is_undecided_value(value: object) -> bool:
     normalized = cleaned.lower()
     if any(keyword in normalized for keyword in NEGATIVE_VALUE_KEYWORDS):
         return True
-    return any(pattern.match(cleaned) for pattern in NON_COMMITTAL_VALUE_PATTERNS)
+    if any(pattern.match(cleaned) for pattern in NON_COMMITTAL_VALUE_PATTERNS):
+        return True
+    return bool(
+        re.match(r"^\s*아직\s+정하지\s+못했", cleaned)
+        or re.match(r"^\s*아직\s+못\s+정했", cleaned)
+    )
 
 
 def is_meta_conversation(value: object) -> bool:
@@ -332,6 +277,10 @@ def _looks_like_room_title_metadata(value: object) -> bool:
         return False
 
     compact = re.sub(r"\s+", "", cleaned)
+    # Check promate/test numeric patterns (case-insensitive)
+    if re.fullmatch(r"(?:promate|test)\d+", compact.lower()):
+        return True
+
     if len(compact) < 3 or len(compact) > 16:
         return False
 
@@ -351,6 +300,32 @@ def looks_like_non_committal_value(value: object) -> bool:
     return is_request_like_value(cleaned) or is_undecided_value(cleaned) or is_meta_conversation(
         cleaned
     )
+
+
+def _is_structurally_valid_collected_value(
+    key: str,
+    value: object,
+    *,
+    team_size: object = None,
+) -> bool:
+    cleaned = _clean(key, value)
+    if not cleaned:
+        return False
+
+    normalized = cleaned.lower()
+    if "@mates" in normalized or "?" in cleaned:
+        return False
+    if is_placeholder_value(cleaned):
+        return False
+    if key in {"subject", "title"} and _looks_like_identifier_noise(cleaned):
+        return False
+    if key in {"subject", "title"} and _looks_like_room_title_metadata(cleaned):
+        return False
+    if key in {"title", "goal"} and re.fullmatch(r"\d+(?:\.\d+)?", cleaned):
+        return False
+    if _looks_like_guidance_placeholder(key, cleaned):
+        return False
+    return True
 
 
 def normalize_team_size(value: object) -> int | None:
@@ -447,58 +422,6 @@ def _split_role_tokens(text: str) -> list[str]:
     return [part.strip() for part in ROLE_VALUE_SPLIT_PATTERN.split(stripped) if part.strip()]
 
 
-def _parse_explicit_role_counts(value: str) -> list[tuple[str, int]] | None:
-    tokens = _split_role_tokens(value)
-    if not tokens:
-        return None
-
-    parsed: list[tuple[str, int]] = []
-    for token in tokens:
-        match = ROLE_COUNT_TOKEN_PATTERN.fullmatch(token)
-        if not match:
-            return None
-
-        role = _normalize_role_label(match.group(1))
-        count = int(match.group(2))
-        if not role or count <= 0:
-            return None
-        parsed.append((role, count))
-
-    return parsed or None
-
-
-def normalize_roles(value: object) -> list[str] | None:
-    if value is None or isinstance(value, bool):
-        return None
-
-    if isinstance(value, (list, tuple, set)):
-        normalized = [_normalize_role_label(item) for item in value]
-        cleaned = [role for role in normalized if role]
-        return _number_duplicate_roles(cleaned) or None
-
-    if not isinstance(value, str):
-        return None
-
-    cleaned = value.strip()
-    if not cleaned:
-        return None
-
-    counted_roles = _parse_explicit_role_counts(cleaned)
-    if counted_roles:
-        expanded_roles: list[str] = []
-        for role, count in counted_roles:
-            expanded_roles.extend([role] * count)
-        return _number_duplicate_roles(expanded_roles) or None
-
-    split_roles = [_normalize_role_label(token) for token in _split_role_tokens(cleaned)]
-    normalized = [role for role in split_roles if role]
-    if normalized:
-        return _number_duplicate_roles(normalized)
-
-    single_role = _normalize_role_label(cleaned)
-    return [single_role] if single_role else None
-
-
 def format_collected_value(key: str, value: object) -> str:
     if key == "teamSize":
         team_size = normalize_team_size(value)
@@ -516,14 +439,6 @@ def format_collected_value(key: str, value: object) -> str:
         return str(value)
 
     return _clean_string(value)
-
-
-def has_role_team_size_conflict(roles: object, team_size: object) -> bool:
-    normalized_roles = normalize_roles(roles)
-    normalized_team_size = normalize_team_size(team_size)
-    if not normalized_roles or normalized_team_size is None:
-        return False
-    return len(normalized_roles) > normalized_team_size
 
 
 def classify_role_team_size_conflict(
@@ -547,82 +462,6 @@ def classify_role_team_size_conflict(
     if role_count >= hard_threshold:
         return ConflictSeverity.HARD
     return ConflictSeverity.SOFT
-
-
-def is_explicit_correction_message(user_message: str) -> bool:
-    cleaned = _clean_string(user_message)
-    if not cleaned:
-        return False
-    return any(pattern.search(cleaned) for pattern in EXPLICIT_CORRECTION_PATTERNS)
-
-
-def _strong_restatement_matches_key(key: str, user_message: str) -> bool:
-    patterns = STRONG_RESTATEMENT_PATTERNS.get("__all__", ()) + STRONG_RESTATEMENT_PATTERNS.get(
-        key,
-        (),
-    )
-    return any(pattern.search(user_message) for pattern in patterns)
-
-
-def _has_explicit_update_intent(key: str, user_message: str) -> bool:
-    cleaned = _clean_string(user_message)
-    if not cleaned:
-        return False
-
-    shared_tokens = (
-        "바꿀래",
-        "바꿀게",
-        "바꾸자",
-        "바꿔줘",
-        "변경할래",
-        "변경할게",
-        "변경하자",
-        "변경해줘",
-        "수정할래",
-        "수정할게",
-        "수정하자",
-        "수정해줘",
-    )
-    if any(token in cleaned for token in shared_tokens):
-        return True
-
-    field_tokens = {
-        "goal": ("목표",),
-        "subject": ("주제",),
-        "title": ("제목",),
-        "dueDate": ("마감", "데드라인"),
-        "deliverables": ("산출물", "결과물"),
-        "roles": ("역할",),
-    }
-    return any(token in cleaned for token in field_tokens.get(key, ())) and any(
-        token in cleaned for token in ("다시", "말고", "정확히는")
-    )
-
-
-def detect_overwrite_mode(
-    *,
-    key: str,
-    current_value: object,
-    incoming_value: object,
-    user_message: str,
-) -> OverwriteMode:
-    current_normalized = normalize_collected_value(key, current_value)
-    incoming_normalized = normalize_collected_value(key, incoming_value)
-    if current_normalized is None or incoming_normalized is None:
-        return OverwriteMode.NONE
-    if current_normalized == incoming_normalized:
-        return OverwriteMode.NONE
-
-    cleaned_message = _clean_string(user_message)
-    if not cleaned_message:
-        return OverwriteMode.NONE
-    if is_explicit_correction_message(cleaned_message):
-        return OverwriteMode.EXPLICIT
-    if _strong_restatement_matches_key(key, cleaned_message) or any(
-        pattern.search(cleaned_message) for pattern in STRONG_RESTATEMENT_ENDINGS
-    ):
-        return OverwriteMode.STRONG_RESTATEMENT
-    return OverwriteMode.NONE
 
 
 def _merge_additive_values(
@@ -657,19 +496,19 @@ def _merge_additive_values(
     return None
 
 
-def _is_approximate_due_date(value: object) -> bool:
-    cleaned = _clean_string(value)
-    if not cleaned:
-        return False
-    return any(pattern.search(cleaned) for pattern in APPROXIMATE_DUE_DATE_PATTERNS)
-
-
 def normalize_collected_value(
     key: str,
     value: object,
     *,
     team_size: object = None,
 ) -> CollectedDataValue | None:
+    # Handle deliverables list by joining into a semicolon-separated string
+    if key == "deliverables" and isinstance(value, (list, tuple, set)):
+        parts = [_clean_string(item) for item in value if _clean_string(item)]
+        if not parts:
+            return None
+        return "; ".join(parts)
+
     if is_placeholder_value(value):
         return None
 
@@ -678,11 +517,7 @@ def normalize_collected_value(
 
     if key == "roles":
         normalized_roles = normalize_roles(value)
-        if not normalized_roles:
-            return None
-        if has_role_team_size_conflict(normalized_roles, team_size):
-            return None
-        return normalized_roles
+        return normalized_roles or None
 
     cleaned = _clean_string(value)
     return cleaned or None
@@ -705,41 +540,35 @@ def _effective_team_size(
     return normalize_team_size((current_data or {}).get("teamSize"))
 
 
-def build_role_team_size_conflict_message(roles: object, team_size: object) -> str:
-    normalized_roles = normalize_roles(roles) or []
-    normalized_team_size = normalize_team_size(team_size)
-    if not normalized_roles or normalized_team_size is None:
-        return ""
-
-    return (
-        f"역할 인원 합계가 {len(normalized_roles)}명인데 현재 팀 인원은 "
-        f"{normalized_team_size}명입니다. 역할 구성이나 팀 인원을 다시 확인해 주세요."
-    )
-
-
-def is_valid_collected_value(key: str, value: object, *, team_size: object = None) -> bool:
-    cleaned = _clean(key, value)
+def _looks_like_guidance_placeholder(key: str, value: object) -> bool:
+    cleaned = _clean_string(value)
     if not cleaned:
         return False
 
-    normalized = cleaned.lower()
-    if "@mates" in normalized or "?" in cleaned:
-        return False
-    if is_meta_conversation(cleaned):
-        return False
-    if is_placeholder_value(cleaned):
-        return False
-    if any(keyword in normalized for keyword in NEGATIVE_VALUE_KEYWORDS):
-        return False
-    if looks_like_non_committal_value(cleaned):
-        return False
-    if key in {"subject", "title"} and _looks_like_identifier_noise(cleaned):
-        return False
-    if key in {"subject", "title"} and _looks_like_room_title_metadata(cleaned):
-        return False
-    if key in {"title", "goal"} and re.fullmatch(r"\d+(?:\.\d+)?", cleaned):
-        return False
-    return True
+    if key == "goal":
+        return any(
+            marker in cleaned
+            for marker in (
+                "목표는 이렇게 잡아볼 수 있어요",
+                "이렇게 잡아볼 수 있어요",
+                "그 문제라면 목표는",
+            )
+        )
+
+    if key == "problemArea":
+        return bool(
+            re.match(r"^\s*(?:주\s*사용자|주요\s*사용자)\s*(?:은|는|이|가|:)", cleaned)
+        )
+
+    return False
+
+
+def is_valid_collected_value(key: str, value: object, *, team_size: object = None) -> bool:
+    return _is_structurally_valid_collected_value(
+        key,
+        value,
+        team_size=team_size,
+    )
 
 
 def normalize_scalar_field(value: object) -> str | None:
@@ -755,36 +584,24 @@ def normalize_roles_field(value: object) -> list[str] | None:
     return normalize_roles(value)
 
 
-def sanitize_llm_updated_data(raw_updated_data: object) -> CollectedData:
-    if not isinstance(raw_updated_data, Mapping):
-        return {}
+def _normalize_auxiliary_value(key: str, value: object) -> str | None:
+    cleaned = _clean_string(value)
+    if not cleaned or is_placeholder_value(cleaned):
+        return None
+    if _looks_like_guidance_placeholder(key, cleaned):
+        return None
+    if key == "projectName":
+        return cleaned
+    return cleaned
 
-    sanitized: CollectedData = {}
-    normalized_team_size = normalize_team_size(raw_updated_data.get("teamSize"))
-    if normalized_team_size is not None:
-        sanitized["teamSize"] = normalized_team_size
 
-    for key in COLLECTED_DATA_FIELDS:
-        if key == "teamSize":
-            continue
-
-        value = raw_updated_data.get(key)
-        if key == "roles":
-            normalized_value = normalize_roles_field(value)
-        else:
-            normalized_value = normalize_collected_value(
-                key,
-                normalize_scalar_field(value),
-                team_size=normalized_team_size,
-            )
-
-        if normalized_value is None:
-            continue
-        if not is_valid_collected_value(key, normalized_value, team_size=normalized_team_size):
-            continue
-        sanitized[key] = normalized_value
-
-    return sanitized
+def _preserve_auxiliary_state_fields(data: Mapping[str, object] | None) -> CollectedData:
+    preserved: CollectedData = {}
+    for key in AUXILIARY_STATE_FIELDS:
+        normalized_value = _normalize_auxiliary_value(key, (data or {}).get(key))
+        if normalized_value is not None:
+            preserved[key] = normalized_value
+    return preserved
 
 
 def sanitize_collected_data(data: Mapping[str, object] | None) -> CollectedData:
@@ -805,6 +622,9 @@ def sanitize_collected_data(data: Mapping[str, object] | None) -> CollectedData:
         if normalized_value is not None:
             sanitized[key] = normalized_value
 
+    if _looks_like_room_title_metadata(sanitized.get("title")):
+        sanitized.pop("title", None)
+    sanitized.update(_preserve_auxiliary_state_fields(data))
     return sanitized
 
 
@@ -813,9 +633,16 @@ def sanitize_candidate_updates(
     *,
     current_data: Mapping[str, object] | None = None,
 ) -> CollectedData:
+    normalized_payload = dict(updated_data or {})
+    if isinstance(normalized_payload.get("deliverables"), (list, tuple, set)):
+        normalized_payload["deliverables"] = normalize_collected_value(
+            "deliverables",
+            normalized_payload.get("deliverables"),
+        )
+
     sanitized: CollectedData = {}
-    team_size = _effective_team_size(current_data, updated_data)
-    normalized_team_size = normalize_team_size((updated_data or {}).get("teamSize"))
+    team_size = _effective_team_size(current_data, normalized_payload)
+    normalized_team_size = normalize_team_size(normalized_payload.get("teamSize"))
     if normalized_team_size is not None:
         sanitized["teamSize"] = normalized_team_size
 
@@ -823,7 +650,7 @@ def sanitize_candidate_updates(
         if key == "teamSize":
             continue
 
-        value = (updated_data or {}).get(key)
+        value = normalized_payload.get(key)
         if not is_valid_collected_value(key, value, team_size=team_size):
             continue
 
@@ -831,45 +658,10 @@ def sanitize_candidate_updates(
         if normalized_value is not None:
             sanitized[key] = normalized_value
 
+    preserved = _preserve_auxiliary_state_fields(current_data)
+    preserved.update(_preserve_auxiliary_state_fields(normalized_payload))
+    sanitized.update(preserved)
     return sanitized
-
-
-def normalize_collected_value(
-    key: str,
-    value: object,
-    *,
-    team_size: object = None,
-) -> CollectedDataValue | None:
-    if is_placeholder_value(value):
-        return None
-
-    if key == "teamSize":
-        return normalize_team_size(value)
-
-    if key == "roles":
-        normalized_roles = normalize_roles(value)
-        return normalized_roles or None
-
-    cleaned = _clean_string(value)
-    return cleaned or None
-
-
-def build_role_team_size_conflict_message(roles: object, team_size: object) -> str:
-    normalized_roles = normalize_roles(roles) or []
-    normalized_team_size = normalize_team_size(team_size)
-    if not normalized_roles or normalized_team_size is None:
-        return ""
-
-    severity = classify_role_team_size_conflict(normalized_roles, normalized_team_size)
-    if severity == ConflictSeverity.HARD:
-        return (
-            f"역할 인원 합계가 {len(normalized_roles)}명인데 현재 총 인원은 "
-            f"{normalized_team_size}명입니다. 현재 정보로는 설명이 어려워서 역할 구성이나 총 인원을 다시 확인해 주세요."
-        )
-    return (
-        f"역할 인원 합계가 {len(normalized_roles)}명인데 현재 총 인원은 "
-        f"{normalized_team_size}명입니다. 겸임 기준인지 포함해서 역할 구성이나 총 인원을 다시 확인해 주세요."
-    )
 
 
 def evaluate_candidate_update(
@@ -882,203 +674,88 @@ def evaluate_candidate_update(
     current_phase: str,
     current_data: Mapping[str, object] | None,
     candidate_updates: Mapping[str, object] | None,
+    source_metadata: Mapping[str, object] | None = None,
 ) -> CandidateDecision:
-    policy = FIELD_POLICY.get(
-        key,
-        {"overwrite": "guarded", "source_bias": "mixed", "allow_additive": False},
-    )
+    metadata = dict(source_metadata or {})
     effective_team_size = _effective_team_size(current_data, candidate_updates)
     team_size_for_key = incoming_value if key == "teamSize" else effective_team_size
     normalized_incoming = normalize_collected_value(key, incoming_value, team_size=team_size_for_key)
-    overwrite_mode = detect_overwrite_mode(
-        key=key,
-        current_value=current_value,
-        incoming_value=incoming_value,
-        user_message=user_message,
-    )
 
-    if normalized_incoming is None:
+    if normalized_incoming is None or not is_valid_collected_value(key, normalized_incoming, team_size=team_size_for_key):
         return CandidateDecision(
-            key=key,
-            approved=False,
-            normalized_value=None,
-            reason="invalid_or_empty_candidate",
-            overwrite_mode=overwrite_mode.value,
-            source=source,
-            requires_followup_question=False,
-        )
-
-    # user_message 전체가 비확정 패턴에 해당하면 텍스트 슬롯 커밋 차단
-    # substring 방식이 아닌 anchored 패턴으로만 검사해 오탐 방지
-    _TEXT_SLOT_KEYS = {"goal", "targetUser", "deliverables"}
-    if key in _TEXT_SLOT_KEYS and user_message:
-        _cleaned_msg = _clean_string(user_message)
-        if any(p.match(_cleaned_msg) for p in NON_COMMITTAL_VALUE_PATTERNS):
-            return CandidateDecision(
-                key=key,
-                approved=False,
-                normalized_value=None,
-                reason="undecided_user_message",
-                overwrite_mode=overwrite_mode.value,
-                source=source,
-                requires_followup_question=False,
-            )
-
-    if not is_valid_collected_value(key, normalized_incoming, team_size=team_size_for_key):
-        return CandidateDecision(
-            key=key,
-            approved=False,
-            normalized_value=None,
-            reason="non_committal_or_placeholder_candidate",
-            overwrite_mode=overwrite_mode.value,
-            source=source,
+            key=key, approved=False, normalized_value=None,
+            reason="invalid_or_empty_candidate", overwrite_mode="NONE", source=source,
             requires_followup_question=False,
         )
 
     current_team_size = normalize_team_size((current_data or {}).get("teamSize"))
-    current_normalized = normalize_collected_value(
-        key,
-        current_value,
-        team_size=current_team_size,
-    )
+    current_normalized = normalize_collected_value(key, current_value, team_size=current_team_size)
+
     if current_normalized == normalized_incoming:
         return CandidateDecision(
-            key=key,
-            approved=True,
-            normalized_value=normalized_incoming,
-            reason="same_as_current",
-            overwrite_mode=OverwriteMode.NONE.value,
-            source=source,
+            key=key, approved=True, normalized_value=normalized_incoming,
+            reason="same_as_current", overwrite_mode="NONE", source=source,
             requires_followup_question=False,
         )
 
-    additive_value = None
-    if policy.get("allow_additive"):
-        additive_value = _merge_additive_values(key, current_normalized, normalized_incoming)
-
-    conflict_severity = ConflictSeverity.NONE
-    requires_followup_question = False
-    if key in {"roles", "teamSize"}:
-        conflict_roles = normalized_incoming if key == "roles" else (candidate_updates or {}).get(
-            "roles",
-            (current_data or {}).get("roles"),
-        )
-        conflict_team_size = (
-            normalized_incoming
-            if key == "teamSize"
-            else (candidate_updates or {}).get("teamSize", (current_data or {}).get("teamSize"))
-        )
-        conflict_severity = classify_role_team_size_conflict(conflict_roles, conflict_team_size)
-        if conflict_severity == ConflictSeverity.HARD:
+    if source == "llm_decision":
+        confidence = metadata.get("confidence", 0)
+        try:
+            confidence_value = float(confidence)
+        except (TypeError, ValueError):
+            confidence_value = 0.0
+        raw_evidence = str(metadata.get("raw_evidence") or "").strip()
+        if confidence_value < LLM_DECISION_MIN_CONFIDENCE:
             return CandidateDecision(
-                key=key,
-                approved=False,
-                normalized_value=None,
-                reason="hard_role_team_size_conflict",
-                overwrite_mode=overwrite_mode.value,
-                source=source,
-                requires_followup_question=True,
-                conflict_severity=conflict_severity.value,
+                key=key, approved=False, normalized_value=None,
+                reason="llm_low_confidence", overwrite_mode="NONE", source=source,
+                requires_followup_question=False,
             )
-        if conflict_severity == ConflictSeverity.SOFT:
-            requires_followup_question = True
+        if not raw_evidence:
+            return CandidateDecision(
+                key=key, approved=False, normalized_value=None,
+                reason="llm_missing_raw_evidence", overwrite_mode="NONE", source=source,
+                requires_followup_question=False,
+            )
 
-    if key == "dueDate" and current_normalized is not None and _is_approximate_due_date(
-        normalized_incoming,
-    ):
-        return CandidateDecision(
-            key=key,
-            approved=False,
-            normalized_value=None,
-            reason="approximate_due_date_cannot_overwrite_confirmed_value",
-            overwrite_mode=overwrite_mode.value,
-            source=source,
-            requires_followup_question=True,
-        )
+    if key in {"roles", "teamSize"}:
+        conflict_roles = normalized_incoming if key == "roles" else (candidate_updates or {}).get("roles", (current_data or {}).get("roles"))
+        conflict_team_size = normalized_incoming if key == "teamSize" else (candidate_updates or {}).get("teamSize", (current_data or {}).get("teamSize"))
+        conflict = classify_role_team_size_conflict(conflict_roles, conflict_team_size)
+        if conflict == ConflictSeverity.HARD:
+            return CandidateDecision(
+                key=key, approved=False, normalized_value=None,
+                reason="hard_role_team_size_conflict", overwrite_mode="NONE", source=source,
+                requires_followup_question=True, conflict_severity=conflict.value,
+            )
 
-    if current_normalized is None:
-        return CandidateDecision(
-            key=key,
-            approved=True,
-            normalized_value=normalized_incoming,
-            reason="new_fact_approved",
-            overwrite_mode=overwrite_mode.value,
-            source=source,
-            requires_followup_question=requires_followup_question,
-            conflict_severity=conflict_severity.value,
-        )
+    policy = FIELD_POLICY.get(key, {"allow_additive": False})
+    if policy.get("allow_additive") and current_normalized is not None:
+        additive = _merge_additive_values(key, current_normalized, normalized_incoming)
+        if additive is not None:
+            return CandidateDecision(
+                key=key, approved=True, normalized_value=additive,
+                reason="additive_update_approved", overwrite_mode="NONE", source=source,
+                requires_followup_question=False,
+            )
 
-    if key in {"subject", "title"} and source == "direct_structured" and current_phase in {
-        "TOPIC_SET",
-        "PROBLEM_DEFINE",
-    }:
-        return CandidateDecision(
-            key=key,
-            approved=True,
-            normalized_value=normalized_incoming,
-            reason="topic_field_direct_structured_override",
-            overwrite_mode=overwrite_mode.value,
-            source=source,
-            requires_followup_question=requires_followup_question,
-            conflict_severity=conflict_severity.value,
-        )
-
-    if additive_value is not None:
-        return CandidateDecision(
-            key=key,
-            approved=True,
-            normalized_value=additive_value,
-            reason="additive_update_approved",
-            overwrite_mode=overwrite_mode.value,
-            source=source,
-            requires_followup_question=requires_followup_question,
-            conflict_severity=conflict_severity.value,
-        )
-
-    # Numeric team-size answers are explicit enough to replace the prior value.
     if (
-        key == "teamSize"
-        and source == "direct_structured"
+        source == "llm_decision"
         and current_normalized is not None
+        and metadata.get("intent") != "correct_info"
     ):
         return CandidateDecision(
-            key=key,
-            approved=True,
-            normalized_value=normalized_incoming,
-            reason="teamSize_direct_numeric_overwrite",
-            overwrite_mode=overwrite_mode.value,
-            source=source,
-            requires_followup_question=requires_followup_question,
-            conflict_severity=conflict_severity.value,
+            key=key, approved=False, normalized_value=None,
+            reason="llm_overwrite_requires_confirmation", overwrite_mode="CONFIRM",
+            source=source, requires_followup_question=True,
         )
-
-    if overwrite_mode in {OverwriteMode.EXPLICIT, OverwriteMode.STRONG_RESTATEMENT}:
-        return CandidateDecision(
-            key=key,
-            approved=True,
-            normalized_value=normalized_incoming,
-            reason="overwrite_approved",
-            overwrite_mode=overwrite_mode.value,
-            source=source,
-            requires_followup_question=requires_followup_question,
-            conflict_severity=conflict_severity.value,
-        )
-
-    overwrite_policy = str(policy.get("overwrite") or "guarded")
-    if overwrite_policy == "strict":
-        reason = "protected_field_requires_explicit_or_strong_restatement"
-    else:
-        reason = "guarded_field_kept_existing_value"
 
     return CandidateDecision(
-        key=key,
-        approved=False,
-        normalized_value=None,
-        reason=reason,
-        overwrite_mode=overwrite_mode.value,
+        key=key, approved=True, normalized_value=normalized_incoming,
+        reason="approved",
+        overwrite_mode="EXPLICIT" if source == "llm_decision" and current_normalized is not None else "NONE",
         source=source,
-        requires_followup_question=requires_followup_question,
-        conflict_severity=conflict_severity.value,
+        requires_followup_question=False,
     )
 
 
@@ -1188,39 +865,6 @@ def normalize_roles(value: object) -> list[str] | None:
     return [single_role] if single_role else None
 
 
-def detect_overwrite_mode(
-    *,
-    key: str,
-    current_value: object,
-    incoming_value: object,
-    user_message: str,
-) -> OverwriteMode:
-    current_normalized = normalize_collected_value(key, current_value)
-    incoming_normalized = normalize_collected_value(key, incoming_value)
-    if current_normalized is None or incoming_normalized is None:
-        return OverwriteMode.NONE
-    if current_normalized == incoming_normalized:
-        return OverwriteMode.NONE
-
-    cleaned_message = _clean_string(user_message)
-    if not cleaned_message:
-        return OverwriteMode.NONE
-    if is_explicit_correction_message(cleaned_message):
-        return OverwriteMode.EXPLICIT
-    if _has_explicit_update_intent(key, cleaned_message):
-        return OverwriteMode.EXPLICIT
-    if key in {"subject", "title", "goal", "dueDate", "deliverables", "roles"} and re.match(
-        r"^\s*(?:주제|제목|목표|마감|산출물|결과물|역할)\s*[:：]",
-        cleaned_message,
-    ):
-        return OverwriteMode.EXPLICIT
-    if _strong_restatement_matches_key(key, cleaned_message) or any(
-        pattern.search(cleaned_message) for pattern in STRONG_RESTATEMENT_ENDINGS
-    ):
-        return OverwriteMode.STRONG_RESTATEMENT
-    return OverwriteMode.NONE
-
-
 def missing_collected_fields(data: Mapping[str, object] | None) -> list[str]:
     sanitized = sanitize_collected_data(data)
     missing: list[str] = []
@@ -1295,10 +939,6 @@ def has_problem_definition_context(data: Mapping[str, object] | None) -> bool:
         or _normalize_auxiliary_value("targetFacility", sanitized.get("targetFacility"))
         or _normalize_auxiliary_value("targetUser", sanitized.get("targetUser"))
     )
-
-
-def has_any_collected_fact(data: Mapping[str, object] | None) -> bool:
-    return bool(sanitize_collected_data(data))
 
 
 def build_phase_derivation_trace(
@@ -1394,339 +1034,6 @@ def derive_phase_from_collected_data(
     return str(trace["returned_phase"])
 
 
-def build_decision_context(
-    data: Mapping[str, object] | None,
-    *,
-    current_phase: str = "GATHER",
-    prompted_slot: str = "",
-    recent_messages: list[str] | None = None,
-    user_message: str = "",
-) -> dict[str, object]:
-    sanitized = sanitize_collected_data(data)
-    phase_trace = build_phase_derivation_trace(
-        sanitized,
-        current_phase=current_phase,
-    )
-    confirmed_facts = {
-        key: sanitized[key]
-        for key in REQUIRED_COLLECTED_DATA_FIELDS
-        if key in sanitized
-    }
-    problem_context = {
-        "problemArea": _clean_string(sanitized.get("problemArea")),
-        "targetFacility": _clean_string(sanitized.get("targetFacility")),
-        "targetUser": _clean_string(sanitized.get("targetUser")),
-    }
-    open_slots = list(missing_collected_fields(sanitized))
-    subject = _clean_string(sanitized.get("subject"))
-    if (
-        subject
-        and subject_needs_problem_definition(subject)
-        and not has_problem_definition_context(sanitized)
-        and "problemArea" not in open_slots
-    ):
-        open_slots.insert(0, "problemArea")
-
-    return {
-        "current_phase": current_phase,
-        "effective_phase": str(phase_trace["returned_phase"]),
-        "prompted_slot": prompted_slot,
-        "topic_anchor": subject or _clean_string(sanitized.get("title")),
-        "confirmed_facts": confirmed_facts,
-        "problem_definition_context": {
-            key: value for key, value in problem_context.items() if value
-        },
-        "open_slots": open_slots,
-        "recent_messages": [_clean_string(message) for message in (recent_messages or []) if _clean_string(message)],
-        "recent_user_message": _clean_string(user_message),
-        "phase_trace": phase_trace,
-    }
-
-
-def build_collected_data_guide() -> str:
-    return ", ".join(f'"{key}" ({label})' for key, label in COLLECTED_DATA_FIELDS.items())
-
-
-def build_collected_data_json_example() -> str:
-    lines = [
-        '            "subject": "..."',
-    ]
-    return "{\n" + ",\n".join(lines) + "\n        }"
-
-
-def merge_collected_data(
-    current_data: Mapping[str, object],
-    updated_data: Mapping[str, object] | None,
-) -> CollectedData:
-    merged = sanitize_collected_data(current_data)
-    sanitized_updates = sanitize_candidate_updates(updated_data, current_data=current_data)
-
-    for key in COLLECTED_DATA_FIELDS:
-        value = sanitized_updates.get(key)
-        if value is not None:
-            merged[key] = value
-
-    for key in AUXILIARY_STATE_FIELDS:
-        value = sanitized_updates.get(key)
-        if value is not None:
-            merged[key] = value
-
-    return merged
-
-
-_original_is_request_like_value = is_request_like_value
-_original_is_undecided_value = is_undecided_value
-_original_is_valid_collected_value = is_valid_collected_value
-_original_evaluate_candidate_update = evaluate_candidate_update
-
-
-def is_request_like_value(value: object) -> bool:
-    if _original_is_request_like_value(value):
-        return True
-
-    cleaned = _clean_string(value)
-    if not cleaned:
-        return False
-
-    normalized = cleaned.lower()
-    extra_keywords = ("도와줘", "도와 줘", "도움 필요", "같이 정하자")
-    return any(keyword in normalized for keyword in extra_keywords)
-
-
-def is_undecided_value(value: object) -> bool:
-    if _original_is_undecided_value(value):
-        return True
-
-    cleaned = _clean_string(value)
-    if not cleaned:
-        return False
-
-    return bool(
-        re.match(r"^\s*아직\s+정하지\s+못했", cleaned)
-        or re.match(r"^\s*아직\s+못\s+정했", cleaned)
-    )
-
-
-def looks_like_non_committal_value(value: object) -> bool:
-    cleaned = _clean_string(value)
-    if not cleaned:
-        return False
-
-    return is_request_like_value(cleaned) or is_undecided_value(cleaned) or is_meta_conversation(
-        cleaned
-    )
-
-
-def _looks_like_guidance_placeholder(key: str, value: object) -> bool:
-    cleaned = _clean_string(value)
-    if not cleaned:
-        return False
-
-    if key == "goal":
-        return any(
-            marker in cleaned
-            for marker in (
-                "목표는 이렇게 잡아볼 수 있어요",
-                "이렇게 잡아볼 수 있어요",
-                "그 문제라면 목표는",
-            )
-        )
-
-    if key == "problemArea":
-        return bool(
-            re.match(r"^\s*(?:주\s*사용자|주요\s*사용자)\s*(?:은|는|이|가|:)", cleaned)
-        )
-
-    return False
-
-
-def is_valid_collected_value(key: str, value: object, *, team_size: object = None) -> bool:
-    if not _original_is_valid_collected_value(key, value, team_size=team_size):
-        return False
-
-    cleaned = _clean(key, value)
-    if _looks_like_guidance_placeholder(key, cleaned):
-        return False
-    if key == "goal" and (is_request_like_value(cleaned) or is_undecided_value(cleaned)):
-        return False
-    return True
-
-
-def evaluate_candidate_update(
-    *,
-    key: str,
-    current_value: object,
-    incoming_value: object,
-    source: str,
-    user_message: str,
-    current_phase: str,
-    current_data: Mapping[str, object] | None,
-    candidate_updates: Mapping[str, object] | None,
-) -> CandidateDecision:
-    effective_team_size = _effective_team_size(current_data, candidate_updates)
-    team_size_for_key = incoming_value if key == "teamSize" else effective_team_size
-    normalized_incoming = normalize_collected_value(key, incoming_value, team_size=team_size_for_key)
-    current_team_size = normalize_team_size((current_data or {}).get("teamSize"))
-    current_normalized = normalize_collected_value(
-        key,
-        current_value,
-        team_size=current_team_size,
-    )
-
-    if (
-        key == "dueDate"
-        and current_normalized is not None
-        and normalized_incoming is not None
-        and str(normalized_incoming).startswith(str(current_normalized))
-        and str(normalized_incoming) != str(current_normalized)
-        and any(marker in str(normalized_incoming) for marker in ("최종 제출", "중간 발표"))
-    ):
-        overwrite_mode = detect_overwrite_mode(
-            key=key,
-            current_value=current_value,
-            incoming_value=incoming_value,
-            user_message=user_message,
-        )
-        return CandidateDecision(
-            key=key,
-            approved=True,
-            normalized_value=normalized_incoming,
-            reason="enrich_existing_due_date",
-            overwrite_mode=overwrite_mode.value,
-            source=source,
-            requires_followup_question=False,
-        )
-
-    if (
-        key == "goal"
-        and current_normalized is not None
-        and not is_valid_collected_value(key, current_normalized, team_size=current_team_size)
-        and normalized_incoming is not None
-        and is_valid_collected_value(key, normalized_incoming, team_size=team_size_for_key)
-    ):
-        overwrite_mode = detect_overwrite_mode(
-            key=key,
-            current_value=current_value,
-            incoming_value=incoming_value,
-            user_message=user_message,
-        )
-        return CandidateDecision(
-            key=key,
-            approved=True,
-            normalized_value=normalized_incoming,
-            reason="replace_unconfirmed_goal",
-            overwrite_mode=overwrite_mode.value,
-            source=source,
-            requires_followup_question=False,
-        )
-
-    return _original_evaluate_candidate_update(
-        key=key,
-        current_value=current_value,
-        incoming_value=incoming_value,
-        source=source,
-        user_message=user_message,
-        current_phase=current_phase,
-        current_data=current_data,
-        candidate_updates=candidate_updates,
-    )
-
-
-_previous_normalize_collected_value = normalize_collected_value
-_previous_sanitize_llm_updated_data = sanitize_llm_updated_data
-_previous_sanitize_candidate_updates = sanitize_candidate_updates
-_previous_sanitize_collected_data = sanitize_collected_data
-_previous_looks_like_room_title_metadata = _looks_like_room_title_metadata
-
-
-def _looks_like_room_title_metadata(value: object) -> bool:
-    cleaned = _clean_string(value)
-    if not cleaned:
-        return False
-    compact = re.sub(r"\s+", "", cleaned).lower()
-    if re.fullmatch(r"(?:promate|test)\d+", compact):
-        return True
-    return _previous_looks_like_room_title_metadata(value)
-
-
-def _normalize_auxiliary_value(key: str, value: object) -> str | None:
-    cleaned = _clean_string(value)
-    if not cleaned or looks_like_non_committal_value(cleaned):
-        return None
-    if _looks_like_guidance_placeholder(key, cleaned):
-        return None
-    if key == "projectName":
-        return cleaned
-    return cleaned
-
-
-def _preserve_auxiliary_state_fields(data: Mapping[str, object] | None) -> CollectedData:
-    preserved: CollectedData = {}
-    for key in AUXILIARY_STATE_FIELDS:
-        normalized_value = _normalize_auxiliary_value(key, (data or {}).get(key))
-        if normalized_value is not None:
-            preserved[key] = normalized_value
-    return preserved
-
-
-def normalize_collected_value(
-    key: str,
-    value: object,
-    *,
-    team_size: object = None,
-) -> CollectedDataValue | None:
-    if key == "deliverables" and isinstance(value, (list, tuple, set)):
-        parts = [_clean_string(item) for item in value if _clean_string(item)]
-        if not parts:
-            return None
-        return "; ".join(parts)
-    return _previous_normalize_collected_value(key, value, team_size=team_size)
-
-
-def sanitize_llm_updated_data(raw_updated_data: object) -> CollectedData:
-    if not isinstance(raw_updated_data, Mapping):
-        return {}
-
-    normalized_payload = dict(raw_updated_data)
-    if isinstance(raw_updated_data.get("deliverables"), (list, tuple, set)):
-        normalized_payload["deliverables"] = normalize_collected_value(
-            "deliverables",
-            raw_updated_data.get("deliverables"),
-        )
-    sanitized = _previous_sanitize_llm_updated_data(normalized_payload)
-    sanitized.update(_preserve_auxiliary_state_fields(normalized_payload))
-    return sanitized
-
-
-def sanitize_candidate_updates(
-    updated_data: Mapping[str, object] | None,
-    *,
-    current_data: Mapping[str, object] | None = None,
-) -> CollectedData:
-    normalized_payload = dict(updated_data or {})
-    if isinstance(normalized_payload.get("deliverables"), (list, tuple, set)):
-        normalized_payload["deliverables"] = normalize_collected_value(
-            "deliverables",
-            normalized_payload.get("deliverables"),
-        )
-    sanitized = _previous_sanitize_candidate_updates(
-        normalized_payload,
-        current_data=current_data,
-    )
-    preserved = _preserve_auxiliary_state_fields(current_data)
-    preserved.update(_preserve_auxiliary_state_fields(normalized_payload))
-    sanitized.update(preserved)
-    return sanitized
-
-
-def sanitize_collected_data(data: Mapping[str, object] | None) -> CollectedData:
-    sanitized = _previous_sanitize_collected_data(data)
-    if _looks_like_room_title_metadata(sanitized.get("title")):
-        sanitized.pop("title", None)
-    sanitized.update(_preserve_auxiliary_state_fields(data))
-    return sanitized
-
-
 REQUIRED_COLLECTED_DATA_FIELDS: tuple[str, ...] = (
     "subject",
     "title",
@@ -1752,248 +1059,25 @@ NEXT_FIELD_PRIORITY_BY_PHASE: dict[str, tuple[str, ...]] = {
     "DONE": ("goal", "teamSize", "roles", "dueDate", "deliverables"),
 }
 
-REQUEST_SUMMARY_KEYWORDS: tuple[str, ...] = (
-    "요약",
-    "정리해줘",
-    "정리해 줘",
-    "지금까지",
-    "현재까지",
-    "정리된 내용",
-    "확정된 내용",
-    "확정된 사항",
-)
-REQUEST_RECOMMENDATION_KEYWORDS: tuple[str, ...] = (
-    "추천",
-    "골라줘",
-    "골라 줘",
-    "정해줘",
-    "정해 줘",
-    "예시",
-    "가이드",
-    "뭐가 좋",
-)
-REQUEST_GUIDANCE_KEYWORDS: tuple[str, ...] = (
-    "도와줘",
-    "도와 줘",
-    "알려줘",
-    "알려 줘",
-    "뭐할까",
-    "뭘로 할까",
-    "다음엔 뭐해",
-    "다음엔 뭐 하지",
-)
-TITLE_CONFIRMATION_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"^\s*(?:제목|프로젝트\s*제목|이름)\s*(?:은|는|이|가|:)\s*.+", re.IGNORECASE),
-)
-TITLE_CONTEXT_CONFIRMATION_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"그\s*제목(?:으로)?\s*(?:할게|할게요|하자|해줘|해주세요)", re.IGNORECASE),
-    re.compile(r"그\s*이름(?:으로)?\s*(?:할게|할게요|하자|해줘|해주세요)", re.IGNORECASE),
-    re.compile(r"그걸로\s*(?:할게|할게요|하자)", re.IGNORECASE),
-)
-TURN_TYPES_BLOCKING_STORAGE: frozenset[str] = frozenset(
-    {
-        "meta_request",
-        "request_summary",
-        "request_fill_missing",
-        "request_goal_guidance",
-        "request_next_step",
-        "request_guided_exploration",
-        "request_refine_topic",
-    }
-)
 
-
-def detect_meta_or_request_like(
-    value: object,
-    *,
-    requested_focus: str | None = None,
-) -> dict[str, object]:
-    cleaned = _clean_string(value)
-    normalized = cleaned.lower()
-    request_like = is_request_like_value(cleaned)
-    undecided = is_undecided_value(cleaned)
-    meta = is_meta_conversation(cleaned)
-    summary = any(keyword in normalized for keyword in REQUEST_SUMMARY_KEYWORDS)
-    recommendation = any(keyword in normalized for keyword in REQUEST_RECOMMENDATION_KEYWORDS)
-    guidance = (
-        request_like
-        or any(keyword in normalized for keyword in REQUEST_GUIDANCE_KEYWORDS)
-    )
-
-    if requested_focus in {"goal", "roles", "deliverables", "title"} and request_like:
-        recommendation = recommendation or not summary
-
-    kind = "factual_answer"
-    if meta:
-        kind = "meta_or_confusion"
-    elif summary and not recommendation:
-        kind = "request_summary"
-    elif recommendation:
-        kind = "request_recommendation"
-    elif guidance or undecided:
-        kind = "request_guidance"
-
-    return {
-        "cleaned": cleaned,
-        "request_like": request_like,
-        "undecided": undecided,
-        "meta": meta,
-        "summary": summary,
-        "recommendation": recommendation,
-        "guidance": guidance,
-        "kind": kind,
-        "requested_focus": requested_focus or "",
-    }
-
-
-def normalize_slot_candidate(
-    key: str,
-    value: object,
-    *,
-    team_size: object = None,
-) -> CollectedDataValue | None:
-    normalized = normalize_collected_value(key, value, team_size=team_size)
-    if normalized is not None:
-        return normalized
-
-    if key == "teamSize":
-        cleaned = _clean_string(value)
-        match = re.search(r"(\d{1,2})\s*명", cleaned)
-        if match:
-            return int(match.group(1))
-    return None
-
-
-def should_accept_candidate(
-    *,
-    key: str,
-    current_value: object,
-    incoming_value: object,
-    source: str,
-    user_message: str,
-    current_phase: str,
-    current_data: Mapping[str, object] | None,
-    candidate_updates: Mapping[str, object] | None,
-) -> CandidateDecision:
-    return evaluate_candidate_update(
-        key=key,
-        current_value=current_value,
-        incoming_value=incoming_value,
-        source=source,
-        user_message=user_message,
-        current_phase=current_phase,
-        current_data=current_data,
-        candidate_updates=candidate_updates,
-    )
-
-
-def _infer_prompted_slot_from_messages(
-    recent_messages: list[str] | None,
-    selected_message: str | None,
-) -> str:
-    blocks: list[str] = []
-    if selected_message:
-        blocks.append(_clean_string(selected_message))
-    if recent_messages:
-        blocks.extend(_clean_string(message) for message in reversed(recent_messages[-4:]))
-
-    slot_hints = {
-        "subject": ("프로젝트 주제", "어떤 분야", "어떤 문제", "주제로"),
-        "title": ("프로젝트 제목", "제목은", "이름은", "제목으로"),
-        "goal": ("프로젝트 목표", "목표를", "목표는"),
-        "teamSize": ("총 몇 명", "몇 명", "팀원은 총"),
-        "roles": ("역할 분담", "필요한 역할", "각자 맡을 역할", "팀원 역할"),
-        "dueDate": ("마감일", "마감", "발표일", "언제까지"),
-        "deliverables": ("산출물", "결과물", "제출물"),
-    }
-
-    for block in blocks:
-        if not block:
-            continue
-        for key, hints in slot_hints.items():
-            if any(hint in block for hint in hints):
-                return key
-    return ""
-
-
-def _is_contextual_slot_answer(user_message: str) -> bool:
-    compact = re.sub(r"\s+", "", user_message)
-    return bool(compact) and len(compact) <= 40 and "\n" not in user_message
-
-
-def _allow_storage_for_turn(
-    *,
-    turn_type: str,
-    key: str,
-    user_message: str,
-    recent_messages: list[str] | None,
-    selected_message: str | None,
-) -> bool:
-    if turn_type not in TURN_TYPES_BLOCKING_STORAGE:
-        return True
-    if is_explicit_correction_message(user_message):
-        return True
-
-    prompted_slot = _infer_prompted_slot_from_messages(recent_messages, selected_message)
-    return prompted_slot == key and _is_contextual_slot_answer(user_message)
-
-
-def _is_explicit_title_commit(message: str) -> bool:
-    cleaned = _clean_string(message)
-    return any(pattern.search(cleaned) for pattern in TITLE_CONFIRMATION_PATTERNS)
-
-
-def _has_title_context(selected_message: str | None, recent_messages: list[str] | None) -> bool:
-    blocks = [_clean_string(selected_message)]
-    blocks.extend(_clean_string(message) for message in (recent_messages or [])[-4:])
-    for block in blocks:
-        if not block:
-            continue
-        if "제목" in block or "이름" in block:
-            return True
-    return False
-
-
-def _protected_field_rejection_reason(
-    *,
-    key: str,
-    normalized_value: object,
+def merge_collected_data(
     current_data: Mapping[str, object],
-    user_message: str,
-    selected_message: str | None,
-    recent_messages: list[str] | None,
-) -> str:
-    cleaned = _clean_string(normalized_value)
-    compact = re.sub(r"\s+", "", cleaned)
-    flags = detect_meta_or_request_like(cleaned, requested_focus=key)
+    updated_data: Mapping[str, object] | None,
+) -> CollectedData:
+    merged = sanitize_collected_data(current_data)
+    sanitized_updates = sanitize_candidate_updates(updated_data, current_data=current_data)
 
-    if key == "subject":
-        if flags["kind"] != "factual_answer":
-            return "subject_request_like_not_storable"
-        if len(compact) < 3:
-            return "subject_too_short"
-        return ""
+    for key in COLLECTED_DATA_FIELDS:
+        value = sanitized_updates.get(key)
+        if value is not None:
+            merged[key] = value
 
-    if key == "title":
-        if flags["kind"] != "factual_answer":
-            return "title_request_like_not_storable"
-        if _is_explicit_title_commit(user_message):
-            return ""
-        if any(pattern.search(user_message) for pattern in TITLE_CONTEXT_CONFIRMATION_PATTERNS):
-            if _has_title_context(selected_message, recent_messages):
-                return ""
-            return "title_requires_recent_context"
-        return "title_requires_explicit_confirmation"
+    for key in AUXILIARY_STATE_FIELDS:
+        value = sanitized_updates.get(key)
+        if value is not None:
+            merged[key] = value
 
-    if key == "goal":
-        if flags["kind"] != "factual_answer" or "?" in cleaned:
-            return "goal_request_like_not_storable"
-        subject = _clean_string(current_data.get("subject"))
-        if subject and subject == cleaned:
-            return "goal_repeats_subject"
-        return ""
-
-    return ""
+    return merged
 
 
 def choose_next_question_field(
@@ -2039,34 +1123,6 @@ def choose_next_question_field(
     return pending[0] if pending else ""
 
 
-def infer_prompted_slot(
-    *,
-    recent_messages: list[str] | None,
-    selected_message: str | None,
-    current_data: Mapping[str, object] | None = None,
-    current_phase: str = "GATHER",
-    followup_fields: list[str] | None = None,
-    rejected_updates: Mapping[str, object] | None = None,
-) -> str:
-    prompted_slot = _infer_prompted_slot_from_messages(recent_messages, selected_message)
-    if prompted_slot:
-        return prompted_slot
-    return choose_next_question_field(
-        current_data,
-        current_phase=current_phase,
-        followup_fields=followup_fields,
-        rejected_updates=rejected_updates,
-    )
-
-
-def infer_contextual_prompted_slot(
-    *,
-    recent_messages: list[str] | None,
-    selected_message: str | None,
-) -> str:
-    return _infer_prompted_slot_from_messages(recent_messages, selected_message)
-
-
 def apply_collected_data_updates(
     current: Mapping[str, object] | None,
     candidate: Mapping[str, object] | None,
@@ -2079,107 +1135,34 @@ def apply_collected_data_updates(
 ) -> tuple[CollectedData, dict[str, object]]:
     current_data = sanitize_collected_data(current)
     raw_candidate = dict(candidate or {})
-    normalized_candidate: dict[str, object] = {}
-
-    for key, value in raw_candidate.items():
-        if key not in REQUIRED_COLLECTED_DATA_FIELDS:
-            continue
-        team_size_hint = raw_candidate.get("teamSize", current_data.get("teamSize"))
-        normalized_value = normalize_slot_candidate(key, value, team_size=team_size_hint)
-        if normalized_value is not None:
-            normalized_candidate[key] = normalized_value
 
     approved_updates: dict[str, object] = {}
     rejected_updates: dict[str, object] = {}
     rejected_reasons: dict[str, str] = {}
     decisions: dict[str, CandidateDecision] = {}
-    needs_confirmation: list[str] = []
 
     for key, raw_value in raw_candidate.items():
         if key not in REQUIRED_COLLECTED_DATA_FIELDS:
             continue
-
-        normalized_value = normalized_candidate.get(key)
         source = str((candidate_sources or {}).get(key, {}).get("source") or "unknown")
-        if normalized_value is None:
-            rejected_updates[key] = raw_value
-            rejected_reasons[key] = "invalid_or_empty_candidate"
-            continue
-
-        if not _allow_storage_for_turn(
-            turn_type=turn_type,
-            key=key,
-            user_message=user_message,
-            recent_messages=recent_messages,
-            selected_message=selected_message,
-        ):
-            rejected_updates[key] = raw_value
-            rejected_reasons[key] = "turn_type_blocks_storage"
-            if key not in needs_confirmation:
-                needs_confirmation.append(key)
-            continue
-
-        protected_reason = _protected_field_rejection_reason(
-            key=key,
-            normalized_value=normalized_value,
-            current_data=current_data,
-            user_message=user_message,
-            selected_message=selected_message,
-            recent_messages=recent_messages,
-        )
-        if protected_reason:
-            rejected_updates[key] = raw_value
-            rejected_reasons[key] = protected_reason
-            if key not in needs_confirmation:
-                needs_confirmation.append(key)
-            continue
-
-        decision = should_accept_candidate(
+        source_metadata = dict((candidate_sources or {}).get(key) or {})
+        decision = evaluate_candidate_update(
             key=key,
             current_value=current_data.get(key),
-            incoming_value=normalized_value,
+            incoming_value=raw_value,
             source=source,
+            source_metadata=source_metadata,
             user_message=user_message,
             current_phase=current_status,
             current_data=current_data,
-            candidate_updates=normalized_candidate,
+            candidate_updates=raw_candidate,
         )
         decisions[key] = decision
-
-        current_normalized = normalize_slot_candidate(
-            key,
-            current_data.get(key),
-            team_size=current_data.get("teamSize"),
-        )
-        changed = current_normalized != decision.normalized_value
-        if (
-            changed
-            and current_normalized is not None
-            and decision.approved
-            and decision.reason not in {"additive_update_approved", "enrich_existing_due_date", "replace_unconfirmed_goal"}
-            and decision.overwrite_mode != OverwriteMode.EXPLICIT.value
-        ):
-            decision = CandidateDecision(
-                key=decision.key,
-                approved=False,
-                normalized_value=None,
-                reason="overwrite_requires_explicit_correction",
-                overwrite_mode=decision.overwrite_mode,
-                source=decision.source,
-                requires_followup_question=decision.requires_followup_question,
-                conflict_severity=decision.conflict_severity,
-            )
-            decisions[key] = decision
-
-        if decision.approved and decision.normalized_value is not None and changed:
+        if decision.approved and decision.normalized_value is not None:
             approved_updates[key] = decision.normalized_value
-            continue
-
-        if not decision.approved:
+        else:
             rejected_updates[key] = raw_value
             rejected_reasons[key] = decision.reason
-            if decision.requires_followup_question and key not in needs_confirmation:
-                needs_confirmation.append(key)
 
     for key, raw_value in raw_candidate.items():
         if key not in AUXILIARY_STATE_FIELDS:
@@ -2189,26 +1172,35 @@ def apply_collected_data_updates(
             rejected_updates[key] = raw_value
             rejected_reasons[key] = "invalid_or_empty_candidate"
             continue
+        current_value = _normalize_auxiliary_value(key, current_data.get(key))
+        if current_value == normalized_value:
+            continue
         approved_updates[key] = normalized_value
+        rejected_updates.pop(key, None)
+        rejected_reasons.pop(key, None)
 
     next_collected_data = merge_collected_data(current_data, approved_updates)
+    needs_confirmation = [
+        key
+        for key, decision in decisions.items()
+        if decision.requires_followup_question
+    ]
     for key in raw_candidate:
         if key not in REQUIRED_COLLECTED_DATA_FIELDS and key not in AUXILIARY_STATE_FIELDS:
             continue
         decision = decisions.get(key)
+        source_metadata = dict((candidate_sources or {}).get(key) or {})
         logger.info(
-            "collected_data_decision field=%s candidate=%r decision=%s reason=%s source=%s",
+            "collected_data_decision field=%s candidate=%r normalized=%r decision=%s reason=%s source=%s confidence=%s raw_evidence=%r overwrite_mode=%s",
             key,
             raw_candidate.get(key),
-            (
-                "approved"
-                if key in approved_updates
-                else "rejected"
-                if key in rejected_reasons
-                else "ignored"
-            ),
+            decision.normalized_value if decision is not None else approved_updates.get(key),
+            "approved" if key in approved_updates else "rejected" if key in rejected_reasons else "ignored",
             rejected_reasons.get(key) or (decision.reason if decision is not None else "unchanged_or_auxiliary"),
             str((candidate_sources or {}).get(key, {}).get("source") or "unknown"),
+            source_metadata.get("confidence"),
+            source_metadata.get("raw_evidence"),
+            decision.overwrite_mode if decision is not None else "NONE",
         )
     logger.info(
         "apply_collected_data_updates turn=%s phase=%s approved=%s rejected=%s before=%s after=%s",
@@ -2318,109 +1310,3 @@ def build_public_update_snapshot(
             snapshot[key] = value
 
     return snapshot
-
-
-_previous_infer_prompted_slot_from_messages = _infer_prompted_slot_from_messages
-_previous_apply_collected_data_updates = apply_collected_data_updates
-
-
-def _infer_prompted_slot_from_messages(
-    recent_messages: list[str] | None,
-    selected_message: str | None,
-) -> str:
-    prompted_slot = _previous_infer_prompted_slot_from_messages(
-        recent_messages,
-        selected_message,
-    )
-    if prompted_slot:
-        return prompted_slot
-
-    blocks: list[str] = []
-    if selected_message:
-        blocks.append(_clean_string(selected_message))
-    if recent_messages:
-        blocks.extend(_clean_string(message) for message in reversed(recent_messages[-4:]))
-
-    extra_slot_hints = {
-        "subject": ("프로젝트 주제", "어떤 분야", "어떤 문제", "주제로"),
-        "title": ("프로젝트 제목", "제목은", "이름은", "제목으로"),
-        "goal": ("프로젝트 목표", "목표를", "목표는"),
-        "targetUser": ("타겟 사용자", "대상 사용자", "대상은", "어떤 팀", "누구를 위한"),
-        "teamSize": ("총 몇 명", "몇 명", "인원은", "전체 인원"),
-        "roles": ("역할 분담", "필요한 역할", "각자 맡을 역할", "어떤 역할"),
-        "dueDate": ("마감일", "마감", "발표일", "언제까지"),
-        "deliverables": ("산출물", "결과물", "최종 제출물"),
-    }
-    for block in blocks:
-        if not block:
-            continue
-        for key, hints in extra_slot_hints.items():
-            if any(hint in block for hint in hints):
-                return key
-    return ""
-
-
-def apply_collected_data_updates(
-    current: Mapping[str, object] | None,
-    candidate: Mapping[str, object] | None,
-    turn_type: str,
-    current_status: str,
-    recent_messages: list[str] | None = None,
-    selected_message: str | None = None,
-    user_message: str = "",
-    candidate_sources: Mapping[str, Mapping[str, object]] | None = None,
-) -> tuple[CollectedData, dict[str, object]]:
-    next_data, audit = _previous_apply_collected_data_updates(
-        current=current,
-        candidate=candidate,
-        turn_type=turn_type,
-        current_status=current_status,
-        recent_messages=recent_messages,
-        selected_message=selected_message,
-        user_message=user_message,
-        candidate_sources=candidate_sources,
-    )
-
-    current_data = sanitize_collected_data(current)
-    raw_candidate = dict(candidate or {})
-    approved_updates = dict(audit.get("approved", {}))
-    rejected_updates = dict(audit.get("rejected", {}))
-    rejected_reasons = dict(audit.get("rejected_reasons", {}))
-    needs_confirmation = list(audit.get("needs_confirmation", []))
-    decisions = dict(audit.get("decisions", {}))
-
-    for key in AUXILIARY_STATE_FIELDS:
-        if key not in raw_candidate:
-            continue
-        normalized_value = _normalize_auxiliary_value(key, raw_candidate.get(key))
-        if normalized_value is None:
-            rejected_updates[key] = raw_candidate.get(key)
-            rejected_reasons[key] = "invalid_or_empty_candidate"
-            continue
-        if not _allow_storage_for_turn(
-            turn_type=turn_type,
-            key=key,
-            user_message=user_message,
-            recent_messages=recent_messages,
-            selected_message=selected_message,
-        ):
-            rejected_updates[key] = raw_candidate.get(key)
-            rejected_reasons[key] = "turn_type_blocks_storage"
-            if key not in needs_confirmation:
-                needs_confirmation.append(key)
-            continue
-        current_value = _normalize_auxiliary_value(key, current_data.get(key))
-        if current_value == normalized_value:
-            continue
-        approved_updates[key] = normalized_value
-        rejected_updates.pop(key, None)
-        rejected_reasons.pop(key, None)
-
-    next_data = merge_collected_data(current_data, approved_updates)
-    return next_data, {
-        "approved": approved_updates,
-        "rejected": rejected_updates,
-        "rejected_reasons": rejected_reasons,
-        "needs_confirmation": needs_confirmation,
-        "decisions": decisions,
-    }
