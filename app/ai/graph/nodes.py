@@ -317,6 +317,31 @@ def _trim_trailing_question_lines(message: str) -> str:
     return "\n".join(lines).strip()
 
 
+_CASUAL_CONFIRMATION_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\s*(?:이대로\s*)?(?:할래|할까|진행할까|확정할까|반영해도\s*될까)\s*,?\s*응\?\s*$"),
+    re.compile(r"\s*(?:그걸로|이걸로|그렇게)\?\s*$"),
+    re.compile(r"\s*응\?\s*$"),
+)
+
+
+def _remove_casual_confirmation_tail(message: str) -> str:
+    cleaned = str(message or "").strip()
+    if not cleaned:
+        return cleaned
+    for pattern in _CASUAL_CONFIRMATION_PATTERNS:
+        if not pattern.search(cleaned):
+            continue
+        boundary = max(
+            cleaned.rfind("."),
+            cleaned.rfind("!"),
+            cleaned.rfind("\n"),
+        )
+        if boundary >= 0:
+            return cleaned[: boundary + 1].strip()
+        return ""
+    return cleaned
+
+
 # ---------------------------------------------------------------------------
 # RAG helpers
 # ---------------------------------------------------------------------------
@@ -614,13 +639,18 @@ def _call_llm_decision(
 응답 규칙:
 - 답변은 2~4문장 이내. 한 번에 하나의 항목만 다룬다. 다른 미결정 항목은 이번 턴에 먼저 언급하지 않는다.
 - 추천이 필요하면 최대 1개를 기본값으로 제시한다. A/B/C 선택지를 나열하지 않는다.
-- 마지막 문장은 반드시 '응', '그걸로', '수정할게' 정도로 답할 수 있는 확인 질문 하나만 둔다.
+- 사용자가 명확한 사실을 제공했으면 확인 질문으로 되묻지 말고 바로 정리한 뒤 다음에 필요한 항목을 자연스럽게 요청한다.
+- '응?', '그걸로?', '할까?', '확정할까?' 같은 가벼운 확인형 종결은 사용하지 않는다.
+- 추천안을 제시할 때도 "이대로 진행해도 됩니다"처럼 안내하고, 사용자가 수락하면 다음 항목으로 넘어간다.
 - 고객님 말투가 아닌 친근한 코치 말투를 사용하세요.
 - '좋아요', '알겠습니다', '반영하겠습니다' 같은 앞구문으로 시작하지 마세요.
 - 이전 메시지와 동일하거나 유사한 내용을 반복하지 마세요.
 - {ask_rule}
 - updates: 이번 턴에서 사용자가 명시적으로 공유한 사실만 포함하세요.
 - value에 사용자 문장을 그대로 복사하지 말고 문서에 어울리는 중립적이고 명확한 표현으로 rephrase하세요.
+- dueDate value는 날짜만 넣으세요. 예: "6월 30일", "2026-06-30". "마감일을 ... 확정" 같은 문장은 넣지 마세요.
+- teamSize value는 숫자만 넣으세요. 예: 3.
+- roles value는 역할명만 짧게 나열하세요. 설명 문장, 괄호 설명, "팀원 N명으로 역할을 분담" 같은 접두어는 넣지 마세요.
 - 사용자가 말하지 않은 사실은 추가하지 마세요.
 - 질문, 요약 요청, 추천 요청, 확인 요청은 updates에 넣지 마세요.
 - raw_evidence에는 실제 사용자 메시지에서 근거가 있는 짧은 인용문을 넣으세요.
@@ -760,6 +790,7 @@ def _apply_llm_message_policy(state: AgentState, ai_message: str) -> str:
     cleaned = str(ai_message or "").strip()
     if not cleaned:
         return cleaned
+    cleaned = _remove_casual_confirmation_tail(cleaned)
     if _is_answer_only_turn(state):
         trimmed = _trim_trailing_question_lines(cleaned)
         return _truncate_ai_message(trimmed or cleaned)

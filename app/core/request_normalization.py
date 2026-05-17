@@ -249,12 +249,46 @@ def _normalize_team_size(value: Any) -> int | None:
         return None
 
     cleaned = value.strip()
+    if cleaned.isdecimal():
+        parsed = int(cleaned)
+        return parsed if parsed > 0 else None
+    match = re.search(r"(\d{1,2})\s*명", cleaned)
+    if match:
+        parsed = int(match.group(1))
+        return parsed if parsed > 0 else None
     if cleaned.endswith("명"):
         cleaned = cleaned[:-1].strip()
     if cleaned.isdecimal():
         parsed = int(cleaned)
         return parsed if parsed > 0 else None
     return None
+
+
+_KOREAN_DATE_VALUE_PATTERN = re.compile(r"(\d{1,2})\s*월\s*(\d{1,2})\s*일")
+
+
+def _normalize_due_date(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+
+    iso_match = re.search(r"\d{4}-\d{2}-\d{2}", cleaned)
+    if iso_match:
+        return iso_match.group()
+
+    slash_match = re.search(r"(\d{4})[./](\d{1,2})[./](\d{1,2})", cleaned)
+    if slash_match:
+        year, month, day = slash_match.groups()
+        return f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
+
+    korean_match = _KOREAN_DATE_VALUE_PATTERN.search(cleaned)
+    if korean_match:
+        month, day = korean_match.groups()
+        return f"{int(month)}월 {int(day)}일"
+
+    return cleaned
 
 
 def _normalize_role_label(value: Any) -> str:
@@ -341,7 +375,14 @@ def normalize_collected_data(value: Any) -> CollectedData:
         normalized["teamSize"] = team_size
 
     for field in TEXT_COLLECTED_DATA_FIELDS:
-        normalized_value = _normalize_text_field(field, canonicalized.get(field))
+        if field == "dueDate":
+            normalized_value = _normalize_due_date(canonicalized.get(field))
+            if normalized_value is not None and any(
+                m in normalized_value for m in _AI_PROPOSAL_MARKERS
+            ):
+                normalized_value = None
+        else:
+            normalized_value = _normalize_text_field(field, canonicalized.get(field))
         if normalized_value is not None:
             normalized[field] = normalized_value
 
