@@ -204,6 +204,28 @@ def _postprocess_ai_message(
     if not cleaned and phase in {"EXPLORE", "TOPIC_SET"} and _matches_topic_presence_button_message(content):
         return _build_initial_button_message(content, phase)
 
+    if phase == "EXPLORE" and "problemArea" in approved_updates and next_question_field == "targetUser":
+        problem_area = normalize_optional_string(
+            approved_updates.get("problemArea") or collected_data.get("problemArea")
+        )
+        prefix = f"문제 배경은 '{problem_area}'로 정리할게요. " if problem_area else ""
+        return (
+            prefix
+            + "아직 프로젝트 제목은 정하지 말고, 먼저 이 문제를 가장 자주 겪는 대상 사용자를 좁혀볼게요. "
+            + "주 타겟은 누구인가요?"
+        )
+
+    if phase == "EXPLORE" and "targetUser" in approved_updates and next_question_field == "subject":
+        target_user = normalize_optional_string(
+            approved_updates.get("targetUser") or collected_data.get("targetUser")
+        )
+        prefix = f"타겟 사용자는 '{target_user}'라고 정리할게요. " if target_user else ""
+        return (
+            prefix
+            + "이제 문제 배경과 타겟 사용자를 바탕으로 최종 프로젝트 주제를 정해볼게요. "
+            + "서비스나 앱 이름이 드러나도록 한 줄로 확정해 주세요."
+        )
+
     if "goal" in approved_updates and next_question_field == "roles":
         team_size = collected_data.get("teamSize")
         suffix = (
