@@ -1072,6 +1072,9 @@ def build_phase_derivation_trace(
             if execution_fact_keys
             else "title_available_without_subject"
         )
+    elif has_problem_context:
+        derived = "EXPLORE"
+        reason = "topic_discovery_context_without_topic_anchor"
     elif sanitized:
         derived = "TOPIC_SET"
         reason = "partial_committed_data_without_topic_anchor"
@@ -1135,7 +1138,7 @@ PUBLIC_AUXILIARY_COLLECTED_DATA_FIELDS: tuple[str, ...] = (
 )
 
 NEXT_FIELD_PRIORITY_BY_PHASE: dict[str, tuple[str, ...]] = {
-    "EXPLORE": ("subject",),
+    "EXPLORE": ("problemArea", "targetUser", "subject"),
     "TOPIC_SET": ("subject", "title", "goal"),
     "PROBLEM_DEFINE": ("subject", "goal", "title"),
     "GATHER": ("goal", "roles", "teamSize", "dueDate", "deliverables", "title"),
@@ -1185,6 +1188,14 @@ def choose_next_question_field(
             seen.add(field)
 
     subject = _clean_string(sanitized.get("subject"))
+    if current_phase == "EXPLORE":
+        if not _normalize_auxiliary_value("problemArea", sanitized.get("problemArea")):
+            return "problemArea"
+        if not _normalize_auxiliary_value("targetUser", sanitized.get("targetUser")):
+            return "targetUser"
+        if not subject:
+            return "subject"
+
     if (
         current_phase in {"EXPLORE", "TOPIC_SET", "PROBLEM_DEFINE"}
         and subject

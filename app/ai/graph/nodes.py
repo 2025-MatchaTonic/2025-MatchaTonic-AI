@@ -58,6 +58,8 @@ RAG_CONTEXT_CACHE: dict[tuple[str, str, tuple[str, ...], tuple[str, ...], int], 
 _VALID_NEXT_FIELDS = {
     "subject",
     "title",
+    "problemArea",
+    "targetFacility",
     "goal",
     "targetUser",
     "teamSize",
@@ -82,16 +84,13 @@ _OPTION_B_PATTERN = re.compile(r"B\)\s*([^\n]+)")
 _PHASE_CONTEXT: dict[str, str] = {
     "EXPLORE": (
         "사용자가 아직 구체적인 프로젝트 주제를 정하지 못한 단계입니다. "
-        "편안한 분위기에서 어떤 프로젝트를 하고 싶은지 탐색할 수 있도록 도와주세요. "
-        "[EXPLORE 2단계 규칙] "
-        "▶ 1단계 — 사용자가 불편함·문제 상황을 처음 언급한 경우: "
-        "subject 업데이트 금지. problemArea로 기록. "
-        "불편함을 바로 주제로 만들지 말고, 어떤 상황에서 가장 답답한지 한 가지만 더 물어보세요. "
-        "예) '예약 과정에서 어떤 순간이 제일 답답했어요?' "
-        "▶ 2단계 — 사용자가 구체적인 상황을 설명한 경우: "
-        "subject 업데이트 금지. "
-        "그 상황을 해결하는 구체적인 앱/서비스 방향을 한 가지 제안하고 '이 방향으로 시작해볼까요?' 같은 확인 질문을 하세요. "
-        "▶ 동의 확정 — 사용자가 제안에 동의(좋아, 그걸로, 맞아, 그거 좋다 등)한 경우에만 subject를 업데이트하세요."
+        "이 단계는 실행 계획 수집이 아니라 주제 발굴 전용입니다. "
+        "[EXPLORE 주제 발굴 순서] "
+        "▶ 1단계 문제 탐색 — 사용자가 불편함·관심 분야·상황을 말하면 subject/title/goal 업데이트 금지. problemArea로만 기록하고, 어떤 상황에서 가장 불편한지 한 가지만 더 물어보세요. "
+        "▶ 2단계 타겟 선정 — problemArea가 있으면 그 문제를 가장 자주 겪는 사람이나 집단을 묻고 targetUser로 기록하세요. "
+        "▶ 3단계 주제 후보 — problemArea와 targetUser가 모두 있을 때만 구체적인 서비스/앱/플랫폼 주제 후보 1개를 제안하세요. 이때도 사용자가 동의하기 전까지 subject/title 업데이트 금지. "
+        "▶ 동의 확정 — 사용자가 제안에 동의(좋아, 그걸로, 맞아, 그거 좋다 등)한 경우에만 subject를 업데이트하세요. "
+        "▶ 금지 — subject가 확정되기 전에는 goal/teamSize/roles/dueDate/deliverables를 묻거나 업데이트하지 마세요."
     ),
     "TOPIC_SET": (
         "프로젝트 주제는 잡혀있지만 아직 구체화가 필요한 단계입니다. "
@@ -206,9 +205,21 @@ def _expected_slot_for_turn(
     current_phase: str,
 ) -> str:
     subject_missing = not _is_valid_collected_value("subject", current_data.get("subject"))
+    problem_area_missing = not _is_meaningful_fact(current_data.get("problemArea"))
+    target_user_missing = not _is_meaningful_fact(current_data.get("targetUser"))
     current_slot = str(
         state.get("current_slot") or state.get("next_question_field") or ""
     ).strip()
+    if current_phase == "EXPLORE":
+        if current_slot in {"problemArea", "targetUser", "subject"}:
+            return current_slot
+        if problem_area_missing:
+            return "problemArea"
+        if target_user_missing:
+            return "targetUser"
+        if subject_missing:
+            return "subject"
+        return ""
     if (
         current_slot == "subject"
         and subject_missing
@@ -236,6 +247,29 @@ def _align_llm_updates_with_expected_slot(
     current_phase: str,
 ) -> None:
     expected_slot = _expected_slot_for_turn(state, current_data, current_phase)
+    if current_phase == "EXPLORE":
+        allowed_by_slot = {
+            "problemArea": {"problemArea"},
+            "targetUser": {"targetUser"},
+            "subject": {"subject"},
+        }.get(expected_slot, set())
+        blocked_fields = {
+            key
+            for key in raw_data_updates
+            if key in _VALID_NEXT_FIELDS and key not in allowed_by_slot
+        }
+        for key in blocked_fields:
+            raw_data_updates.pop(key, None)
+            candidate_sources.pop(key, None)
+        if blocked_fields:
+            logger.info(
+                "dropped_explore_premature_updates expected_slot=%s blocked=%s",
+                expected_slot,
+                sorted(blocked_fields),
+            )
+        if expected_slot in {"problemArea", "targetUser"}:
+            return
+
     if expected_slot != "subject":
         return
 
@@ -628,7 +662,17 @@ def _call_llm_decision(
 
     rag_context = _fetch_rag_context(state, phase=phase, **_get_rag_filters(phase))
     recent_context = _build_recent_context(state)
-    missing_summary = _build_missing_field_summary(current_data)
+    if phase == "EXPLORE":
+        discovery_missing: list[str] = []
+        if not _is_meaningful_fact(current_data.get("problemArea")):
+            discovery_missing.append("- 해결하고 싶은 문제 상황")
+        if not _is_meaningful_fact(current_data.get("targetUser")):
+            discovery_missing.append("- 그 문제를 가장 자주 겪는 대상 사용자")
+        if not _is_meaningful_fact(current_data.get("subject")):
+            discovery_missing.append("- 사용자가 동의한 프로젝트 주제")
+        missing_summary = "\n".join(discovery_missing) if discovery_missing else "- 없음"
+    else:
+        missing_summary = _build_missing_field_summary(current_data)
     phase_guidance = _PHASE_CONTEXT.get(phase, _PHASE_CONTEXT["GATHER"])
     ask_rule = (
         "필요하면 다음 질문 하나만 하세요."
@@ -678,7 +722,7 @@ def _call_llm_decision(
 - raw_evidence에는 실제 사용자 메시지에서 근거가 있는 짧은 인용문을 넣으세요.
 - confidence가 높은 사실 공유가 아니면 is_user_provided_fact=false로 하세요.
 - next_field: 팀이 다음에 결정해야 할 항목 이름. 없으면 빈 문자열
-  (subject/title/goal/targetUser/teamSize/roles/dueDate/deliverables 중 하나)
+  (problemArea/targetUser/subject/title/goal/teamSize/roles/dueDate/deliverables 중 하나)
 - 필드 이름을 언급하지 말 것. JSON만 출력 (다른 텍스트 없이 JSON만):
 {{
   "intent": "provide_info | ask_help | ask_summary | request_next_step | correct_info | meta | other",

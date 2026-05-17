@@ -7,6 +7,8 @@ class ConversationFieldUpdate(BaseModel):
     field: Literal[
         "subject",
         "title",
+        "problemArea",
+        "targetFacility",
         "goal",
         "targetUser",
         "teamSize",
