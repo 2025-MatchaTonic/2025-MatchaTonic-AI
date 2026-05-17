@@ -66,6 +66,12 @@ _VALID_NEXT_FIELDS = {
     "deliverables",
 }
 
+_EXPLICIT_SLOT_MARKERS: dict[str, re.Pattern[str]] = {
+    "subject": re.compile(r"(?:subject|topic|\uc8fc\uc81c)", re.IGNORECASE),
+    "title": re.compile(r"(?:title|\uc81c\ubaa9|\uc774\ub984)", re.IGNORECASE),
+    "goal": re.compile(r"(?:goal|objective|\ubaa9\ud45c)", re.IGNORECASE),
+}
+
 _ACCEPT_RECOMMENDATION_PATTERN = re.compile(
     r"(?:추천(?:하는)?\s*대로|이대로|그걸로|그걸로\s*할게|확정|b\s*로|B\s*로)",
     re.IGNORECASE,
@@ -179,6 +185,69 @@ def _build_acceptance_updates(
             "intent": "correct_info",
         }
     }
+
+
+def _message_explicitly_mentions_slot(message: str, slot: str) -> bool:
+    pattern = _EXPLICIT_SLOT_MARKERS.get(slot)
+    return bool(pattern and pattern.search(message or ""))
+
+
+def _expected_slot_for_turn(
+    state: AgentState,
+    current_data: dict[str, object],
+    current_phase: str,
+) -> str:
+    subject_missing = not _is_valid_collected_value("subject", current_data.get("subject"))
+    current_slot = str(
+        state.get("current_slot") or state.get("next_question_field") or ""
+    ).strip()
+    if (
+        current_slot == "subject"
+        and subject_missing
+        and current_phase in {"EXPLORE", "TOPIC_SET", "PROBLEM_DEFINE"}
+    ):
+        return current_slot
+    if (
+        current_phase in {"EXPLORE", "TOPIC_SET", "PROBLEM_DEFINE"}
+        and subject_missing
+    ):
+        return "subject"
+    if current_phase == "GATHER" and not _is_valid_collected_value(
+        "goal", current_data.get("goal")
+    ):
+        return "goal"
+    return ""
+
+
+def _align_llm_updates_with_expected_slot(
+    state: AgentState,
+    *,
+    current_data: dict[str, object],
+    raw_data_updates: dict[str, object],
+    candidate_sources: dict[str, dict[str, object]],
+    current_phase: str,
+) -> None:
+    expected_slot = _expected_slot_for_turn(state, current_data, current_phase)
+    if expected_slot != "subject" or "subject" in raw_data_updates:
+        return
+
+    user_message = _effective_user_message(state)
+    for source_field in ("goal", "title"):
+        if source_field not in raw_data_updates:
+            continue
+        if _message_explicitly_mentions_slot(user_message, source_field):
+            continue
+
+        raw_data_updates["subject"] = raw_data_updates.pop(source_field)
+        source_info = dict(candidate_sources.pop(source_field, {}))
+        source_info["original_field"] = source_field
+        candidate_sources["subject"] = source_info
+        logger.info(
+            "realigned_llm_update original_field=%s expected_field=subject phase=%s",
+            source_field,
+            current_phase,
+        )
+        return
 
 
 def _is_initial_button_selection(state: AgentState) -> bool:
@@ -715,6 +784,13 @@ def _apply_llm_updates(
     user_message = _effective_user_message(state)
     raw_data_updates = dict(llm_result.get("data_updates") or {})
     candidate_sources = dict(llm_result.get("update_sources") or {})
+    _align_llm_updates_with_expected_slot(
+        state,
+        current_data=current_data,
+        raw_data_updates=raw_data_updates,
+        candidate_sources=candidate_sources,
+        current_phase=current_phase,
+    )
     acceptance_updates, acceptance_sources = _build_acceptance_updates(state, current_data)
     for key, value in acceptance_updates.items():
         raw_data_updates.setdefault(key, value)

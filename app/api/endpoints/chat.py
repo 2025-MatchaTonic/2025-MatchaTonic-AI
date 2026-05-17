@@ -151,6 +151,19 @@ def _resolve_next_question_field(
     followup_fields: List[str],
     proposed_field: str | None,
 ) -> str:
+    if (
+        phase == "TOPIC_SET"
+        and "subject" not in collected_data
+        and "subject" not in approved_updates
+    ):
+        return "subject"
+    if "subject" in approved_updates:
+        return choose_next_question_field(
+            collected_data,
+            current_phase=phase,
+            followup_fields=followup_fields,
+            rejected_updates=rejected_updates,
+        )
     if phase == "GATHER" and "goal" not in collected_data and "goal" not in approved_updates:
         return "goal"
     if "goal" in approved_updates and "roles" not in collected_data:
