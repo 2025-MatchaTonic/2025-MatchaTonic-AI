@@ -188,6 +188,13 @@ def _postprocess_ai_message(
     if "teamSize" in approved_updates and next_question_field == "goal":
         return f"팀 인원 {approved_updates['teamSize']}명 확인했습니다. 다음으로 프로젝트 목표를 한 줄로 정해 주세요."
 
+    if "subject" in approved_updates and next_question_field == "goal":
+        subject = normalize_optional_string(
+            approved_updates.get("subject") or collected_data.get("subject")
+        )
+        prefix = f"주제는 '{subject}'로 정리할게요. " if subject else ""
+        return prefix + "이 프로젝트로 무엇을 달성하려는지 한 줄로 알려주세요."
+
     return cleaned
 
 

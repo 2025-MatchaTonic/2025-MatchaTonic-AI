@@ -720,6 +720,18 @@ def evaluate_candidate_update(
     current_team_size = normalize_team_size((current_data or {}).get("teamSize"))
     current_normalized = normalize_collected_value(key, current_value, team_size=current_team_size)
 
+    if key == "goal" and source == "llm_decision":
+        title_candidate = normalize_collected_value(
+            "title",
+            (candidate_updates or {}).get("title"),
+        )
+        if title_candidate and title_candidate == normalized_incoming:
+            return CandidateDecision(
+                key=key, approved=False, normalized_value=None,
+                reason="goal_duplicates_title_candidate", overwrite_mode="NONE",
+                source=source, requires_followup_question=False,
+            )
+
     if current_normalized == normalized_incoming:
         return CandidateDecision(
             key=key, approved=True, normalized_value=normalized_incoming,
