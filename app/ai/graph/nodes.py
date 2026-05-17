@@ -228,26 +228,40 @@ def _align_llm_updates_with_expected_slot(
     current_phase: str,
 ) -> None:
     expected_slot = _expected_slot_for_turn(state, current_data, current_phase)
-    if expected_slot != "subject" or "subject" in raw_data_updates:
+    if expected_slot != "subject":
         return
 
     user_message = _effective_user_message(state)
-    for source_field in ("goal", "title"):
-        if source_field not in raw_data_updates:
-            continue
-        if _message_explicitly_mentions_slot(user_message, source_field):
-            continue
 
-        raw_data_updates["subject"] = raw_data_updates.pop(source_field)
-        source_info = dict(candidate_sources.pop(source_field, {}))
-        source_info["original_field"] = source_field
-        candidate_sources["subject"] = source_info
-        logger.info(
-            "realigned_llm_update original_field=%s expected_field=subject phase=%s",
-            source_field,
-            current_phase,
-        )
-        return
+    # subject가 없으면 goal/title을 subject로 재정렬
+    if "subject" not in raw_data_updates:
+        for source_field in ("goal", "title"):
+            if source_field not in raw_data_updates:
+                continue
+            if _message_explicitly_mentions_slot(user_message, source_field):
+                continue
+
+            raw_data_updates["subject"] = raw_data_updates.pop(source_field)
+            source_info = dict(candidate_sources.pop(source_field, {}))
+            source_info["original_field"] = source_field
+            candidate_sources["subject"] = source_info
+            logger.info(
+                "realigned_llm_update original_field=%s expected_field=subject phase=%s",
+                source_field,
+                current_phase,
+            )
+            return
+
+    # subject가 있어도 같이 딸려온 goal은 제거 — subject 확정 전에 goal이 확정되면
+    # _postprocess_ai_message 분기가 모두 빗나가 LLM 원문이 그대로 노출됨
+    if current_phase in {"EXPLORE", "TOPIC_SET"} and "goal" in raw_data_updates:
+        if not _message_explicitly_mentions_slot(user_message, "goal"):
+            raw_data_updates.pop("goal")
+            candidate_sources.pop("goal", None)
+            logger.info(
+                "dropped_premature_goal_extraction phase=%s",
+                current_phase,
+            )
 
 
 def _is_initial_button_selection(state: AgentState) -> bool:
