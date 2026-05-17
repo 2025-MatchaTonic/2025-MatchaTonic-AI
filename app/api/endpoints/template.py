@@ -21,7 +21,6 @@ from app.ai.graph.template_support import (
     build_notion_template_payload,
     build_recent_context,
     build_template_content_example,
-    build_template_input_summary,
     get_template_mode_config,
     merge_template_sections,
 )
@@ -99,61 +98,28 @@ class TemplateGenerateResponse(BaseModel):
 
 
 def _build_template_state(request: TemplateGenerateRequest) -> dict:
-    user_message = request.content.strip()
-    if not user_message:
-        user_message = (
-            "개발 템플릿 생성해줘"
-            if request.templateType == "dev"
-            else "기획 템플릿 생성해줘"
-        )
-
-    return {
-        "project_id": str(request.roomId),
-        "user_message": user_message,
-        "action_type": "BTN_DEV" if request.templateType == "dev" else "BTN_PLAN",
-        "current_phase": request.currentStatus,
-        "turn_policy": "ANSWER_ONLY",
-        "collected_data": request.collectedData,
-        "recent_messages": request.recentMessages,
-        "selected_message": request.selectedMessage,
-        "is_sufficient": True,
-        "ai_message": "",
-        "next_phase": request.currentStatus,
-        "template_payload": None,
-    }
-
-
-def _run_template_generation(request: TemplateGenerateRequest) -> tuple[dict, dict]:
-    state = _build_template_state(request)
-    result = (
-        generate_dev_template(state)
-        if request.templateType == "dev"
-        else generate_plan_template(state)
-    )
-    payload = result.get("template_payload")
-    if payload is None:
-        raise RuntimeError("template generation returned no payload")
-    return result, payload
-
-
-def _build_template_state(request: TemplateGenerateRequest) -> dict:
-    user_message = request.content.strip()
-    if not user_message:
-        user_message = (
-            "개발 템플릿 생성해줘"
-            if request.templateType == "dev"
-            else "기획 템플릿 생성해줘"
-        )
-
     approved_collected_data = build_approved_collected_data_snapshot(request.collectedData)
     effective_phase = derive_phase_from_collected_data(
         approved_collected_data,
         current_phase=request.currentStatus,
     )
 
+    # RAG 쿼리를 프로젝트 내용 기반으로 구성 (고정 문자열 대신 subject/goal 사용)
+    mode_label = "개발" if request.templateType == "dev" else "기획"
+    query_parts = [
+        p for p in [
+            str(approved_collected_data.get("subject") or ""),
+            str(approved_collected_data.get("goal") or ""),
+        ] if p
+    ]
+    if query_parts:
+        rag_user_message = " ".join(query_parts) + f" {mode_label} 프로젝트"
+    else:
+        rag_user_message = request.content.strip() or f"학생 {mode_label} 프로젝트 템플릿"
+
     return {
         "project_id": str(request.roomId),
-        "user_message": user_message,
+        "user_message": rag_user_message,
         "action_type": "BTN_DEV" if request.templateType == "dev" else "BTN_PLAN",
         "current_phase": effective_phase,
         "turn_policy": "ANSWER_ONLY",
@@ -207,64 +173,55 @@ def generate_template_from_state(state: AgentState, *, action_type: str) -> dict
             "template generation RAG failed; continuing without RAG project_id=%s",
             state.get("project_id"),
         )
-        rag_context = "(reference context unavailable)"
+        rag_context = "(참고 자료를 불러올 수 없습니다.)"
     recent_context = build_recent_context(state)
-    template_input_summary = build_template_input_summary(state)
     collected_data = state.get("collected_data", {})
+    # missing_collected_fields는 original collectedData 기준으로 계산 (snapshot 이전)
     missing_fields = missing_collected_fields(collected_data)
-    missing_fields_summary = ", ".join(missing_fields) if missing_fields else "none"
+    missing_fields_summary = ", ".join(missing_fields) if missing_fields else "없음"
 
     prompt = f"""
-    You are a PM writing a Korean {mode_config["mode_label"]} draft.
-    Output JSON only. Do not change the JSON shape.
+    당신은 {mode_config["mode_label"]} 노션 프로젝트 템플릿 문구를 작성하는 PM입니다.
+    JSON만 출력하세요. JSON 형식은 절대 바꾸지 마세요.
 
-    Core factual rules:
+    [사실 규칙]
     - collected_data에 있는 값만 사실로 사용하세요.
-    - 없는 값은 추측해 단정하지 마세요.
-    - 예시는 예시로 표시하고, 사실처럼 쓰지 마세요.
-    - missing field는 중립 표현으로 처리하세요.
-    - projectId, key, parentKey, title은 생성하지 마세요.
-    - content만 작성하세요.
-    - target_persona.name, age, 구체 KPI, 특정 대상군, 특정 날짜는 collected_data에 없으면 확정하지 마세요.
-    - recent conversation은 문체와 강조점 참고용입니다. collected_data에 없는 사실을 확정하는 근거로 쓰지 마세요.
+    - 없는 값은 추측해 단정하지 말고 중립 표현으로 처리하세요.
+    - projectId, key, parentKey, title은 생성하지 마세요. content만 작성하세요.
+    - target_persona.name, age, 구체 KPI, 특정 날짜는 collected_data에 없으면 확정하지 마세요.
+    - 최근 대화는 문체·강조점 참고용입니다. collected_data에 없는 사실을 확정하는 근거로 쓰지 마세요.
 
-    Section-level rules:
-    - 일정 섹션: dueDate가 없으면 정확한 날짜를 쓰지 마세요.
-    - 산출물 섹션: deliverables가 없으면 구체 산출물을 확정하지 마세요.
-    - 역할 섹션: roles가 없으면 책임 분배를 확정하지 마세요.
-    - 목표 섹션: goal이 없으면 "추가 논의 필요" 수준의 중립 표현만 쓰세요.
+    [섹션별 규칙]
+    - dueDate가 없으면 정확한 날짜를 쓰지 마세요.
+    - deliverables가 없으면 구체 산출물을 확정하지 마세요.
+    - roles가 없으면 책임 분배를 확정하지 마세요.
+    - goal이 없으면 "추가 논의 필요" 수준의 중립 표현만 쓰세요.
 
-    Writing rules:
-    - `problem_definition`과 `problem_solutions`는 각각 1개만 작성하세요.
-    - `features`는 승인된 정보 기준으로 최대 3개만 작성하세요.
-    - missing_fields={missing_fields_summary}
+    [작성 규칙]
+    - problem_definition과 problem_solutions는 각각 1개만 작성하세요.
+    - features는 확정된 정보 기준으로 최대 3개만 작성하세요.
+    - 미입력 필드: {missing_fields_summary}
     - {mode_config["focus"]}
     {PLAIN_LANGUAGE_RULES}
 
-    [Reference context]
+    [참고 레퍼런스]
     {rag_context}
 
-    [Recent conversation]
+    [최근 대화 문맥]
     {recent_context}
 
-    [Approved collected data]
+    [수집된 데이터]
     {json.dumps(collected_data, ensure_ascii=False)}
 
-    [Missing fields]
-    {missing_fields_summary}
-
-    [Approved data summary]
-    {template_input_summary}
-
-    [Default draft guide]
+    [기본 초안 가이드]
     {json.dumps(default_sections, ensure_ascii=False, indent=2)}
 
-    [Required JSON content shape]
+    [반드시 따라야 하는 JSON 형식]
     {{
-      "summary_message": "short Korean summary",
+      "summary_message": "스프링으로 전달할 한 줄 안내 메시지",
       "project_home": {json.dumps(template_content_example["project_home"], ensure_ascii=False)},
       "planning": {json.dumps(template_content_example["planning"], ensure_ascii=False)},
-      "ground_rules": " "
+      "ground_rules": "팀이 함께 지킬 원칙 (번호 목록으로 작성)"
     }}
     """
 

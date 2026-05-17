@@ -2,31 +2,6 @@ from typing import Any, Dict, List, Literal
 
 from pydantic import BaseModel, Field
 
-from app.ai.graph.collected_data import COLLECTED_DATA_FIELDS
-
-
-class GatherLLMResponse(BaseModel):
-    intent: Literal[
-        "answer_fact",
-        "ask_advice",
-        "ask_idea",
-        "ask_summary",
-        "uncertain",
-        "frustrated",
-        "general",
-    ] = "general"
-    ai_message: str = ""
-    updated_data: Dict[str, str] = Field(default_factory=dict)
-    is_sufficient: bool = False
-
-    def normalized_updated_data(self) -> Dict[str, str]:
-        normalized: Dict[str, str] = {}
-        for key in COLLECTED_DATA_FIELDS:
-            value = self.updated_data.get(key)
-            if isinstance(value, str) and value.strip():
-                normalized[key] = value.strip()
-        return normalized
-
 
 class ConversationFieldUpdate(BaseModel):
     field: Literal[
@@ -100,7 +75,7 @@ class TemplateContentLLMResponse(BaseModel):
     summary_message: str = ""
     project_home: Dict[str, str] = Field(default_factory=dict)
     planning: TemplatePlanning = Field(default_factory=TemplatePlanning)
-    ground_rules: str = " "
+    ground_rules: str = ""
 
     def to_merged_dict(self) -> dict:
         return {
