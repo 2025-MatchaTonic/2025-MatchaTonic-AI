@@ -1,3 +1,4 @@
+import re
 from typing import Any, Dict, List
 
 from app.ai.graph.collected_data import CollectedData
@@ -274,21 +275,43 @@ def _normalize_role_label(value: Any) -> str:
     return cleaned
 
 
+_ROLE_COUNT_PATTERN = re.compile(r"^(.+?)\s+[xX](\d{1,2})$")
+
+
+def _expand_role_token(token: str) -> list[str]:
+    cleaned = token.strip()
+    if not cleaned:
+        return []
+    match = _ROLE_COUNT_PATTERN.match(cleaned)
+    if match:
+        role = _normalize_role_label(match.group(1))
+        count = int(match.group(2))
+        if role and 1 <= count <= 20:
+            return [role] * count
+    role = _normalize_role_label(cleaned)
+    return [role] if role else []
+
+
 def _split_roles(value: str) -> list[str]:
     normalized = value
     for delimiter in [",", "/", " 그리고 ", " 및 ", "와 ", "과 "]:
         normalized = normalized.replace(delimiter, "|")
-    return [
-        _normalize_role_label(part)
-        for part in normalized.split("|")
-        if _normalize_role_label(part)
-    ]
+    result = []
+    for part in normalized.split("|"):
+        result.extend(_expand_role_token(part))
+    return result
 
 
 def _normalize_roles(value: Any, team_size: int | None = None) -> list[str] | str | None:
     if isinstance(value, list):
-        roles = [_normalize_role_label(item) for item in value]
-        roles = [role for role in roles if role]
+        roles = []
+        for item in value:
+            if isinstance(item, str):
+                roles.extend(_expand_role_token(item))
+            else:
+                role = _normalize_role_label(str(item))
+                if role:
+                    roles.append(role)
     elif isinstance(value, str):
         cleaned = value.strip()
         if not cleaned:

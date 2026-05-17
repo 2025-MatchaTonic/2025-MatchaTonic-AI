@@ -338,7 +338,7 @@ def _derive_turn_policy(request: AIChatRequest) -> TurnPolicy:
     if phase == "TOPIC_SET" and not current_topic and effective_message:
         if _matches_topic_presence_button_message(effective_message):
             return "ASK_ONLY"
-        return "CAPTURE_TITLE"
+        return "ANSWER_THEN_ASK"
     if phase in {"EXPLORE", "TOPIC_SET", "PROBLEM_DEFINE", "GATHER", "READY"}:
         return "ANSWER_THEN_ASK"
     return "ANSWER_ONLY"

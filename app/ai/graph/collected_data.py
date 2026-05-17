@@ -1310,11 +1310,6 @@ def build_approved_collected_data_snapshot(
         if value is not None:
             snapshot[key] = value
 
-    goal = _clean_string(snapshot.get("goal"))
-    subject = _clean_string(snapshot.get("subject"))
-    if goal and subject and goal == subject:
-        snapshot.pop("goal", None)
-
     return snapshot
 
 

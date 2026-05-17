@@ -49,7 +49,7 @@ from app.rag.retriever import get_rag_context
 
 logger = logging.getLogger(__name__)
 
-RAG_EMPTY_CONTEXT = "(愿???덊띁?곗뒪瑜?李얠? 紐삵뻽?듬땲??)"
+RAG_EMPTY_CONTEXT = "(참고할 레퍼런스를 찾지 못했습니다.)"
 RAG_CACHE_MAX_ITEMS = 128
 RAG_CONTEXT_CACHE: dict[tuple[str, str, tuple[str, ...], tuple[str, ...], int], str] = (
     {}
@@ -75,17 +75,17 @@ _OPTION_B_PATTERN = re.compile(r"B\)\s*([^\n]+)")
 
 _PHASE_CONTEXT: dict[str, str] = {
     "EXPLORE": (
-        "?ъ슜?먭? ?꾩쭅 援ъ껜?곸씤 二쇱젣媛 ?놁뒿?덈떎. "
-        "寃쏀뿕 湲곕컲 遺덊렪?⑥씠???꾩씠?붿뼱瑜??대걣?대궡?몄슂. "
-        "?대? 二쇱젣媛 ?덈떎硫?媛꾨왂???곷룄濡??좊룄?섏꽭??"
+        "사용자가 아직 구체적인 프로젝트 주제를 정하지 못한 단계입니다. "
+        "편안한 분위기에서 어떤 프로젝트를 하고 싶은지 탐색할 수 있도록 도와주세요. "
+        "막연하더라도 어떤 아이디어가 있다면 같이 발전시켜볼 수 있도록 이끌어주세요."
     ),
     "TOPIC_SET": (
-        "二쇱젣媛 ?쒖븞?먯?留??꾩쭅 ?뺤젙?섏? ?딆븯?듬땲?? "
-        "二쇱젣瑜?紐낇솗???섍퀬 ?듭떖 臾몄젣 ?곸뿭???≪븘媛?몄슂."
+        "프로젝트 주제는 잡혀있지만 아직 구체화가 필요한 단계입니다. "
+        "주제를 명확히 하고 핵심 문제 영역을 찾아낼 수 있도록 도와주세요."
     ),
     "PROBLEM_DEFINE": (
-        "二쇱젣???덉쑝??紐⑺몴媛 ?꾩쭅 遺덈텇紐낇빀?덈떎. "
-        "???꾨줈?앺듃濡?????ㅼ젣濡?留뚮뱾怨??띠? 寃껋쓣 ??以꾨줈 ?뚯뼱?댁꽭??"
+        "프로젝트 방향은 있지만 구체적인 문제 정의가 필요한 단계입니다. "
+        "어떤 문제를 프로젝트로 풀어낼지 함께 생각해보도록 이끌어주세요."
     ),
     "GATHER": (
         "팀이 실행 계획을 함께 세워나가는 단계입니다. "
@@ -93,8 +93,8 @@ _PHASE_CONTEXT: dict[str, str] = {
         "질문은 필드가 비어서가 아니라, 팀이 그 결정을 잘 내릴 수 있도록 이끄는 것임을 명심하세요."
     ),
     "READY": (
-        "?꾩슂???뺣낫媛 嫄곗쓽 ??紐⑥씤 ?④퀎?낅땲?? "
-        "?⑥? 怨듬갚??梨꾩슦嫄곕굹 ?쒗뵆由??앹꽦???덈궡?섏꽭??"
+        "필요한 정보가 거의 다 모인 단계입니다. "
+        "빈 필드를 채우거나 바로 템플릿 생성을 제안해주세요."
     ),
 }
 
@@ -253,8 +253,14 @@ def _trim_trailing_question_lines(message: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+_HELP_REQUEST_PATTERN = re.compile(
+    r"도움|어떻게|방법|모르겠|막막|뭘\s*해야|어디서|무엇부터",
+    re.IGNORECASE,
+)
+
+
 def _is_help_request(user_message: str) -> bool:
-    return False
+    return bool(_HELP_REQUEST_PATTERN.search(str(user_message or "")))
 
 
 def _should_skip_rag(state: AgentState) -> bool:
@@ -267,13 +273,15 @@ def _should_skip_rag(state: AgentState) -> bool:
 def _should_use_rag(state: AgentState, phase: str, query: str) -> bool:
     if _should_skip_rag(state):
         return False
-    action = state.get("action_type")
-    if action not in {"BTN_PLAN", "BTN_DEV"}:
-        return False
     query_text = str(query or "").strip()
     if not query_text:
         return False
-    return True
+    action = state.get("action_type")
+    # 템플릿 생성 버튼: 항상 RAG 사용
+    if action in {"BTN_PLAN", "BTN_DEV"}:
+        return True
+    # 대화(CHAT): GATHER 단계 이상에서만 RAG 사용 (EXPLORE는 너무 이른 단계)
+    return phase in {"GATHER", "PROBLEM_DEFINE", "READY"}
 
 
 def _select_rag_top_k(state: AgentState, phase: str, query: str) -> int:
@@ -478,8 +486,8 @@ def _decision_conflict_message(
     if not effective_roles or not effective_team_size:
         return ""
     return (
-        f"??븷({effective_roles})怨?? ?몄썝({effective_team_size})??留욎? ?딆븘?? "
-        "?뺤씤 ???ㅼ떆 ?뚮젮 二쇱꽭??"
+        f"역할({effective_roles})과 팀 인원({effective_team_size})이 맞지 않습니다. "
+        "확인 후 다시 알려 주세요."
     )
 
 
@@ -507,9 +515,9 @@ def _call_llm_decision(
     missing_summary = _build_missing_field_summary(current_data)
     phase_guidance = _PHASE_CONTEXT.get(phase, _PHASE_CONTEXT["GATHER"])
     ask_rule = (
-        "?꾩슂?섎㈃ ?꾩냽 吏덈Ц????媛吏留??섏꽭??"
+        "필요하면 다음 질문 하나만 하세요."
         if can_ask
-        else "吏덈Ц? ?섏? 留먭퀬 ?듬?留??섏꽭??"
+        else "질문은 하지 말고 답변만 하세요."
     )
 
     prompt = f"""당신은 초보 대학생 팀의 프로젝트 의사결정을 돕는 코치입니다.
@@ -519,19 +527,19 @@ def _call_llm_decision(
 [?꾩옱 ?④퀎: {phase}]
 {phase_guidance}
 
-[?꾩옱 ?섏쭛???뺣낫]
+[현재 수집된 정보]
 {json.dumps(current_data, ensure_ascii=False, indent=2)}
 
 [팀이 아직 결정하지 않은 것들]
 {missing_summary}
 
-[理쒓렐 ???
+[최근 대화]
 {recent_context}
 
 [李멸퀬 ?먮즺]
 {rag_context}
 
-[?ъ슜??硫붿떆吏]
+[사용자 메시지]
 {user_message}
 
 응답 규칙:
@@ -554,11 +562,11 @@ def _call_llm_decision(
 {{
   "intent": "provide_info | ask_help | ask_summary | request_next_step | correct_info | meta | other",
   "response_mode": "answer | answer_then_ask | ask_only",
-  "ai_message": "?쒓뎅???듬?",
+  "ai_message": "응답 메시지",
   "updates": [
     {{
       "field": "goal",
-      "value": "臾몄꽌???????덇쾶 ?뺣━??媛?,
+      "value": "문서에 어울리게 정리된 값",
       "raw_evidence": "?ъ슜?먭? ?ㅼ젣濡?留먰븳 洹쇨굅",
       "confidence": 0.0,
       "is_user_provided_fact": false

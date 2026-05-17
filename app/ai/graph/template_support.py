@@ -397,5 +397,5 @@ def build_template_content_example() -> dict:
                 ],
             },
         },
-        "ground_rules": " ",
+        "ground_rules": "팀이 함께 지킬 원칙 (번호 목록으로 작성)",
     }
