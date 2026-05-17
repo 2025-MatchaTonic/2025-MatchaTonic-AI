@@ -40,6 +40,8 @@ CHAT_RESPONSE_MAX_CHARS = 900
 _EXECUTION_FACT_FIELDS = {"goal", "teamSize", "roles", "dueDate", "deliverables"}
 
 _VALID_SLOT_FIELDS = {
+    "problemArea",
+    "targetFacility",
     "subject",
     "title",
     "goal",
@@ -136,8 +138,8 @@ def _normalize_chat_collected_data(data: Dict[str, Any]) -> Dict[str, Any]:
 def _build_initial_button_message(content: str, next_phase: str) -> str:
     if next_phase == "EXPLORE" or _is_topic_presence_negative_message(content):
         return (
-            "괜찮아요. 아직 주제가 없어도 됩니다. 관심 분야나 최근에 불편했던 경험을 "
-            "한 줄로 말해 주세요."
+            "괜찮아요. 먼저 주제부터 같이 발굴해볼게요. 학교생활이나 일상에서 최근에 "
+            "불편했던 상황 하나를 짧게 말해 주세요."
         )
     return "좋아요. 준비한 프로젝트 주제를 한 줄로 알려주세요."
 
@@ -151,6 +153,19 @@ def _resolve_next_question_field(
     followup_fields: List[str],
     proposed_field: str | None,
 ) -> str:
+    if phase == "EXPLORE":
+        if "problemArea" not in collected_data and "problemArea" not in approved_updates:
+            return "problemArea"
+        if "targetUser" not in collected_data and "targetUser" not in approved_updates:
+            return "targetUser"
+        if "subject" not in collected_data and "subject" not in approved_updates:
+            return "subject"
+        return _normalize_slot_name(proposed_field) or choose_next_question_field(
+            collected_data,
+            current_phase=phase,
+            followup_fields=followup_fields,
+            rejected_updates=rejected_updates,
+        )
     if (
         phase == "TOPIC_SET"
         and "subject" not in collected_data
@@ -316,6 +331,8 @@ PHASE_FIELD_PRIORITY = {
 }
 
 SUGGESTED_QUESTIONS_BY_FIELD = {
+    "problemArea": ["최근에 불편했던 상황이나 해결하고 싶은 문제는 무엇인가요?"],
+    "targetFacility": ["그 문제가 주로 어디에서 발생하나요?"],
     "subject": ["어떤 주제로 진행할까요?"],
     "title": ["프로젝트 제목을 한 줄로 적어주세요."],
     "goal": ["이 프로젝트 목표를 한 줄로 말해 주세요."],
