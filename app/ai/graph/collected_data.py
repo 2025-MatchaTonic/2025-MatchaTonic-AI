@@ -203,6 +203,8 @@ ROOM_TITLE_METADATA_PREFIXES: tuple[str, ...] = (
     "팀",
 )
 TEAM_SIZE_VALUE_PATTERN = re.compile(r"^\s*(\d{1,2})(?:\s*명)?\s*$")
+TEAM_SIZE_EMBEDDED_PATTERN = re.compile(r"(\d{1,2})\s*명")
+KOREAN_DATE_VALUE_PATTERN = re.compile(r"(\d{1,2})\s*월\s*(\d{1,2})\s*일")
 ROLE_VALUE_PREFIX_PATTERN = re.compile(
     r"^\s*(?:역할|역할은|구성|구성은|담당|담당은)\s*[:은는이가]?\s*",
     re.IGNORECASE,
@@ -344,10 +346,34 @@ def normalize_team_size(value: object) -> int | None:
 
     match = TEAM_SIZE_VALUE_PATTERN.fullmatch(cleaned)
     if not match:
+        match = TEAM_SIZE_EMBEDDED_PATTERN.search(cleaned)
+    if not match:
         return None
 
     parsed = int(match.group(1))
     return parsed if parsed > 0 else None
+
+
+def normalize_due_date(value: object) -> str | None:
+    cleaned = _clean_string(value)
+    if not cleaned:
+        return None
+
+    iso_match = re.search(r"\d{4}-\d{2}-\d{2}", cleaned)
+    if iso_match:
+        return iso_match.group()
+
+    slash_match = re.search(r"(\d{4})[./](\d{1,2})[./](\d{1,2})", cleaned)
+    if slash_match:
+        year, month, day = slash_match.groups()
+        return f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
+
+    korean_match = KOREAN_DATE_VALUE_PATTERN.search(cleaned)
+    if korean_match:
+        month, day = korean_match.groups()
+        return f"{int(month)}월 {int(day)}일"
+
+    return cleaned
 
 
 def _normalize_role_label(token: object) -> str:
@@ -524,9 +550,7 @@ def normalize_collected_value(
         return None
 
     if key == "dueDate":
-        date_match = re.search(r"\d{4}-\d{2}-\d{2}", cleaned)
-        if date_match:
-            return date_match.group()
+        return normalize_due_date(cleaned)
 
     return cleaned
 
