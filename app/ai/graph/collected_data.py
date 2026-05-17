@@ -721,6 +721,16 @@ def evaluate_candidate_update(
     current_normalized = normalize_collected_value(key, current_value, team_size=current_team_size)
 
     if key == "goal" and source == "llm_decision":
+        subject_candidate = normalize_collected_value(
+            "subject",
+            (candidate_updates or {}).get("subject"),
+        )
+        if subject_candidate and subject_candidate == normalized_incoming:
+            return CandidateDecision(
+                key=key, approved=False, normalized_value=None,
+                reason="goal_duplicates_subject_candidate", overwrite_mode="NONE",
+                source=source, requires_followup_question=False,
+            )
         title_candidate = normalize_collected_value(
             "title",
             (candidate_updates or {}).get("title"),
