@@ -215,11 +215,22 @@ def _postprocess_ai_message(
             + "주 타겟은 누구인가요?"
         )
 
+    if phase == "EXPLORE" and "targetUser" in approved_updates and next_question_field == "problemArea":
+        target_user = normalize_optional_string(
+            approved_updates.get("targetUser") or collected_data.get("targetUser")
+        )
+        prefix = f"타겟 사용자는 '{target_user}'로 정리할게요. " if target_user else ""
+        return (
+            prefix
+            + "다만 주제 없음 흐름에서는 제목을 정하기 전에 문제 배경이 먼저 필요해요. "
+            + "이 타겟이 캠퍼스 생활에서 가장 자주 겪는 구체적인 불편 상황 한 가지를 말해 주세요."
+        )
+
     if phase == "EXPLORE" and "targetUser" in approved_updates and next_question_field == "subject":
         target_user = normalize_optional_string(
             approved_updates.get("targetUser") or collected_data.get("targetUser")
         )
-        prefix = f"타겟 사용자는 '{target_user}'라고 정리할게요. " if target_user else ""
+        prefix = f"타겟 사용자는 '{target_user}'로 정리할게요. " if target_user else ""
         return (
             prefix
             + "이제 문제 배경과 타겟 사용자를 바탕으로 최종 프로젝트 주제를 정해볼게요. "
