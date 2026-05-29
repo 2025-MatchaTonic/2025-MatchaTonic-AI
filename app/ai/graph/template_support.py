@@ -151,29 +151,9 @@ def build_default_template_sections(state: AgentState, mode: str = "plan") -> di
             ),
         },
         "planning": _default_planning(snapshot, mode),
-        "development": {
-            "개발 목표": (
-                f"{deliverables}를 구현하기 위해 필요한 화면, API, 데이터 구조를 우선 정리합니다."
-            ),
-            "기능 후보": [
-                "사용자 흐름을 기준으로 핵심 화면을 정의합니다.",
-                "기획 범위에서 바로 필요한 API를 먼저 식별합니다.",
-                "데이터 저장이 필요한 항목을 DB 설계 페이지와 연결합니다.",
-            ],
-        },
-        "database": {
-            "주요 엔티티 후보": [
-                "User: 사용자 또는 팀원 정보",
-                "Project: 프로젝트 기본 정보",
-                "Task: 역할별 작업과 진행 상태",
-            ],
-        },
-        "role_guide": {
-            "공통 원칙": [
-                "모든 역할은 결정 사항을 문서에 남깁니다.",
-                "불확실한 항목은 확정 표현 대신 추가 논의 필요로 표시합니다.",
-            ],
-        },
+        "development": {},
+        "database": {},
+        "role_guide": {},
         "meeting_notes": {},
         "schedule": {},
         "ground_rules": (
