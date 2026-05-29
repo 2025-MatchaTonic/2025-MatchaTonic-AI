@@ -198,6 +198,9 @@ def generate_template_from_state(state: AgentState, *, action_type: str) -> dict
     - goal이 없으면 "추가 논의 필요" 수준의 중립 표현만 쓰세요.
     - planning.problem_definition, planning.solution, planning.target_persona를 반드시 채우세요.
     - 이 세 항목은 백엔드가 기획 하위 페이지의 최우선 내용으로 매핑합니다.
+    - 정보가 부족하면 일반적인 템플릿 문장으로 채우지 말고 "추가 확인 필요" 항목을 작성하세요.
+    - target_persona는 targetUser, 주요 활동, 불편함이 부족하면 이름/나이/활동을 추정하지 마세요.
+    - "추가 논의 필요와 관련된 과업"처럼 placeholder를 문장 안에 끼워 넣지 마세요.
 
     [작성 규칙]
     - problem_definition과 problem_solutions는 각각 1개만 작성하세요.
