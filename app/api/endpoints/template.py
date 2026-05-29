@@ -196,6 +196,8 @@ def generate_template_from_state(state: AgentState, *, action_type: str) -> dict
     - deliverables가 없으면 구체 산출물을 확정하지 마세요.
     - roles가 없으면 책임 분배를 확정하지 마세요.
     - goal이 없으면 "추가 논의 필요" 수준의 중립 표현만 쓰세요.
+    - schedule, development, database, role_guide, meeting_notes도 반드시 채우세요.
+    - database와 API는 확정 설계가 아니라 초안/후보로 작성하세요.
 
     [작성 규칙]
     - problem_definition과 problem_solutions는 각각 1개만 작성하세요.
@@ -221,6 +223,11 @@ def generate_template_from_state(state: AgentState, *, action_type: str) -> dict
       "summary_message": "스프링으로 전달할 한 줄 안내 메시지",
       "project_home": {json.dumps(template_content_example["project_home"], ensure_ascii=False)},
       "planning": {json.dumps(template_content_example["planning"], ensure_ascii=False)},
+      "schedule": {json.dumps(template_content_example["schedule"], ensure_ascii=False)},
+      "development": {json.dumps(template_content_example["development"], ensure_ascii=False)},
+      "database": {json.dumps(template_content_example["database"], ensure_ascii=False)},
+      "role_guide": {json.dumps(template_content_example["role_guide"], ensure_ascii=False)},
+      "meeting_notes": {json.dumps(template_content_example["meeting_notes"], ensure_ascii=False)},
       "ground_rules": "팀이 함께 지킬 원칙 (번호 목록으로 작성)"
     }}
     """
