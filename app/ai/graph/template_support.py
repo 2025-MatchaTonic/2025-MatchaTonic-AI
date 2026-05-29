@@ -317,6 +317,24 @@ def build_notion_template_payload(state: AgentState, sections: dict) -> dict:
                 "title": "그라운드룰",
                 "content": sections["ground_rules"],
             },
+            {
+                "key": "DEVELOPMENT",
+                "parentKey": "PROJECT_HOME",
+                "title": "개발",
+                "content": None,
+            },
+            {
+                "key": "DB",
+                "parentKey": "PROJECT_HOME",
+                "title": "DB",
+                "content": None,
+            },
+            {
+                "key": "ROLE_GUIDE",
+                "parentKey": "PROJECT_HOME",
+                "title": "역할별 가이드",
+                "content": None,
+            },
         ],
     }
 

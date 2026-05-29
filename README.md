@@ -5,6 +5,9 @@ FastAPI-based AI server for MatchaTonic.
 ## Template API
 
 - `POST /ai/template/`
+  - Spring compatibility response.
+  - Returns flat `{ "projectId": ..., "templates": [...] }`.
+- `POST /ai/template/rich`
   - Rich response for AI clients.
   - Returns `content`, `currentStatus`, and `notionTemplatePayload`.
 - `POST /ai/template/spring`

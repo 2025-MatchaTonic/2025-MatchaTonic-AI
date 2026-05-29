@@ -279,15 +279,35 @@ def generate_dev_template(state: AgentState) -> dict:
     return generate_template_from_state(state, action_type="BTN_DEV")
 
 
-@router.post("/", response_model=TemplateGenerateResponse)
-async def generate_template(request: TemplateGenerateRequest):
+def _build_template_generate_response(
+    request: TemplateGenerateRequest,
+    result: dict,
+    payload: dict,
+) -> TemplateGenerateResponse:
+    return TemplateGenerateResponse(
+        content=result.get("ai_message", ""),
+        currentStatus=result.get("next_phase", request.currentStatus),
+        notionTemplatePayload=payload,
+    )
+
+
+@router.post("/rich", response_model=TemplateGenerateResponse)
+async def generate_template_rich(request: TemplateGenerateRequest):
     try:
         result, payload = _run_template_generation(request)
-        return TemplateGenerateResponse(
-            content=result.get("ai_message", ""),
-            currentStatus=result.get("next_phase", request.currentStatus),
-            notionTemplatePayload=payload,
-        )
+        return _build_template_generate_response(request, result, payload)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Template generation failed: %s", exc)
+        raise HTTPException(status_code=500, detail="템플릿 생성 중 오류가 발생했습니다.")
+
+
+@router.post("/", response_model=NotionTemplatePayload)
+async def generate_template(request: TemplateGenerateRequest):
+    try:
+        _, payload = _run_template_generation(request)
+        return payload
     except HTTPException:
         raise
     except Exception as exc:
