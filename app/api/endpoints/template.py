@@ -196,6 +196,8 @@ def generate_template_from_state(state: AgentState, *, action_type: str) -> dict
     - deliverables가 없으면 구체 산출물을 확정하지 마세요.
     - roles가 없으면 책임 분배를 확정하지 마세요.
     - goal이 없으면 "추가 논의 필요" 수준의 중립 표현만 쓰세요.
+    - planning.problem_definition, planning.solution, planning.target_persona를 반드시 채우세요.
+    - 이 세 항목은 백엔드가 기획 하위 페이지의 최우선 내용으로 매핑합니다.
 
     [작성 규칙]
     - problem_definition과 problem_solutions는 각각 1개만 작성하세요.

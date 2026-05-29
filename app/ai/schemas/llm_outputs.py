@@ -77,6 +77,11 @@ class TemplateContentLLMResponse(BaseModel):
     summary_message: str = ""
     project_home: Dict[str, str] = Field(default_factory=dict)
     planning: TemplatePlanning = Field(default_factory=TemplatePlanning)
+    schedule: Dict[str, List[str] | str] = Field(default_factory=dict)
+    development: Dict[str, List[str] | str] = Field(default_factory=dict)
+    database: Dict[str, List[str] | str] = Field(default_factory=dict)
+    role_guide: Dict[str, List[str] | str] = Field(default_factory=dict)
+    meeting_notes: Dict[str, List[str] | str] = Field(default_factory=dict)
     ground_rules: str = ""
 
     def to_merged_dict(self) -> dict:
@@ -84,5 +89,10 @@ class TemplateContentLLMResponse(BaseModel):
             "summary_message": self.summary_message,
             "project_home": self.project_home,
             "planning": self.planning.model_dump(),
+            "schedule": self.schedule,
+            "development": self.development,
+            "database": self.database,
+            "role_guide": self.role_guide,
+            "meeting_notes": self.meeting_notes,
             "ground_rules": self.ground_rules,
         }
