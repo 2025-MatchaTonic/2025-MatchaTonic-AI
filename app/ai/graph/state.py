@@ -25,6 +25,8 @@ class AgentState(TypedDict):
     target_facility: Optional[str]
     current_slot: Optional[str]
     next_question_field: Optional[str]
+    response_mode: Optional[str]
+    backend_schema_name: Optional[str]
     is_sufficient: bool
     ai_message: str
     next_phase: str

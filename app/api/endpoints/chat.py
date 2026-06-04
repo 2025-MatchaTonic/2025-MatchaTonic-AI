@@ -272,6 +272,8 @@ class AIChatRequest(BaseModel):
     selectedAnswers: List[str] = Field(default_factory=list)
     currentSlot: Optional[str] = None
     nextQuestionField: Optional[str] = None
+    responseMode: Optional[str] = None
+    backendSchemaName: Optional[str] = None
 
     @root_validator(pre=True)
     def normalize_spring_compatible_payload(
@@ -331,6 +333,12 @@ class AIChatRequest(BaseModel):
         payload["selectedMessage"] = selected_message
         payload["currentSlot"] = _normalize_slot_name(payload.get("currentSlot"))
         payload["nextQuestionField"] = _normalize_slot_name(payload.get("nextQuestionField"))
+        payload["responseMode"] = normalize_optional_string(
+            payload.get("responseMode") or payload.get("response_mode")
+        )
+        payload["backendSchemaName"] = normalize_optional_string(
+            payload.get("backendSchemaName") or payload.get("backend_schema_name")
+        )
 
         content = normalize_optional_string(payload.get("content")) or ""
         if not content:
@@ -471,6 +479,8 @@ async def process_chat(request: AIChatRequest):
             "problem_area": normalize_optional_string(request.collectedData.get("problemArea")),
             "target_facility": normalize_optional_string(request.collectedData.get("targetFacility")),
             "current_slot": request.currentSlot or request.nextQuestionField,
+            "response_mode": request.responseMode,
+            "backend_schema_name": request.backendSchemaName,
             "is_sufficient": False,
             "ai_message": "",
             "next_phase": effective_phase,
@@ -548,7 +558,7 @@ async def process_chat(request: AIChatRequest):
 
         return AIChatResponse(
             content=_truncate_content(response_message, max_chars=CHAT_RESPONSE_MAX_CHARS),
-            suggestedQuestions=_build_suggested_questions(
+            suggestedQuestions=[] if result.get("is_sufficient", False) else _build_suggested_questions(
                 phase=response_phase,
                 collected_data=response_collected_data,
                 rejected_updates=rejected_updates,

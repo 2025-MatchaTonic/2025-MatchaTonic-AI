@@ -4,6 +4,7 @@ from app.ai.graph.state import AgentState
 from app.ai.graph.nodes import (
     explore_problem_node,
     gather_information_node,
+    project_progress_node,
     topic_exists_node,
 )
 from app.api.endpoints.template import generate_dev_template, generate_plan_template
@@ -11,6 +12,12 @@ from app.api.endpoints.template import generate_dev_template, generate_plan_temp
 
 def route_logic(state: AgentState):
     action = state["action_type"]
+    if (
+        state.get("response_mode") == "assistant_reply_with_backend_json"
+        or state.get("backend_schema_name") == "project_progress_v1"
+    ):
+        return "project_progress_node"
+
     phase = derive_phase_from_collected_data(
         state.get("collected_data") or {},
         current_phase=state["current_phase"],
@@ -38,6 +45,7 @@ workflow.add_node("gather_node", gather_information_node)
 workflow.add_node("generate_plan_node", generate_plan_template)
 workflow.add_node("generate_dev_node", generate_dev_template)
 workflow.add_node("topic_exists_node", topic_exists_node)
+workflow.add_node("project_progress_node", project_progress_node)
 
 workflow.set_conditional_entry_point(
     route_logic,
@@ -47,6 +55,7 @@ workflow.set_conditional_entry_point(
         "generate_plan_node": "generate_plan_node",
         "generate_dev_node": "generate_dev_node",
         "topic_exists_node": "topic_exists_node",
+        "project_progress_node": "project_progress_node",
         END: END,
     },
 )
@@ -56,5 +65,6 @@ workflow.add_edge("gather_node", END)
 workflow.add_edge("generate_plan_node", END)
 workflow.add_edge("generate_dev_node", END)
 workflow.add_edge("topic_exists_node", END)
+workflow.add_edge("project_progress_node", END)
 
 ai_app = workflow.compile()

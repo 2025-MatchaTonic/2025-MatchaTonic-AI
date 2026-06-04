@@ -863,6 +863,120 @@ def _apply_llm_message_policy(state: AgentState, ai_message: str) -> str:
     return _truncate_ai_message(cleaned)
 
 
+def _is_project_progress_request(state: AgentState) -> bool:
+    return (
+        str(state.get("response_mode") or "") == "assistant_reply_with_backend_json"
+        or str(state.get("backend_schema_name") or "") == "project_progress_v1"
+    )
+
+
+def _build_project_progress_fallback_message(user_message: str) -> str:
+    compact = " ".join(str(user_message or "").split())
+    if len(compact) > 180:
+        compact = compact[:177].rstrip() + "..."
+    return (
+        "현재 대화 기준으로는 팀 회의 내용을 바로 정리하는 흐름이 맞습니다. "
+        f"핵심 맥락은 '{compact}'로 보고, 다음 단계는 주제/제약/역할을 확정해 MVP 범위를 좁히는 것입니다. "
+        "팀원별 작업은 기획 정리, 데이터/자료 확인, 화면 설계, 발표 자료 준비로 나누고, 미정 사항은 외부 연계 가능 여부와 최종 산출물 범위입니다."
+    )
+
+
+def project_progress_node(state: AgentState):
+    user_message = _effective_user_message(state)
+    recent_context = _build_recent_context(state)
+    current_data = _prune_collected_data(dict(state.get("collected_data") or {}))
+
+    prompt = f"""
+You are a Korean AI project manager for beginner student teams.
+
+The user already provided team meeting context. Do not behave like a slot collector.
+Use only facts grounded in the chat. Do not invent requirements, schedules,
+customers, tech stacks, budgets, or external integrations.
+
+Return JSON only:
+{{
+  "assistant_message": "Korean response under 850 characters",
+  "collected_data": {{
+    "subject": "",
+    "title": "",
+    "goal": "",
+    "targetUser": "",
+    "teamSize": null,
+    "roles": [],
+    "dueDate": "",
+    "deliverables": "",
+    "problemArea": ""
+  }},
+  "is_sufficient": true
+}}
+
+assistant_message must include:
+- project topic or direction
+- current decisions
+- realistic constraints
+- member tasks or role-level tasks
+- next steps, max 3
+- risks or open questions
+
+Rules:
+- Prefer action guidance over asking missing-slot questions.
+- Ask at most one short question only if a blocker remains.
+- Never say generic fallbacks like "목표를 알려주세요" or "역할 분담을 알려주세요".
+- If roles are not fully named, suggest role-level tasks without inventing member names.
+- Keep it concise and practical.
+
+Current collected_data:
+{json.dumps(current_data, ensure_ascii=False)}
+
+Recent context:
+{recent_context}
+
+Team chat:
+{user_message}
+"""
+
+    response = _invoke_llm(
+        structured_llm,
+        prompt,
+        label="project_progress_node",
+        response_format={"type": "json_object"},
+    )
+
+    fallback_message = _build_project_progress_fallback_message(user_message)
+    parsed: dict[str, object] = {}
+    if response is not None:
+        try:
+            raw = json.loads(str(response.content))
+            if isinstance(raw, dict):
+                parsed = raw
+        except (JSONDecodeError, AttributeError):
+            logger.warning(
+                "project_progress_node json parse failed content=%r",
+                getattr(response, "content", ""),
+            )
+
+    assistant_message = str(parsed.get("assistant_message") or "").strip()
+    if not assistant_message:
+        assistant_message = fallback_message
+
+    candidate_data = parsed.get("collected_data")
+    if not isinstance(candidate_data, dict):
+        candidate_data = {}
+    merged_data = merge_collected_data(current_data, candidate_data)
+
+    return {
+        "ai_message": _truncate_ai_message(assistant_message, max_chars=900),
+        "collected_data": merged_data,
+        "is_sufficient": True,
+        "next_phase": "READY",
+        "approved_updates": {},
+        "rejected_updates": {},
+        "rejected_reasons": {},
+        "followup_fields": [],
+        "next_question_field": "",
+    }
+
+
 def _apply_llm_updates(
     state: AgentState,
     *,
