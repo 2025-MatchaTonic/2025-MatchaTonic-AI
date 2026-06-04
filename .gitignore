@@ -18,3 +18,4 @@ CI_CD_SETUP.md
 *.pfx
 id_rsa
 id_ed25519
+eval/

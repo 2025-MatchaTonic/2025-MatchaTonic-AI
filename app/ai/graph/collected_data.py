@@ -1153,6 +1153,7 @@ def merge_collected_data(
 ) -> CollectedData:
     merged = sanitize_collected_data(current_data)
     sanitized_updates = sanitize_candidate_updates(updated_data, current_data=current_data)
+    previous_subject = _clean_string(merged.get("subject"))
 
     for key in COLLECTED_DATA_FIELDS:
         value = sanitized_updates.get(key)
@@ -1163,6 +1164,18 @@ def merge_collected_data(
         value = sanitized_updates.get(key)
         if value is not None:
             merged[key] = value
+
+    subject = merged.get("subject")
+    title = merged.get("title")
+    if is_valid_collected_value("subject", subject) and (
+        not is_valid_collected_value("title", title)
+        or (
+            "subject" in sanitized_updates
+            and previous_subject
+            and _clean_string(title) == previous_subject
+        )
+    ):
+        merged["title"] = subject
 
     return merged
 

@@ -118,7 +118,11 @@ def _should_promote_selected_message_to_content(action_type: str, message: str |
     return True
 
 
-def _normalize_chat_collected_data(data: Dict[str, Any]) -> Dict[str, Any]:
+def _normalize_chat_collected_data(
+    data: Dict[str, Any],
+    *,
+    current_status: str = "EXPLORE",
+) -> Dict[str, Any]:
     normalized = dict(normalize_collected_data(data))
 
     # Spring currently sends the chat room/project display name as collectedData.title.
@@ -131,6 +135,12 @@ def _normalize_chat_collected_data(data: Dict[str, Any]) -> Dict[str, Any]:
 
     if "title" in normalized and not any(field in normalized for field in _EXECUTION_FACT_FIELDS):
         normalized.pop("title", None)
+
+    if current_status == "TOPIC_SET":
+        problem_area = normalize_optional_string(normalized.get("problemArea"))
+        if problem_area:
+            normalized["subject"] = problem_area
+            normalized["title"] = problem_area
 
     return normalized
 
@@ -305,7 +315,8 @@ class AIChatRequest(BaseModel):
             payload.get("currentStatus"), default="EXPLORE"
         )
         payload["collectedData"] = _normalize_chat_collected_data(
-            payload.get("collectedData")
+            payload.get("collectedData"),
+            current_status=payload["currentStatus"],
         )
         payload["projectName"] = normalize_optional_string(
             payload.get("projectName")

@@ -277,14 +277,14 @@ def _align_llm_updates_with_expected_slot(
 
     # subject가 없으면 goal/title을 subject로 재정렬
     if "subject" not in raw_data_updates:
-        for source_field in ("goal", "title"):
+        for source_field in ("title", "problemArea", "goal"):
             if source_field not in raw_data_updates:
                 continue
             if _message_explicitly_mentions_slot(user_message, source_field):
                 continue
 
-            raw_data_updates["subject"] = raw_data_updates.pop(source_field)
-            source_info = dict(candidate_sources.pop(source_field, {}))
+            raw_data_updates["subject"] = raw_data_updates[source_field]
+            source_info = dict(candidate_sources.get(source_field, {}))
             source_info["original_field"] = source_field
             candidate_sources["subject"] = source_info
             logger.info(

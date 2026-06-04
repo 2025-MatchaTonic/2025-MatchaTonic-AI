@@ -12,12 +12,6 @@ from app.api.endpoints.template import generate_dev_template, generate_plan_temp
 
 def route_logic(state: AgentState):
     action = state["action_type"]
-    if (
-        state.get("response_mode") == "assistant_reply_with_backend_json"
-        or state.get("backend_schema_name") == "project_progress_v1"
-    ):
-        return "project_progress_node"
-
     phase = derive_phase_from_collected_data(
         state.get("collected_data") or {},
         current_phase=state["current_phase"],
@@ -31,6 +25,11 @@ def route_logic(state: AgentState):
         return "generate_plan_node"
     if action == "BTN_DEV":
         return "generate_dev_node"
+    if (
+        state.get("response_mode") == "assistant_reply_with_backend_json"
+        or state.get("backend_schema_name") == "project_progress_v1"
+    ):
+        return "project_progress_node"
 
     if phase in {"GATHER", "READY", "PROBLEM_DEFINE"}:
         return "gather_node"
