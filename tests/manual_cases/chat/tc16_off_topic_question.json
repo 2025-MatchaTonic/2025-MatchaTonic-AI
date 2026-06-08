@@ -1,0 +1,12 @@
+{
+  "roomId": 3116,
+  "content": "근데 오늘 점심 뭐 먹지?",
+  "actionType": "CHAT",
+  "currentStatus": "GATHER",
+  "collectedData": {
+    "subject": "공공시설"
+  },
+  "recentMessages": [],
+  "selectedMessage": "근데 오늘 점심 뭐 먹지?",
+  "selectedAnswers": []
+}

@@ -1,0 +1,12 @@
+{
+  "roomId": 3111,
+  "content": "목표는 공공시설 혼잡도를 실시간으로 확인할 수 있게 하는 것입니다",
+  "actionType": "CHAT",
+  "currentStatus": "GATHER",
+  "collectedData": {
+    "goal": "공공시설 관련 서비스"
+  },
+  "recentMessages": [],
+  "selectedMessage": "목표는 공공시설 혼잡도를 실시간으로 확인할 수 있게 하는 것입니다",
+  "selectedAnswers": []
+}

@@ -1,0 +1,12 @@
+{
+  "roomId": 3123,
+  "content": "지금 미정인 항목까지 네가 다 채워줘",
+  "actionType": "CHAT",
+  "currentStatus": "GATHER",
+  "collectedData": {
+    "subject": "공공시설"
+  },
+  "recentMessages": [],
+  "selectedMessage": "지금 미정인 항목까지 네가 다 채워줘",
+  "selectedAnswers": []
+}

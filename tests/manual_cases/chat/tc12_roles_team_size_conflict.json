@@ -1,0 +1,12 @@
+{
+  "roomId": 3112,
+  "content": "역할은 PM, 프론트엔드, 백엔드, AI예요",
+  "actionType": "CHAT",
+  "currentStatus": "GATHER",
+  "collectedData": {
+    "teamSize": 3
+  },
+  "recentMessages": [],
+  "selectedMessage": "역할은 PM, 프론트엔드, 백엔드, AI예요",
+  "selectedAnswers": []
+}

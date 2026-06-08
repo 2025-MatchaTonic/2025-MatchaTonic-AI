@@ -1,0 +1,12 @@
+{
+  "roomId": 3130,
+  "content": "기획 템플릿 생성해줘",
+  "actionType": "BTN_PLAN",
+  "currentStatus": "READY",
+  "collectedData": {
+    "subject": "공공시설"
+  },
+  "recentMessages": [],
+  "selectedMessage": "기획 템플릿 생성해줘",
+  "selectedAnswers": []
+}

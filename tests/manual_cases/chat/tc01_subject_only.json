@@ -1,0 +1,12 @@
+{
+  "roomId": 3101,
+  "content": "주제는 공공시설",
+  "actionType": "CHAT",
+  "currentStatus": "TOPIC_SET",
+  "collectedData": {},
+  "recentMessages": [
+    "@mates 예, 프로젝트 주제가 있습니다"
+  ],
+  "selectedMessage": "주제는 공공시설",
+  "selectedAnswers": []
+}

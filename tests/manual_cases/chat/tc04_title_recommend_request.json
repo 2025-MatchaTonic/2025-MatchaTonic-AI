@@ -1,0 +1,12 @@
+{
+  "roomId": 3104,
+  "content": "제목 좀 더 좋게 추천해줘",
+  "actionType": "CHAT",
+  "currentStatus": "GATHER",
+  "collectedData": {
+    "title": "공공시설 혼잡도 확인 서비스"
+  },
+  "recentMessages": [],
+  "selectedMessage": "제목 좀 더 좋게 추천해줘",
+  "selectedAnswers": []
+}

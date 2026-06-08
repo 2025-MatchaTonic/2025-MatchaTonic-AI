@@ -1,0 +1,12 @@
+{
+  "roomId": 3107,
+  "content": "아직 정확하진 않은데 6월쯤일 듯?",
+  "actionType": "CHAT",
+  "currentStatus": "GATHER",
+  "collectedData": {
+    "dueDate": "2026-06-20"
+  },
+  "recentMessages": [],
+  "selectedMessage": "아직 정확하진 않은데 6월쯤일 듯?",
+  "selectedAnswers": []
+}

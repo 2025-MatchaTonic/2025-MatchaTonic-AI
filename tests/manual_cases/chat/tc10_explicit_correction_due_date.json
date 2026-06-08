@@ -1,0 +1,12 @@
+{
+  "roomId": 3110,
+  "content": "아니, 마감일은 6월 20일이에요",
+  "actionType": "CHAT",
+  "currentStatus": "GATHER",
+  "collectedData": {
+    "dueDate": "2026-06-30"
+  },
+  "recentMessages": [],
+  "selectedMessage": "아니, 마감일은 6월 20일이에요",
+  "selectedAnswers": []
+}

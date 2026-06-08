@@ -1,0 +1,12 @@
+{
+  "roomId": 3109,
+  "content": "산출물은 뭐로 해야 하지?",
+  "actionType": "CHAT",
+  "currentStatus": "GATHER",
+  "collectedData": {
+    "subject": "공공시설"
+  },
+  "recentMessages": [],
+  "selectedMessage": "산출물은 뭐로 해야 하지?",
+  "selectedAnswers": []
+}
